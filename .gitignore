@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Node.js
+node_modules/
+node/dist/
+
+# PHP
+php/vendor/
+
+# Go
+go/secretserver/*.bak
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
