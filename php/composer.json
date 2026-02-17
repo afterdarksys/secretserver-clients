@@ -1,0 +1,23 @@
+{
+  "name": "afterdark/secretserver",
+  "description": "SecretServer.io PHP client library",
+  "version": "1.0.0",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["secrets", "vault", "security", "secretserver"],
+  "require": {
+    "php": ">=8.0",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "require-dev": {},
+  "autoload": {
+    "psr-4": {
+      "SecretServer\\": "src/"
+    }
+  },
+  "homepage": "https://secretserver.io",
+  "support": {
+    "source": "https://github.com/afterdarksys/secretserver-clients"
+  }
+}
