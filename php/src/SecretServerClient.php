@@ -22,7 +22,7 @@ namespace SecretServer;
 class SecretServerClient
 {
     private const DEFAULT_URL = 'https://api.secretserver.io';
-    private const USER_AGENT  = 'secretserver-php/1.0.0';
+    private const USER_AGENT  = 'secretserver-php/1.1.0';
 
     private string $apiKey;
     private string $apiUrl;
@@ -303,6 +303,189 @@ class SecretServerClient
         $r = $this->post('/transform/decode', ['data' => $data, 'format' => $format]);
         return (string) ($r['result'] ?? '');
     }
+
+    // -----------------------------------------------------------------------
+    // GPG Keys
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listGPGKeys(): array { return $this->get('/gpg-keys'); }
+
+    /** @return array<string, mixed> */
+    public function getGPGKey(string $id): array { return $this->get('/gpg-keys/' . $id); }
+
+    /**
+     * @param array<string, mixed> $opts 'key_type', 'expires_in_days'
+     * @return array<string, mixed>
+     */
+    public function generateGPGKey(string $name, string $email, array $opts = []): array
+    {
+        return $this->post('/gpg-keys/generate', array_merge([
+            'name' => $name,
+            'email' => $email,
+        ], $opts));
+    }
+
+    /** @return array<string, mixed> */
+    public function importGPGKey(string $name, string $email, string $privateKey): array
+    {
+        return $this->post('/gpg-keys/import', [
+            'name' => $name,
+            'email' => $email,
+            'private_key' => $privateKey,
+        ]);
+    }
+
+    /** @return array<string, mixed> */
+    public function exportGPGKey(string $id): array { return $this->get('/gpg-keys/' . $id . '/export'); }
+
+    public function deleteGPGKey(string $id): void { $this->delete('/gpg-keys/' . $id); }
+
+    // -----------------------------------------------------------------------
+    // OpenSSL Keys
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listOpenSSLKeys(): array { return $this->get('/openssl-keys'); }
+
+    /** @return array<string, mixed> */
+    public function getOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . $id); }
+
+    /** @return array<string, mixed> */
+    public function generateOpenSSLKey(string $name, string $keyType = 'rsa', int $bits = 4096): array
+    {
+        return $this->post('/openssl-keys/generate', [
+            'name' => $name,
+            'key_type' => $keyType,
+            'bits' => $bits,
+        ]);
+    }
+
+    /** @return array<string, mixed> */
+    public function importOpenSSLKey(string $name, string $privateKey): array
+    {
+        return $this->post('/openssl-keys/import', [
+            'name' => $name,
+            'private_key' => $privateKey,
+        ]);
+    }
+
+    /** @return array<string, mixed> */
+    public function exportOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . $id . '/export'); }
+
+    public function deleteOpenSSLKey(string $id): void { $this->delete('/openssl-keys/' . $id); }
+
+    // -----------------------------------------------------------------------
+    // NTLM Hashes
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listNTLMHashes(): array { return $this->get('/ntlm'); }
+
+    /** @return array<string, mixed> */
+    public function getNTLMHash(string $id): array { return $this->get('/ntlm/' . $id); }
+
+    /** @return array<string, mixed> */
+    public function createNTLMHash(string $name, string $username, string $hash): array
+    {
+        return $this->post('/ntlm', ['name' => $name, 'username' => $username, 'hash' => $hash]);
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    public function updateNTLMHash(string $id, array $data): array
+    {
+        return $this->put('/ntlm/' . $id, $data);
+    }
+
+    public function deleteNTLMHash(string $id): void { $this->delete('/ntlm/' . $id); }
+
+    // -----------------------------------------------------------------------
+    // Certificates (extended operations)
+    // -----------------------------------------------------------------------
+
+    /** @return array<string, mixed> */
+    public function revokeCertificate(string $id): array { return $this->post('/certificates/' . $id . '/revoke'); }
+
+    /** @return array<string, mixed> */
+    public function downloadCertificate(string $id): array { return $this->get('/certificates/' . $id . '/download'); }
+
+    // -----------------------------------------------------------------------
+    // Webhooks
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listWebhooks(): array { return $this->get('/webhooks'); }
+
+    /**
+     * @param string[] $events
+     * @return array<string, mixed>
+     */
+    public function createWebhook(string $name, string $url, array $events, string $authType = 'none'): array
+    {
+        return $this->post('/webhooks', [
+            'name' => $name,
+            'url' => $url,
+            'events' => $events,
+            'auth_type' => $authType,
+        ]);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function getWebhookDeliveries(string $webhookId): array { return $this->get('/webhooks/' . $webhookId . '/deliveries'); }
+
+    /** @return array<string, mixed> */
+    public function testWebhook(string $webhookId): array { return $this->post('/webhooks/' . $webhookId . '/test'); }
+
+    // -----------------------------------------------------------------------
+    // Export
+    // -----------------------------------------------------------------------
+
+    /**
+     * @param array<int, array<string, mixed>> $items
+     * @return array<string, mixed>
+     */
+    public function exportToKeychain(array $items): array
+    {
+        return $this->post('/export/keychain', ['items' => $items]);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $items
+     * @return array<string, mixed>
+     */
+    public function exportToCredentialManager(array $items): array
+    {
+        return $this->post('/export/credential-manager', ['items' => $items]);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $items
+     * @return array<string, mixed>
+     */
+    public function exportToJSON(array $items): array
+    {
+        return $this->post('/export/json', ['items' => $items]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit logs
+    // -----------------------------------------------------------------------
+
+    /**
+     * @param array<string, mixed> $opts 'limit', 'offset', 'action'
+     * @return array<string, mixed>
+     */
+    public function getAuditLogs(array $opts = []): array
+    {
+        $query = http_build_query($opts);
+        return $this->get('/audit/logs' . ($query ? '?' . $query : ''));
+    }
+
+    /** @return array<string, mixed> */
+    public function exportAuditLogs(): array { return $this->get('/audit/logs/export'); }
 
     // -----------------------------------------------------------------------
     // HTTP core (internal)

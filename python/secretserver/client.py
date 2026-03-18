@@ -47,7 +47,7 @@ class SecretServerClient:
     """
 
     DEFAULT_URL = "https://api.secretserver.io"
-    USER_AGENT = "secretserver-python/1.0.0"
+    USER_AGENT = "secretserver-python/1.1.0"
 
     def __init__(
         self,
@@ -295,3 +295,181 @@ class SecretServerClient:
     def decode(self, data: str, format: str = "base64") -> str:
         result = self._post("/transform/decode", {"data": data, "format": format})
         return result.get("result", "")
+
+    # ------------------------------------------------------------------
+    # GPG Keys
+    # ------------------------------------------------------------------
+
+    def list_gpg_keys(self) -> List[Dict]:
+        return self._get("/gpg-keys") or []
+
+    def get_gpg_key(self, key_id: str) -> Dict:
+        return self._get(f"/gpg-keys/{key_id}")
+
+    def generate_gpg_key(self, name: str, email: str, key_type: str = "rsa4096", expires_days: Optional[int] = None) -> Dict:
+        body: Dict[str, Any] = {"name": name, "email": email, "key_type": key_type}
+        if expires_days is not None:
+            body["expires_in_days"] = expires_days
+        return self._post("/gpg-keys/generate", body)
+
+    def import_gpg_key(self, name: str, email: str, private_key: str) -> Dict:
+        return self._post("/gpg-keys/import", {"name": name, "email": email, "private_key": private_key})
+
+    def export_gpg_key(self, key_id: str) -> Dict:
+        return self._get(f"/gpg-keys/{key_id}/export")
+
+    def delete_gpg_key(self, key_id: str) -> None:
+        self._delete(f"/gpg-keys/{key_id}")
+
+    # ------------------------------------------------------------------
+    # Extended credential types (generic helper)
+    # ------------------------------------------------------------------
+
+    def credentials(self, resource: str) -> 'CredentialResource':
+        """
+        Generic CRUD accessor for extended credential types.
+
+        Usage:
+            ss.credentials("computer-credentials").list()
+            ss.credentials("wifi-credentials").create({...})
+            ss.credentials("disk-credentials").get(id)
+
+        Supported resources:
+            - computer-credentials
+            - wifi-credentials
+            - windows-credentials
+            - social-credentials
+            - disk-credentials
+            - service-config
+            - root-credentials
+            - ldap-bind-credentials
+            - integrations
+            - code-signing-keys
+        """
+        return CredentialResource(self, resource)
+
+    # ------------------------------------------------------------------
+    # OpenSSL Keys
+    # ------------------------------------------------------------------
+
+    def list_openssl_keys(self) -> List[Dict]:
+        return self._get("/openssl-keys") or []
+
+    def get_openssl_key(self, key_id: str) -> Dict:
+        return self._get(f"/openssl-keys/{key_id}")
+
+    def generate_openssl_key(self, name: str, key_type: str = "rsa", bits: int = 4096) -> Dict:
+        return self._post("/openssl-keys/generate", {"name": name, "key_type": key_type, "bits": bits})
+
+    def import_openssl_key(self, name: str, private_key: str) -> Dict:
+        return self._post("/openssl-keys/import", {"name": name, "private_key": private_key})
+
+    def export_openssl_key(self, key_id: str) -> Dict:
+        return self._get(f"/openssl-keys/{key_id}/export")
+
+    def delete_openssl_key(self, key_id: str) -> None:
+        self._delete(f"/openssl-keys/{key_id}")
+
+    # ------------------------------------------------------------------
+    # NTLM Hashes
+    # ------------------------------------------------------------------
+
+    def list_ntlm_hashes(self) -> List[Dict]:
+        return self._get("/ntlm") or []
+
+    def get_ntlm_hash(self, hash_id: str) -> Dict:
+        return self._get(f"/ntlm/{hash_id}")
+
+    def create_ntlm_hash(self, name: str, username: str, hash: str) -> Dict:
+        return self._post("/ntlm", {"name": name, "username": username, "hash": hash})
+
+    def update_ntlm_hash(self, hash_id: str, data: Dict) -> Dict:
+        return self._put(f"/ntlm/{hash_id}", data)
+
+    def delete_ntlm_hash(self, hash_id: str) -> None:
+        self._delete(f"/ntlm/{hash_id}")
+
+    # ------------------------------------------------------------------
+    # Certificates (extended operations)
+    # ------------------------------------------------------------------
+
+    def revoke_certificate(self, cert_id: str) -> Dict:
+        return self._post(f"/certificates/{cert_id}/revoke")
+
+    def download_certificate(self, cert_id: str) -> Dict:
+        return self._get(f"/certificates/{cert_id}/download")
+
+    # ------------------------------------------------------------------
+    # Webhooks
+    # ------------------------------------------------------------------
+
+    def list_webhooks(self) -> List[Dict]:
+        return self._get("/webhooks") or []
+
+    def create_webhook(self, name: str, url: str, events: List[str], auth_type: str = "none") -> Dict:
+        return self._post("/webhooks", {
+            "name": name,
+            "url": url,
+            "events": events,
+            "auth_type": auth_type,
+        })
+
+    def get_webhook_deliveries(self, webhook_id: str) -> List[Dict]:
+        return self._get(f"/webhooks/{webhook_id}/deliveries") or []
+
+    def test_webhook(self, webhook_id: str) -> Dict:
+        return self._post(f"/webhooks/{webhook_id}/test")
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_to_keychain(self, items: List[Dict]) -> Dict:
+        return self._post("/export/keychain", {"items": items})
+
+    def export_to_credential_manager(self, items: List[Dict]) -> Dict:
+        return self._post("/export/credential-manager", {"items": items})
+
+    def export_to_json(self, items: List[Dict]) -> Dict:
+        return self._post("/export/json", {"items": items})
+
+    # ------------------------------------------------------------------
+    # Audit logs
+    # ------------------------------------------------------------------
+
+    def get_audit_logs(self, limit: int = 100, offset: int = 0, action: str = "") -> Dict:
+        params = {"limit": str(limit), "offset": str(offset)}
+        if action:
+            params["action"] = action
+        query = "&".join([f"{k}={v}" for k, v in params.items()])
+        return self._get(f"/audit/logs?{query}")
+
+    def export_audit_logs(self) -> Dict:
+        return self._get("/audit/logs/export")
+
+
+# -----------------------------------------------------------------------
+# Credential resource helper
+# -----------------------------------------------------------------------
+
+class CredentialResource:
+    """Helper class for CRUD operations on extended credential types."""
+
+    def __init__(self, client: 'SecretServerClient', resource: str):
+        self._client = client
+        self._resource = resource
+
+    def list(self) -> List[Dict]:
+        return self._client._get(f"/{self._resource}") or []
+
+    def get(self, id: str) -> Dict:
+        return self._client._get(f"/{self._resource}/{id}")
+
+    def create(self, data: Dict) -> Dict:
+        return self._client._post(f"/{self._resource}", data)
+
+    def update(self, id: str, data: Dict) -> Dict:
+        return self._client._put(f"/{self._resource}/{id}", data)
+
+    def delete(self, id: str) -> None:
+        self._client._delete(f"/{self._resource}/{id}")
