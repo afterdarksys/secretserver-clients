@@ -96,7 +96,7 @@ export interface TempAccessResult {
 }
 
 const DEFAULT_URL = "https://api.secretserver.io";
-const USER_AGENT = "secretserver-node/1.0.0";
+const USER_AGENT = "secretserver-node/1.1.0";
 
 export class SecretServerClient {
   private readonly apiKey: string;
@@ -275,6 +275,8 @@ export class SecretServerClient {
     return this.get(`/gpg-keys/${id}/export`);
   }
 
+  deleteGPGKey(id: string): Promise<void> { return this.delete(`/gpg-keys/${id}`); }
+
   // -----------------------------------------------------------------------
   // Extended credential types (read + write)
   // -----------------------------------------------------------------------
@@ -366,6 +368,86 @@ export class SecretServerClient {
   getAuditLogs(opts: { limit?: number; offset?: number; action?: string } = {}): Promise<{ logs: unknown[]; total: number }> {
     const q = new URLSearchParams(opts as Record<string, string>).toString();
     return this.get(`/audit/logs${q ? `?${q}` : ""}`);
+  }
+
+  exportAuditLogs(): Promise<unknown> { return this.get("/audit/logs/export"); }
+
+  // -----------------------------------------------------------------------
+  // OpenSSL Keys
+  // -----------------------------------------------------------------------
+
+  listOpenSSLKeys(): Promise<unknown[]> { return this.get("/openssl-keys"); }
+  getOpenSSLKey(id: string): Promise<unknown> { return this.get(`/openssl-keys/${id}`); }
+
+  generateOpenSSLKey(name: string, keyType = "rsa", bits = 4096): Promise<unknown> {
+    return this.post("/openssl-keys/generate", { name, key_type: keyType, bits });
+  }
+
+  importOpenSSLKey(name: string, privateKey: string): Promise<unknown> {
+    return this.post("/openssl-keys/import", { name, private_key: privateKey });
+  }
+
+  exportOpenSSLKey(id: string): Promise<{ public_key: string; private_key: string }> {
+    return this.get(`/openssl-keys/${id}/export`);
+  }
+
+  deleteOpenSSLKey(id: string): Promise<void> { return this.delete(`/openssl-keys/${id}`); }
+
+  // -----------------------------------------------------------------------
+  // NTLM Hashes
+  // -----------------------------------------------------------------------
+
+  listNTLMHashes(): Promise<unknown[]> { return this.get("/ntlm"); }
+  getNTLMHash(id: string): Promise<unknown> { return this.get(`/ntlm/${id}`); }
+
+  createNTLMHash(name: string, username: string, hash: string): Promise<unknown> {
+    return this.post("/ntlm", { name, username, hash });
+  }
+
+  updateNTLMHash(id: string, data: unknown): Promise<unknown> {
+    return this.put(`/ntlm/${id}`, data);
+  }
+
+  deleteNTLMHash(id: string): Promise<void> { return this.delete(`/ntlm/${id}`); }
+
+  // -----------------------------------------------------------------------
+  // Certificates (extended operations)
+  // -----------------------------------------------------------------------
+
+  revokeCertificate(id: string): Promise<unknown> { return this.post(`/certificates/${id}/revoke`); }
+
+  // -----------------------------------------------------------------------
+  // Webhooks
+  // -----------------------------------------------------------------------
+
+  listWebhooks(): Promise<unknown[]> { return this.get("/webhooks"); }
+
+  createWebhook(name: string, url: string, events: string[], authType = "none"): Promise<unknown> {
+    return this.post("/webhooks", { name, url, events, auth_type: authType });
+  }
+
+  listWebhookDeliveries(webhookId: string): Promise<unknown[]> {
+    return this.get(`/webhooks/${webhookId}/deliveries`);
+  }
+
+  testWebhook(webhookId: string): Promise<unknown> {
+    return this.post(`/webhooks/${webhookId}/test`);
+  }
+
+  // -----------------------------------------------------------------------
+  // Export
+  // -----------------------------------------------------------------------
+
+  exportToKeychain(items: unknown[]): Promise<unknown> {
+    return this.post("/export/keychain", { items });
+  }
+
+  exportToCredentialManager(items: unknown[]): Promise<unknown> {
+    return this.post("/export/credential-manager", { items });
+  }
+
+  exportToJSON(items: unknown[]): Promise<unknown> {
+    return this.post("/export/json", { items });
   }
 }
 
