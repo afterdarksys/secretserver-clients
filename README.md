@@ -2,6 +2,31 @@
 
 Official client libraries for [SecretServer.io](https://secretserver.io) — enterprise secret management.
 
+## ⚠️ Current Implementation Status
+
+**As of 2026-03-21**, the SecretServer.io API is in **partial implementation**:
+
+### ✅ What Works
+- **API Key Authentication** - Create and manage API keys
+- **Core Secret Management** - Create, read, update, delete secrets
+- **Path-based Access** - Access secrets by container/key path
+- **Version History** - Access historical versions of secrets
+
+### ❌ What Doesn't Work Yet
+- Certificate management (enroll, renew, revoke)
+- SSH key generation
+- GPG key operations
+- Password generation
+- Extended credential types (WiFi, Computer, Windows, Social, Disk, etc.)
+- Intelligence features (breach detection)
+- Export operations (Keychain, Credential Manager)
+
+**For full implementation status**, see [API_IMPLEMENTATION_STATUS.md](https://github.com/afterdarksys/secretserver.io/blob/main/API_IMPLEMENTATION_STATUS.md) in the server repository.
+
+**The examples below show the intended API**. Only the secret management examples will work with the current implementation.
+
+---
+
 ## Libraries
 
 | Language | Directory | Install | Package |
