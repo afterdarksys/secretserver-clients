@@ -22,7 +22,7 @@ namespace SecretServer;
 class SecretServerClient
 {
     private const DEFAULT_URL = 'https://api.secretserver.io';
-    private const USER_AGENT  = 'secretserver-php/1.1.0';
+    private const USER_AGENT  = 'secretserver-php/1.2.0';
 
     private string $apiKey;
     private string $apiUrl;
@@ -486,6 +486,108 @@ class SecretServerClient
 
     /** @return array<string, mixed> */
     public function exportAuditLogs(): array { return $this->get('/audit/logs/export'); }
+
+    // -----------------------------------------------------------------------
+    // TOTP Authenticators
+    // -----------------------------------------------------------------------
+
+    /**
+     * List all TOTP authenticator tokens.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function listTOTPTokens(): array { return $this->get('/totp-tokens'); }
+
+    /**
+     * Get a specific TOTP token by ID.
+     *
+     * @return array<string, mixed>
+     */
+    public function getTOTPToken(string $id): array { return $this->get('/totp-tokens/' . $id); }
+
+    /**
+     * Create a new TOTP token.
+     *
+     * @param string $name         Display name for the token
+     * @param string $issuer       Issuer name (e.g., "GitHub", "AWS")
+     * @param string $accountName  Account identifier (e.g., email or username)
+     * @param string $secretKey    Base32-encoded secret key
+     * @param string $algorithm    Hash algorithm (SHA1, SHA256, SHA512)
+     * @param int    $digits       Number of digits in the code (6 or 8)
+     * @param int    $period       Time period in seconds (default 30)
+     * @return array<string, mixed>
+     */
+    public function createTOTPToken(
+        string $name,
+        string $issuer,
+        string $accountName,
+        string $secretKey,
+        string $algorithm = 'SHA1',
+        int    $digits = 6,
+        int    $period = 30
+    ): array {
+        return $this->post('/totp-tokens', [
+            'name' => $name,
+            'issuer' => $issuer,
+            'account_name' => $accountName,
+            'secret_key' => $secretKey,
+            'algorithm' => $algorithm,
+            'digits' => $digits,
+            'period' => $period,
+        ]);
+    }
+
+    /**
+     * Update a TOTP token.
+     *
+     * @param string $id
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    public function updateTOTPToken(string $id, array $data): array
+    {
+        return $this->put('/totp-tokens/' . $id, $data);
+    }
+
+    /**
+     * Delete a TOTP token.
+     */
+    public function deleteTOTPToken(string $id): void { $this->delete('/totp-tokens/' . $id); }
+
+    /**
+     * Generate a TOTP code for the given token.
+     *
+     * Returns array with 'code' and 'expires_in' (seconds remaining).
+     *
+     * @return array{code: string, expires_in: int}
+     */
+    public function generateTOTPCode(string $id): array
+    {
+        return $this->post('/totp-tokens/' . $id . '/generate');
+    }
+
+    /**
+     * Import a TOTP token from an otpauth:// URI.
+     *
+     * @param string $uri otpauth://totp/... URI string
+     * @return array<string, mixed> The created TOTP token
+     */
+    public function importTOTPFromURI(string $uri): array
+    {
+        return $this->post('/totp-tokens/import', ['uri' => $uri]);
+    }
+
+    /**
+     * Export a TOTP token to an otpauth:// URI.
+     *
+     * Returns array with 'uri' and 'qr_code' (base64-encoded PNG).
+     *
+     * @return array{uri: string, qr_code: string}
+     */
+    public function exportTOTPToURI(string $id): array
+    {
+        return $this->get('/totp-tokens/' . $id . '/export');
+    }
 
     // -----------------------------------------------------------------------
     // HTTP core (internal)
