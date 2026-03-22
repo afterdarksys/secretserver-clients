@@ -2,11 +2,13 @@
 
 Official client libraries for [SecretServer.io](https://secretserver.io) — enterprise secret management.
 
+**📦 [Download from GitHub](https://github.com/afterdarksys/secretserver-clients/releases) | [View Source](https://github.com/afterdarksys/secretserver-clients)**
+
 ## ✅ Full API Implementation
 
-**As of 2026-03-21**, the SecretServer.io API is **100% IMPLEMENTED**!
+**As of 2026-03-22**, the SecretServer.io API is **100% IMPLEMENTED** with **TOTP support**!
 
-All 160 API endpoints are now fully functional in production:
+All 168 API endpoints are now fully functional in production:
 
 - ✅ **Authentication** - API keys, OAuth2, OIDC, WebAuthn/Passkeys
 - ✅ **Core Secret Management** - Full CRUD, versioning, path-based access
@@ -15,6 +17,7 @@ All 160 API endpoints are now fully functional in production:
 - ✅ **GPG Keys** - Generate, import, export, encrypt, decrypt, sign
 - ✅ **Passwords** - Generate strong passwords, store, retrieve
 - ✅ **API Tokens** - Store third-party tokens (Stripe, AWS, GitHub, etc.)
+- ✅ **TOTP Authenticators** - Backup Google/Microsoft/Oracle Authenticator tokens **NEW!**
 - ✅ **Extended Credentials** - 12 types (Computer, WiFi, Windows, Social, Disk, etc.)
 - ✅ **Containers** - Namespace management
 - ✅ **Sharing** - Share secrets with users/groups
@@ -34,13 +37,15 @@ All 160 API endpoints are now fully functional in production:
 
 ## Libraries
 
-| Language | Directory | Install | Package |
-|----------|-----------|---------|---------|
-| **Python** | `python/` | `pip install secretserver` | [PyPI](https://pypi.org/project/secretserver) |
-| **Node.js / TypeScript** | `node/` | `npm install secretserver` | [npm](https://npmjs.com/package/secretserver) |
-| **PHP** | `php/` | `composer require afterdark/secretserver` | [Packagist](https://packagist.org/packages/afterdark/secretserver) |
-| **Go** | `go/` | `go get github.com/afterdarksys/secretserver-go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-go) |
-| **Ansible** | `ansible/` | Drop `secretserver.py` in your lookup_plugins/ | — |
+| Language | Directory | Install | Package | GitHub |
+|----------|-----------|---------|---------|--------|
+| **Python** | `python/` | `pip install secretserver` | [PyPI](https://pypi.org/project/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/python) |
+| **Node.js / TypeScript** | `node/` | `npm install secretserver` | [npm](https://npmjs.com/package/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/node) |
+| **PHP** | `php/` | `composer require afterdark/secretserver` | [Packagist](https://packagist.org/packages/afterdark/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
+| **Go** | `go/` | `go get github.com/afterdarksys/secretserver-go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-go) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/go) |
+| **Ansible** | `ansible/` | Drop `secretserver.py` in your lookup_plugins/ | — | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/ansible) |
+
+**📥 [Download All Clients](https://github.com/afterdarksys/secretserver-clients/releases) | [Clone Repository](https://github.com/afterdarksys/secretserver-clients.git)**
 
 ---
 
@@ -69,6 +74,17 @@ ss.share("passwords", secret["id"], "colleague@company.com", expires_hours=24)
 # Generate a temp access token
 grant = ss.create_temp_access("passwords", secret["id"], duration_seconds=900)
 print(grant["token"])
+
+# TOTP Authenticator (NEW!)
+# Backup your Google Authenticator / Microsoft Authenticator tokens
+totp = ss.create_totp_token(
+    name="AWS Production",
+    issuer="Amazon Web Services",
+    account_name="admin@company.com",
+    secret_key="JBSWY3DPEHPK3PXP"
+)
+code = ss.generate_totp_code(totp["id"])
+print(f"Current code: {code['code']}")  # 6-digit code
 ```
 
 ### Node.js / TypeScript
@@ -97,6 +113,17 @@ await ss.computerCredentials.create({
   admin_user: "admin",
   password: "secure-password",
 });
+
+// TOTP Authenticator (NEW!)
+// Backup Google Authenticator / Microsoft Authenticator tokens
+const totp = await ss.createTOTPToken(
+  "AWS Production",
+  "Amazon Web Services",
+  "admin@company.com",
+  "JBSWY3DPEHPK3PXP"
+);
+const code = await ss.generateTOTPCode(totp.id);
+console.log(`Current code: ${code.code}`);  // 6-digit code
 ```
 
 ### PHP
@@ -121,6 +148,17 @@ $wifiCreds->create([
     'password' => 'wifi-password',
     'security_protocol' => 'WPA3',
 ]);
+
+// TOTP Authenticator (NEW!)
+// Backup Google Authenticator / Microsoft Authenticator tokens
+$totp = $ss->createTOTPToken(
+    'AWS Production',
+    'Amazon Web Services',
+    'admin@company.com',
+    'JBSWY3DPEHPK3PXP'
+);
+$code = $ss->generateTOTPCode($totp['id']);
+echo "Current code: {$code['code']}\n";  // 6-digit code
 ```
 
 ### Go

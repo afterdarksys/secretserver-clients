@@ -47,7 +47,7 @@ class SecretServerClient:
     """
 
     DEFAULT_URL = "https://api.secretserver.io"
-    USER_AGENT = "secretserver-python/1.1.0"
+    USER_AGENT = "secretserver-python/1.2.0"
 
     def __init__(
         self,
@@ -446,6 +446,85 @@ class SecretServerClient:
 
     def export_audit_logs(self) -> Dict:
         return self._get("/audit/logs/export")
+
+    # ------------------------------------------------------------------
+    # TOTP Authenticators
+    # ------------------------------------------------------------------
+
+    def list_totp_tokens(self) -> List[Dict]:
+        """List all TOTP authenticator tokens."""
+        return self._get("/totp-tokens") or []
+
+    def get_totp_token(self, id: str) -> Dict:
+        """Get a specific TOTP token by ID."""
+        return self._get(f"/totp-tokens/{id}")
+
+    def create_totp_token(
+        self,
+        name: str,
+        issuer: str,
+        account_name: str,
+        secret_key: str,
+        algorithm: str = "SHA1",
+        digits: int = 6,
+        period: int = 30
+    ) -> Dict:
+        """
+        Create a new TOTP token.
+
+        Args:
+            name: Display name for the token
+            issuer: Issuer name (e.g., "GitHub", "AWS")
+            account_name: Account identifier (e.g., email or username)
+            secret_key: Base32-encoded secret key
+            algorithm: Hash algorithm (SHA1, SHA256, SHA512)
+            digits: Number of digits in the code (6 or 8)
+            period: Time period in seconds (default 30)
+        """
+        return self._post("/totp-tokens", {
+            "name": name,
+            "issuer": issuer,
+            "account_name": account_name,
+            "secret_key": secret_key,
+            "algorithm": algorithm,
+            "digits": digits,
+            "period": period,
+        })
+
+    def update_totp_token(self, id: str, data: Dict) -> Dict:
+        """Update a TOTP token."""
+        return self._put(f"/totp-tokens/{id}", data)
+
+    def delete_totp_token(self, id: str) -> None:
+        """Delete a TOTP token."""
+        self._delete(f"/totp-tokens/{id}")
+
+    def generate_totp_code(self, id: str) -> Dict:
+        """
+        Generate a TOTP code for the given token.
+
+        Returns dict with 'code' and 'expires_in' (seconds remaining).
+        """
+        return self._post(f"/totp-tokens/{id}/generate")
+
+    def import_totp_from_uri(self, uri: str) -> Dict:
+        """
+        Import a TOTP token from an otpauth:// URI.
+
+        Args:
+            uri: otpauth://totp/... URI string
+
+        Returns the created TOTP token.
+        """
+        return self._post("/totp-tokens/import", {"uri": uri})
+
+    def export_totp_to_uri(self, id: str) -> Dict:
+        """
+        Export a TOTP token to an otpauth:// URI.
+
+        Returns dict with 'uri' and 'qr_code' (base64-encoded PNG).
+        """
+        return self._get(f"/totp-tokens/{id}/export")
 
 
 # -----------------------------------------------------------------------

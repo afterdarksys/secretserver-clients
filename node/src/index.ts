@@ -95,8 +95,30 @@ export interface TempAccessResult {
   expires_at: string;
 }
 
+export interface TOTPToken {
+  id: string;
+  name: string;
+  issuer: string;
+  account_name: string;
+  algorithm: string;
+  digits: number;
+  period: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TOTPCode {
+  code: string;
+  expires_in: number;
+}
+
+export interface TOTPExport {
+  uri: string;
+  qr_code: string;
+}
+
 const DEFAULT_URL = "https://api.secretserver.io";
-const USER_AGENT = "secretserver-node/1.1.0";
+const USER_AGENT = "secretserver-node/1.2.0";
 
 export class SecretServerClient {
   private readonly apiKey: string;
@@ -448,6 +470,79 @@ export class SecretServerClient {
 
   exportToJSON(items: unknown[]): Promise<unknown> {
     return this.post("/export/json", { items });
+  }
+
+  // -----------------------------------------------------------------------
+  // TOTP Authenticators
+  // -----------------------------------------------------------------------
+
+  /** List all TOTP authenticator tokens */
+  listTOTPTokens(): Promise<TOTPToken[]> { return this.get("/totp-tokens"); }
+
+  /** Get a specific TOTP token by ID */
+  getTOTPToken(id: string): Promise<TOTPToken> { return this.get(`/totp-tokens/${id}`); }
+
+  /**
+   * Create a new TOTP token
+   *
+   * @param name Display name for the token
+   * @param issuer Issuer name (e.g., "GitHub", "AWS")
+   * @param accountName Account identifier (e.g., email or username)
+   * @param secretKey Base32-encoded secret key
+   * @param opts Optional parameters (algorithm, digits, period)
+   */
+  createTOTPToken(
+    name: string,
+    issuer: string,
+    accountName: string,
+    secretKey: string,
+    opts: { algorithm?: string; digits?: number; period?: number } = {}
+  ): Promise<TOTPToken> {
+    return this.post("/totp-tokens", {
+      name,
+      issuer,
+      account_name: accountName,
+      secret_key: secretKey,
+      algorithm: opts.algorithm ?? "SHA1",
+      digits: opts.digits ?? 6,
+      period: opts.period ?? 30,
+    });
+  }
+
+  /** Update a TOTP token */
+  updateTOTPToken(id: string, data: Partial<Omit<TOTPToken, "id" | "created_at" | "updated_at">>): Promise<TOTPToken> {
+    return this.put(`/totp-tokens/${id}`, data);
+  }
+
+  /** Delete a TOTP token */
+  deleteTOTPToken(id: string): Promise<void> { return this.delete(`/totp-tokens/${id}`); }
+
+  /**
+   * Generate a TOTP code for the given token
+   *
+   * Returns an object with 'code' and 'expires_in' (seconds remaining)
+   */
+  generateTOTPCode(id: string): Promise<TOTPCode> {
+    return this.post(`/totp-tokens/${id}/generate`);
+  }
+
+  /**
+   * Import a TOTP token from an otpauth:// URI
+   *
+   * @param uri otpauth://totp/... URI string
+   * @returns The created TOTP token
+   */
+  importTOTPFromURI(uri: string): Promise<TOTPToken> {
+    return this.post("/totp-tokens/import", { uri });
+  }
+
+  /**
+   * Export a TOTP token to an otpauth:// URI
+   *
+   * Returns an object with 'uri' and 'qr_code' (base64-encoded PNG)
+   */
+  exportTOTPToURI(id: string): Promise<TOTPExport> {
+    return this.get(`/totp-tokens/${id}/export`);
   }
 }
 
