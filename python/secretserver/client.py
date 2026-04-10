@@ -269,8 +269,8 @@ class SecretServerClient:
     def share(self, secret_type: str, secret_id: str, email: str, permission: str = "read", expires_hours: Optional[int] = 72) -> Dict:
         body: Dict[str, Any] = {"shared_with_email": email, "permission": permission}
         if expires_hours is not None:
-            from datetime import datetime, timedelta
-            body["expires_at"] = (datetime.utcnow() + timedelta(hours=expires_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            from datetime import datetime, timedelta, timezone
+            body["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=expires_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
         return self._post(f"/{secret_type}/{secret_id}/shares", body)
 
     def create_temp_access(self, secret_type: str, secret_id: str, duration_seconds: int = 900) -> Dict:
@@ -282,18 +282,18 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def check_breach(self, value: str) -> Dict:
-        return self._post("/intelligence/check-breach", {"value": value})
+        return self._post("/intelligence/check-breach", {"password": value})
 
     # ------------------------------------------------------------------
     # Transform
     # ------------------------------------------------------------------
 
     def encode(self, data: str, format: str = "base64") -> str:
-        result = self._post("/transform/encode", {"data": data, "format": format})
+        result = self._post("/transform/encode", {"input": data, "target_type": format})
         return result.get("result", "")
 
     def decode(self, data: str, format: str = "base64") -> str:
-        result = self._post("/transform/decode", {"data": data, "format": format})
+        result = self._post("/transform/decode", {"input": data, "source_type": format})
         return result.get("result", "")
 
     # ------------------------------------------------------------------
@@ -380,8 +380,8 @@ class SecretServerClient:
     def get_ntlm_hash(self, hash_id: str) -> Dict:
         return self._get(f"/ntlm/{hash_id}")
 
-    def create_ntlm_hash(self, name: str, username: str, hash: str) -> Dict:
-        return self._post("/ntlm", {"name": name, "username": username, "hash": hash})
+    def create_ntlm_hash(self, name: str, username: str, hash_value: str) -> Dict:
+        return self._post("/ntlm", {"name": name, "username": username, "hash": hash_value})
 
     def update_ntlm_hash(self, hash_id: str, data: Dict) -> Dict:
         return self._put(f"/ntlm/{hash_id}", data)

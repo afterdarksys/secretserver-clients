@@ -289,18 +289,18 @@ class SecretServerClient
     /** @return array<string, mixed> */
     public function checkBreach(string $value): array
     {
-        return $this->post('/intelligence/check-breach', ['value' => $value]);
+        return $this->post('/intelligence/check-breach', ['password' => $value]);
     }
 
     public function encode(string $data, string $format = 'base64'): string
     {
-        $r = $this->post('/transform/encode', ['data' => $data, 'format' => $format]);
+        $r = $this->post('/transform/encode', ['input' => $data, 'target_type' => $format]);
         return (string) ($r['result'] ?? '');
     }
 
     public function decode(string $data, string $format = 'base64'): string
     {
-        $r = $this->post('/transform/decode', ['data' => $data, 'format' => $format]);
+        $r = $this->post('/transform/decode', ['input' => $data, 'source_type' => $format]);
         return (string) ($r['result'] ?? '');
     }
 
@@ -595,25 +595,25 @@ class SecretServerClient
 
     /**
      * @return array<string, mixed>
-     * @internal
+     * @internal Used by CredentialResource
      */
     public function get(string $path): array { return $this->request('GET', $path); }
 
     /**
      * @param array<string, mixed>|null $body
      * @return array<string, mixed>
-     * @internal
+     * @internal Used by CredentialResource
      */
     public function post(string $path, ?array $body = null): array { return $this->request('POST', $path, $body); }
 
     /**
      * @param array<string, mixed>|null $body
      * @return array<string, mixed>
-     * @internal
+     * @internal Used by CredentialResource
      */
     public function put(string $path, ?array $body = null): array { return $this->request('PUT', $path, $body); }
 
-    /** @internal */
+    /** @internal Used by CredentialResource */
     public function delete(string $path): void { $this->request('DELETE', $path); }
 
     /**

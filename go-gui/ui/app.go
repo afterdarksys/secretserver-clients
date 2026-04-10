@@ -1,9 +1,6 @@
 package ui
 
 import (
-	"crypto/tls"
-	"net/http"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"github.com/afterdarksys/secretserver-go/secretserver"
@@ -48,17 +45,10 @@ func (a *App) initClient() {
 		return
 	}
 
-	// We allow insecure requests for testing purposes, assuming local dev environments
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	httpClient := &http.Client{Transport: tr}
-
 	cfg := &secretserver.Config{
-		APIURL:     apiURL,
-		APIKey:     apiKey,
-		HTTPClient: httpClient,
-		UserAgent:  "SecretServer-GUI/1.0",
+		APIURL:    apiURL,
+		APIKey:    apiKey,
+		UserAgent: "SecretServer-GUI/1.0",
 	}
 
 	client, err := secretserver.NewClient(cfg)
