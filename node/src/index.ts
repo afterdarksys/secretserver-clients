@@ -114,7 +114,26 @@ export interface TOTPCode {
 
 export interface TOTPExport {
   uri: string;
-  qr_code: string;
+  qr_code?: string;
+}
+
+export interface YubikeyCredential {
+  id: string;
+  name: string;
+  serial_number?: string;
+  public_id: string;
+  client_id: string;
+  validation_server: string;
+  notes?: string;
+  tags?: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface YubikeyValidateResult {
+  valid: boolean;
+  public_id: string;
+  checked_at: string;
 }
 
 const DEFAULT_URL = "https://api.secretserver.io";
@@ -475,6 +494,34 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
   // TOTP Authenticators
   // -----------------------------------------------------------------------
+
+  // -----------------------------------------------------------------------
+  // YubiKey OTP Credentials
+  // -----------------------------------------------------------------------
+
+  listYubikeys(): Promise<YubikeyCredential[]> { return this.get("/yubikeys"); }
+  getYubikey(id: string): Promise<YubikeyCredential> { return this.get(`/yubikeys/${id}`); }
+
+  createYubikey(
+    name: string, publicId: string, clientId: string, apiKey: string,
+    opts: { serialNumber?: string; validationServer?: string; notes?: string } = {}
+  ): Promise<YubikeyCredential> {
+    return this.post("/yubikeys", {
+      name, public_id: publicId, client_id: clientId, api_key: apiKey,
+      serial_number: opts.serialNumber, validation_server: opts.validationServer, notes: opts.notes,
+    });
+  }
+
+  updateYubikey(id: string, data: Partial<YubikeyCredential & { api_key: string }>): Promise<unknown> {
+    return this.put(`/yubikeys/${id}`, data);
+  }
+
+  deleteYubikey(id: string): Promise<void> { return this.delete(`/yubikeys/${id}`); }
+
+  /** Validate a Yubico OTP against the stored YubiKey configuration */
+  validateYubikeyOTP(id: string, otp: string): Promise<YubikeyValidateResult> {
+    return this.post(`/yubikeys/${id}/validate`, { otp });
+  }
 
   /** List all TOTP authenticator tokens */
   listTOTPTokens(): Promise<TOTPToken[]> { return this.get("/totp-tokens"); }

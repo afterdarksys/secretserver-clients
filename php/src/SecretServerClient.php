@@ -491,6 +491,46 @@ class SecretServerClient
     // TOTP Authenticators
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // YubiKey OTP Credentials
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listYubikeys(): array { return $this->get('/yubikeys'); }
+
+    /** @return array<string, mixed> */
+    public function getYubikey(string $id): array { return $this->get('/yubikeys/' . $id); }
+
+    /**
+     * @param array<string, mixed> $opts 'serial_number', 'validation_server', 'notes', 'tags'
+     * @return array<string, mixed>
+     */
+    public function createYubikey(string $name, string $publicId, string $clientId, string $apiKey, array $opts = []): array
+    {
+        return $this->post('/yubikeys', array_merge([
+            'name'      => $name,
+            'public_id' => $publicId,
+            'client_id' => $clientId,
+            'api_key'   => $apiKey,
+        ], $opts));
+    }
+
+    /** @param array<string, mixed> $data
+     *  @return array<string, mixed> */
+    public function updateYubikey(string $id, array $data): array { return $this->put('/yubikeys/' . $id, $data); }
+
+    public function deleteYubikey(string $id): void { $this->delete('/yubikeys/' . $id); }
+
+    /**
+     * Validate a Yubico OTP against the stored YubiKey configuration.
+     *
+     * @return array{valid: bool, public_id: string, checked_at: string}
+     */
+    public function validateYubikeyOTP(string $id, string $otp): array
+    {
+        return $this->post('/yubikeys/' . $id . '/validate', ['otp' => $otp]);
+    }
+
     /**
      * List all TOTP authenticator tokens.
      *
