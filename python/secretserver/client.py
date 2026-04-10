@@ -507,6 +507,37 @@ class SecretServerClient:
         """
         return self._post(f"/totp-tokens/{id}/generate")
 
+    # ------------------------------------------------------------------
+    # YubiKey OTP Credentials
+    # ------------------------------------------------------------------
+
+    def list_yubikeys(self) -> List[Dict]:
+        return self._get("/yubikeys") or []
+
+    def get_yubikey(self, yubikey_id: str) -> Dict:
+        return self._get(f"/yubikeys/{yubikey_id}")
+
+    def create_yubikey(self, name: str, public_id: str, client_id: str, api_key: str,
+                       serial_number: str = "", validation_server: str = "", notes: str = "") -> Dict:
+        body: Dict[str, Any] = {"name": name, "public_id": public_id, "client_id": client_id, "api_key": api_key}
+        if serial_number:
+            body["serial_number"] = serial_number
+        if validation_server:
+            body["validation_server"] = validation_server
+        if notes:
+            body["notes"] = notes
+        return self._post("/yubikeys", body)
+
+    def update_yubikey(self, yubikey_id: str, data: Dict) -> Dict:
+        return self._put(f"/yubikeys/{yubikey_id}", data)
+
+    def delete_yubikey(self, yubikey_id: str) -> None:
+        self._delete(f"/yubikeys/{yubikey_id}")
+
+    def validate_yubikey_otp(self, yubikey_id: str, otp: str) -> Dict:
+        """Validate a Yubico OTP. Returns dict with 'valid' (bool) and 'checked_at'."""
+        return self._post(f"/yubikeys/{yubikey_id}/validate", {"otp": otp})
+
     def import_totp_from_uri(self, uri: str) -> Dict:
         """
         Import a TOTP token from an otpauth:// URI.
