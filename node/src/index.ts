@@ -371,16 +371,16 @@ export class SecretServerClient {
   // Intelligence & transform
   // -----------------------------------------------------------------------
 
-  checkBreach(value: string): Promise<{ breached: boolean; sources?: string[] }> {
-    return this.post("/intelligence/check-breach", { value });
+  checkBreach(value: string): Promise<{ leaked: boolean; exposure_count: number; risk_level: string }> {
+    return this.post("/intelligence/check-breach", { password: value });
   }
 
   encode(data: string, format = "base64"): Promise<{ result: string }> {
-    return this.post("/transform/encode", { data, format });
+    return this.post("/transform/encode", { input: data, target_type: format });
   }
 
   decode(data: string, format = "base64"): Promise<{ result: string }> {
-    return this.post("/transform/decode", { data, format });
+    return this.post("/transform/decode", { input: data, source_type: format });
   }
 
   // -----------------------------------------------------------------------
