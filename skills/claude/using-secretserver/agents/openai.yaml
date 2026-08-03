@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use SecretServer"
+  short_description: "Use keys and credentials without exporting them"
+  default_prompt: "Use $using-secretserver to perform a least-privilege SecretServer operation."

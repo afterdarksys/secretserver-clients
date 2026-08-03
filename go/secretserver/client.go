@@ -37,6 +37,7 @@ type Client struct {
 	Extraction   *ExtractionService
 	LDAP         *LDAPService
 	Mock         *MockService
+	Integrations *IntegrationsService
 }
 
 // Config holds client configuration
@@ -86,6 +87,7 @@ func NewClient(cfg *Config) (*Client, error) {
 	c.Extraction = &ExtractionService{client: c}
 	c.LDAP = &LDAPService{client: c}
 	c.Mock = &MockService{client: c}
+	c.Integrations = &IntegrationsService{client: c}
 
 	return c, nil
 }

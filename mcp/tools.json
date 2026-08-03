@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "security_model": "operation_only",
+  "tools": [
+    {
+      "name": "list_key_metadata",
+      "permission": "keys:sign",
+      "returns_secret_material": false
+    },
+    {
+      "name": "sign_with_key",
+      "permission": "keys:sign",
+      "returns_secret_material": false,
+      "requires_purpose": true
+    }
+  ]
+}

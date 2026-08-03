@@ -77,10 +77,11 @@ func (s *SecretsService) List(ctx context.Context, opts *SecretListOptions) ([]*
 
 // Get retrieves a secret by name
 func (s *SecretsService) Get(ctx context.Context, name string, opts *SecretGetOptions) (*Secret, error) {
-	path := fmt.Sprintf("/api/v1/secrets/%s", name)
+	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
 
 	if opts != nil && opts.Version != "" {
-		path = fmt.Sprintf("%s?version=%s", path, opts.Version)
+		params := url.Values{"version": []string{opts.Version}}
+		path = fmt.Sprintf("%s?%s", path, params.Encode())
 	}
 
 	req, err := s.client.NewRequest(ctx, "GET", path, nil)
@@ -115,7 +116,7 @@ func (s *SecretsService) Create(ctx context.Context, createReq *SecretCreateRequ
 
 // Update updates an existing secret
 func (s *SecretsService) Update(ctx context.Context, name string, updateReq *SecretUpdateRequest) (*Secret, error) {
-	path := fmt.Sprintf("/api/v1/secrets/%s", name)
+	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
 
 	req, err := s.client.NewRequest(ctx, "PUT", path, updateReq)
 	if err != nil {
@@ -133,7 +134,7 @@ func (s *SecretsService) Update(ctx context.Context, name string, updateReq *Sec
 
 // Delete deletes a secret
 func (s *SecretsService) Delete(ctx context.Context, name string) error {
-	path := fmt.Sprintf("/api/v1/secrets/%s", name)
+	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
 
 	req, err := s.client.NewRequest(ctx, "DELETE", path, nil)
 	if err != nil {

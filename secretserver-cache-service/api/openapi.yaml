@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: SecretServer Cache Local API
+  version: 0.1.0-design
+  description: Local IPC-only design contract. This API must never bind TCP.
+paths:
+  /v1/status:
+    get:
+      operationId: cacheStatus
+      responses:
+        "200":
+          description: Non-secret lease and daemon status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+  /v1/resolve:
+    post:
+      operationId: resolveCachedSecret
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveRequest"
+      responses:
+        "200":
+          description: Policy-approved cached value and signed provenance
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentEncoding: binary
+        "403": {description: Consumer or delivery mode is not authorized}
+        "404": {description: Resource is not present in the signed lease}
+        "409": {description: Lease is expired, quarantined, rolled back, or invalid}
+  /v1/exec:
+    post:
+      operationId: executeWithCachedSecret
+      description: Starts a dashboard-approved executable and delivers the value through an inherited pipe. Arbitrary commands are forbidden.
+      responses:
+        "202": {description: Approved child process started}
+        "403": {description: Executable or caller is not approved}
+components:
+  schemas:
+    Status:
+      type: object
+      additionalProperties: false
+      required: [state, assurance]
+      properties:
+        state: {enum: [unenrolled, pending_approval, active, expired, quarantined, revoked]}
+        assurance: {enum: [standard, hardware]}
+        policy_id: {type: string, format: uuid}
+        policy_version: {type: integer, minimum: 1}
+        lease_id: {type: string, format: uuid}
+        expires_at: {type: string, format: date-time}
+    ResolveRequest:
+      type: object
+      additionalProperties: false
+      required: [resource_type, resource_id, delivery_mode]
+      properties:
+        resource_type: {type: string, minLength: 1, maxLength: 64}
+        resource_id: {type: string, minLength: 1, maxLength: 512}
+        version: {type: integer, minimum: 1}
+        delivery_mode: {enum: [plaintext_read, child_process_pipe]}
