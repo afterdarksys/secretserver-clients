@@ -4,11 +4,21 @@ Official client libraries for [SecretServer.io](https://secretserver.io) — ent
 
 **📦 [Download from GitHub](https://github.com/afterdarksys/secretserver-clients/releases) | [View Source](https://github.com/afterdarksys/secretserver-clients)**
 
-## ✅ Full API Implementation
+## REST API compatibility
 
-**As of 2026-03-22**, the SecretServer.io API is **100% IMPLEMENTED** with **TOTP support**!
+The clients target the authenticated REST API under `/api/v1`. Python, Node.js,
+PHP, and Go also expose a generic authenticated request method so newly added
+REST endpoints remain usable before a typed convenience method is released:
 
-All 168 API endpoints are now fully functional in production:
+- Python: `client.request(method, path, body)`
+- Node.js: `client.request<T>(method, path, body)`
+- PHP: `$client->request($method, $path, $body)`
+- Go: `client.Call(ctx, method, path, body, &result)`
+
+Base URLs may be configured with or without the `/api/v1` suffix. GraphQL and
+gRPC schemas in the backend are design artifacts and are not client transports.
+
+The backend REST surface includes:
 
 - ✅ **Authentication** - API keys, OAuth2, OIDC, WebAuthn/Passkeys
 - ✅ **Core Secret Management** - Full CRUD, versioning, path-based access
@@ -31,7 +41,8 @@ All 168 API endpoints are now fully functional in production:
 - ✅ **SAML** - Metadata and assertion management
 - ✅ **OIDC** - Client, token, and JWKS management
 
-**All client library examples below are now fully functional!** 🎉
+Typed helpers include secret CRUD and path access, certificates, credentials,
+TOTP and YubiKey OTP, JKS keystores, and operation-only HSM signing.
 
 ---
 

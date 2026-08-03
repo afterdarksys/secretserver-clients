@@ -117,6 +117,12 @@ func (s *SecretsService) Create(ctx context.Context, createReq *SecretCreateRequ
 // Update updates an existing secret
 func (s *SecretsService) Update(ctx context.Context, name string, updateReq *SecretUpdateRequest) (*Secret, error) {
 	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
+	if updateReq == nil {
+		return nil, fmt.Errorf("update request is required")
+	}
+	if updateReq.Name == "" {
+		updateReq.Name = name
+	}
 
 	req, err := s.client.NewRequest(ctx, "PUT", path, updateReq)
 	if err != nil {
