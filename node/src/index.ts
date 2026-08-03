@@ -136,6 +136,35 @@ export interface YubikeyValidateResult {
   checked_at: string;
 }
 
+export interface IntegrationProvider {
+  id: string;
+  display_name: string;
+  category: string;
+  required?: string[];
+  optional?: string[];
+  alternatives?: string[][];
+}
+
+export interface KeyCatalogItem {
+  id: string;
+  category: string;
+  kind: string;
+  maturity: string;
+  formats?: string[];
+  algorithms?: string[];
+  non_exportable?: boolean;
+  enabled_by_default: boolean;
+}
+
+export interface IntegrationCredential {
+  id: string;
+  name: string;
+  provider: string;
+  auth_type?: string;
+  endpoint?: string;
+  credentials?: Record<string, unknown>;
+}
+
 const DEFAULT_URL = "https://api.secretserver.io";
 const USER_AGENT = "secretserver-node/1.2.0";
 
@@ -203,18 +232,18 @@ export class SecretServerClient {
   async secret(path: string): Promise<string> {
     const parts = path.replace(/^\/|\/$/g, "").split("/");
     if (parts.length === 1) {
-      const d = await this.get<{ value?: string; data?: { value?: string } }>(`/secrets/${parts[0]}`);
+      const d = await this.get<{ value?: string; data?: { value?: string } }>(`/secrets/${encodeURIComponent(parts[0])}`);
       return d.value ?? d.data?.value ?? "";
     }
-    const d = await this.get<{ value?: string }>(`/s/${parts.join("/")}`);
+    const d = await this.get<{ value?: string }>(`/s/${parts.map(encodeURIComponent).join("/")}`);
     return d.value ?? "";
   }
 
   /** Get full secret object by path */
   getSecret(path: string): Promise<Secret> {
     const parts = path.replace(/^\/|\/$/g, "").split("/");
-    if (parts.length === 1) return this.get(`/secrets/${parts[0]}`);
-    return this.get(`/s/${parts.join("/")}`);
+    if (parts.length === 1) return this.get(`/secrets/${encodeURIComponent(parts[0])}`);
+    return this.get(`/s/${parts.map(encodeURIComponent).join("/")}`);
   }
 
   // -----------------------------------------------------------------------
@@ -233,10 +262,10 @@ export class SecretServerClient {
   }
 
   updateSecret(name: string, value: string): Promise<Secret> {
-    return this.put(`/secrets/${name}`, { data: { value } });
+    return this.put(`/secrets/${encodeURIComponent(name)}`, { data: { value } });
   }
 
-  deleteSecret(name: string): Promise<void> { return this.delete(`/secrets/${name}`); }
+  deleteSecret(name: string): Promise<void> { return this.delete(`/secrets/${encodeURIComponent(name)}`); }
 
   // -----------------------------------------------------------------------
   // Containers
@@ -261,6 +290,18 @@ export class SecretServerClient {
 
   renewCertificate(id: string): Promise<Certificate> { return this.post(`/certificates/${id}/renew`); }
   downloadCertificate(id: string): Promise<{ pem: string }> { return this.get(`/certificates/${id}/download`); }
+
+  // Provider credentials are redacted unless reveal=true and the identity has export:read.
+  listIntegrationProviders(): Promise<IntegrationProvider[]> { return this.get("/integration-providers"); }
+  listKeyCatalog(): Promise<KeyCatalogItem[]> { return this.get("/key-catalog"); }
+  createIntegrationCredential(input: {
+    name: string; provider: string; credentials: Record<string, string>;
+    auth_type?: string; endpoint?: string; tags?: string[];
+  }): Promise<{ id: string; created_at: string }> { return this.post("/integrations", input); }
+  getIntegrationCredential(id: string, reveal = false): Promise<IntegrationCredential> {
+    const query = reveal ? "?reveal=true" : "";
+    return this.get(`/integrations/${encodeURIComponent(id)}${query}`);
+  }
 
   // -----------------------------------------------------------------------
   // SSH Keys

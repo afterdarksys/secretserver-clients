@@ -7,6 +7,7 @@ import json
 import urllib.request
 import urllib.error
 import ssl
+from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -132,21 +133,21 @@ class SecretServerClient:
         """
         parts = path.strip("/").split("/")
         if len(parts) == 1:
-            data = self._get(f"/secrets/{parts[0]}")
+            data = self._get(f"/secrets/{quote(parts[0], safe='')}")
             return data.get("value", data.get("data", {}).get("value", ""))
         elif len(parts) == 2:
-            data = self._get(f"/s/{parts[0]}/{parts[1]}")
+            data = self._get(f"/s/{quote(parts[0], safe='')}/{quote(parts[1], safe='')}")
             return data.get("value", "")
         else:
-            data = self._get(f"/s/{parts[0]}/{parts[1]}/{parts[2]}")
+            data = self._get("/s/" + "/".join(quote(part, safe="") for part in parts[:3]))
             return data.get("value", "")
 
     def get_secret(self, path: str) -> Dict[str, Any]:
         """Get full secret metadata + value dict for a path."""
         parts = path.strip("/").split("/")
         if len(parts) == 1:
-            return self._get(f"/secrets/{parts[0]}")
-        return self._get(f"/s/{'/'.join(parts)}")
+            return self._get(f"/secrets/{quote(parts[0], safe='')}")
+        return self._get("/s/" + "/".join(quote(part, safe="") for part in parts))
 
     # ------------------------------------------------------------------
     # Secrets
@@ -164,10 +165,10 @@ class SecretServerClient:
         return self._post("/secrets", body)
 
     def update_secret(self, name: str, value: str) -> Dict:
-        return self._put(f"/secrets/{name}", {"data": {"value": value}})
+        return self._put(f"/secrets/{quote(name, safe='')}", {"data": {"value": value}})
 
     def delete_secret(self, name: str) -> None:
-        self._delete(f"/secrets/{name}")
+        self._delete(f"/secrets/{quote(name, safe='')}")
 
     # ------------------------------------------------------------------
     # Containers
@@ -203,7 +204,35 @@ class SecretServerClient:
         })
 
     def renew_certificate(self, cert_id: str) -> Dict:
-        return self._post(f"/certificates/{cert_id}/renew")
+        return self._post(f"/certificates/{quote(cert_id, safe='')}/renew")
+
+    # ------------------------------------------------------------------
+    # Provider credentials and key taxonomy
+    # ------------------------------------------------------------------
+
+    def list_integration_providers(self) -> List[Dict[str, Any]]:
+        """Return categorized, allowlisted provider credential schemas."""
+        return self._get("/integration-providers") or []
+
+    def list_key_catalog(self) -> List[Dict[str, Any]]:
+        """Return supported key types, formats, algorithms, and maturity."""
+        return self._get("/key-catalog") or []
+
+    def create_integration_credential(
+        self, name: str, provider: str, credentials: Dict[str, str],
+        auth_type: str = "", endpoint: str = "", tags: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._post("/integrations", {
+            "name": name, "provider": provider, "credentials": credentials,
+            "auth_type": auth_type, "endpoint": endpoint, "tags": tags or [],
+        })
+
+    def get_integration_credential(self, credential_id: str, reveal: bool = False) -> Dict[str, Any]:
+        """Get redacted metadata; reveal requires the export:read permission."""
+        path = f"/integrations/{quote(credential_id, safe='')}"
+        if reveal:
+            path += "?reveal=true"
+        return self._get(path)
 
     # ------------------------------------------------------------------
     # SSH Keys

@@ -44,8 +44,28 @@ All 168 API endpoints are now fully functional in production:
 | **PHP** | `php/` | `composer require afterdark/secretserver` | [Packagist](https://packagist.org/packages/afterdark/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
 | **Go** | `go/` | `go get github.com/afterdarksys/secretserver-go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-go) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/go) |
 | **Ansible** | `ansible/` | Drop `secretserver.py` in your lookup_plugins/ | — | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/ansible) |
+| **MCP** | `mcp/` | `go build -o secretserver-mcp .` | stdio MCP server | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/mcp) |
+| **Agent Skills** | `skills/` | Copy the appropriate skill folder | Claude Code and Codex | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/skills) |
+| **Offline Cache Service** | `secretserver-cache-service/` | Architecture/design package | Device-bound encrypted lease cache | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/secretserver-cache-service) |
 
 **📥 [Download All Clients](https://github.com/afterdarksys/secretserver-clients/releases) | [Clone Repository](https://github.com/afterdarksys/secretserver-clients.git)**
+
+### MCP and agent skills
+
+The standalone MCP bridge provides operation-only access to non-exportable smart-card and HSM signing keys. It reads a short-lived `keys:sign` identity from an owner-only file and never returns private key material.
+
+- Codex skill: `skills/codex/using-secretserver/`
+- Claude Code skill: `skills/claude/using-secretserver/`
+- MCP build and configuration: `mcp/README.md`
+
+Install the skills for the current user:
+
+```bash
+cp -R skills/codex/using-secretserver ~/.codex/skills/
+cp -R skills/claude/using-secretserver ~/.claude/skills/
+```
+
+The proposed `secretserver-cache-service/` defines a dashboard-authorized encrypted offline lease cache and the shared `--cache=off|prefer|required` client contract. It is currently a reviewed design package, not an operational daemon.
 
 ---
 

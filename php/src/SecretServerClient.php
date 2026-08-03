@@ -65,10 +65,10 @@ class SecretServerClient
     {
         $parts = explode('/', trim($path, '/'));
         if (count($parts) === 1) {
-            $data = $this->get('/secrets/' . $parts[0]);
+            $data = $this->get('/secrets/' . rawurlencode($parts[0]));
             return (string) ($data['value'] ?? $data['data']['value'] ?? '');
         }
-        $data = $this->get('/s/' . implode('/', $parts));
+        $data = $this->get('/s/' . implode('/', array_map('rawurlencode', $parts)));
         return (string) ($data['value'] ?? '');
     }
 
@@ -81,9 +81,9 @@ class SecretServerClient
     {
         $parts = explode('/', trim($path, '/'));
         if (count($parts) === 1) {
-            return $this->get('/secrets/' . $parts[0]);
+            return $this->get('/secrets/' . rawurlencode($parts[0]));
         }
-        return $this->get('/s/' . implode('/', $parts));
+        return $this->get('/s/' . implode('/', array_map('rawurlencode', $parts)));
     }
 
     // -----------------------------------------------------------------------
@@ -108,10 +108,10 @@ class SecretServerClient
     /** @return array<string, mixed> */
     public function updateSecret(string $name, string $value): array
     {
-        return $this->put('/secrets/' . $name, ['data' => ['value' => $value]]);
+        return $this->put('/secrets/' . rawurlencode($name), ['data' => ['value' => $value]]);
     }
 
-    public function deleteSecret(string $name): void { $this->delete('/secrets/' . $name); }
+    public function deleteSecret(string $name): void { $this->delete('/secrets/' . rawurlencode($name)); }
 
     // -----------------------------------------------------------------------
     // Containers
@@ -157,6 +157,34 @@ class SecretServerClient
 
     /** @return array<string, mixed> */
     public function renewCertificate(string $id): array { return $this->post('/certificates/' . $id . '/renew'); }
+
+    // -----------------------------------------------------------------------
+    // Provider credentials and key taxonomy
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listIntegrationProviders(): array { return $this->get('/integration-providers'); }
+
+    /** @return array<int, array<string, mixed>> */
+    public function listKeyCatalog(): array { return $this->get('/key-catalog'); }
+
+    /**
+     * @param array<string, string> $credentials
+     * @param array<string, mixed> $options
+     * @return array<string, mixed>
+     */
+    public function createIntegrationCredential(string $name, string $provider, array $credentials, array $options = []): array
+    {
+        return $this->post('/integrations', array_merge($options, [
+            'name' => $name, 'provider' => $provider, 'credentials' => $credentials,
+        ]));
+    }
+
+    /** Get redacted metadata; reveal requires export:read. @return array<string, mixed> */
+    public function getIntegrationCredential(string $id, bool $reveal = false): array
+    {
+        return $this->get('/integrations/' . rawurlencode($id) . ($reveal ? '?reveal=true' : ''));
+    }
 
     // -----------------------------------------------------------------------
     // SSH Keys
