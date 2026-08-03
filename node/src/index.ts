@@ -165,8 +165,78 @@ export interface IntegrationCredential {
   credentials?: Record<string, unknown>;
 }
 
+export interface CryptoBackend {
+  backend: string;
+  name: string;
+  healthy: boolean;
+  capabilities: Record<string, unknown>;
+}
+
+export interface SigningKey {
+  id: string;
+  label: string;
+  algorithm: string;
+  backend: string;
+  metadata?: Record<string, string>;
+}
+
+export interface SignResult {
+  signature: string;
+  algorithm: string;
+  key_id: string;
+  audit_id: string;
+}
+
+export interface JKSKeystore {
+  id: string;
+  name: string;
+  store_type: "raw" | "managed";
+  entry_count?: number;
+  notes?: string;
+  tags?: string[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface JKSEntry {
+  id: string;
+  keystore_id?: string;
+  alias: string;
+  entry_type: "private_key" | "trusted_cert";
+  subject?: string;
+  not_before?: string;
+  not_after?: string;
+  fingerprint?: string;
+  created_at?: string;
+}
+
+export interface CreateJKSKeystoreInput {
+  name: string;
+  store_type?: "raw" | "managed";
+  jks?: string;
+  password?: string;
+  container_id?: string;
+  notes?: string;
+  tags?: string[];
+}
+
+export interface CreateJKSEntryInput {
+  alias: string;
+  entry_type: "private_key" | "trusted_cert";
+  certificate: string;
+  private_key?: string;
+  cert_chain?: string;
+  key_password?: string;
+}
+
+export interface JKSExport {
+  jks: string;
+  format?: "jks";
+  filename?: string;
+}
+
 const DEFAULT_URL = "https://api.secretserver.io";
-const USER_AGENT = "secretserver-node/1.2.0";
+const USER_AGENT = "secretserver-node/1.3.0";
 
 export class SecretServerClient {
   private readonly apiKey: string;
@@ -175,7 +245,9 @@ export class SecretServerClient {
 
   constructor(config: ClientConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.SS_API_KEY ?? "";
-    this.apiUrl = (config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL).replace(/\/$/, "");
+    this.apiUrl = (config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL)
+      .replace(/\/$/, "")
+      .replace(/\/api\/v1$/, "");
     this.fetchFn = config.fetchFn ?? fetch;
 
     if (!this.apiKey) {
@@ -196,8 +268,10 @@ export class SecretServerClient {
     };
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const url = `${this.apiUrl}/api/v1${path}`;
+  /** Call any REST endpoint using a path relative to `/api/v1`. */
+  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
+    const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
     const res = await this.fetchFn(url, {
       method,
       headers: this.headers(),
@@ -223,6 +297,16 @@ export class SecretServerClient {
   private post = <T>(path: string, body?: unknown) => this.request<T>("POST", path, body);
   private put = <T>(path: string, body?: unknown) => this.request<T>("PUT", path, body);
   private delete = <T>(path: string) => this.request<T>("DELETE", path);
+
+  private async getList<T>(path: string, ...envelopeKeys: string[]): Promise<T[]> {
+    const data = await this.get<T[] | Record<string, unknown>>(path);
+    if (Array.isArray(data)) return data;
+    for (const key of envelopeKeys) {
+      const value = data[key];
+      if (Array.isArray(value)) return value as T[];
+    }
+    return [];
+  }
 
   // -----------------------------------------------------------------------
   // Path-based secret access (primary interface)
@@ -250,7 +334,9 @@ export class SecretServerClient {
   // Secrets
   // -----------------------------------------------------------------------
 
-  listSecrets(): Promise<Secret[]> { return this.get("/secrets"); }
+  async listSecrets(): Promise<Secret[]> {
+    return this.getList<Secret>("/secrets", "secrets");
+  }
 
   createSecret(name: string, value: string, opts: { description?: string; containerID?: string } = {}): Promise<Secret> {
     return this.post("/secrets", {
@@ -262,7 +348,7 @@ export class SecretServerClient {
   }
 
   updateSecret(name: string, value: string): Promise<Secret> {
-    return this.put(`/secrets/${encodeURIComponent(name)}`, { data: { value } });
+    return this.put(`/secrets/${encodeURIComponent(name)}`, { name, data: { value } });
   }
 
   deleteSecret(name: string): Promise<void> { return this.delete(`/secrets/${encodeURIComponent(name)}`); }
@@ -281,15 +367,51 @@ export class SecretServerClient {
   // Certificates
   // -----------------------------------------------------------------------
 
-  listCertificates(): Promise<Certificate[]> { return this.get("/certificates"); }
+  listCertificates(): Promise<Certificate[]> { return this.getList("/certificates", "certificates"); }
   getCertificate(id: string): Promise<Certificate> { return this.get(`/certificates/${id}`); }
 
   enrollCertificate(name: string, commonName: string, sans: string[] = [], autoRenew = true): Promise<Certificate> {
-    return this.post("/certificates/enroll", { name, common_name: commonName, sans, auto_renew: autoRenew });
+    return this.post("/certificates/enroll", { name, common_name: commonName, dns_names: sans, auto_renew: autoRenew });
   }
 
   renewCertificate(id: string): Promise<Certificate> { return this.post(`/certificates/${id}/renew`); }
   downloadCertificate(id: string): Promise<{ pem: string }> { return this.get(`/certificates/${id}/download`); }
+
+  // -----------------------------------------------------------------------
+  // Operation-only cryptographic backends
+  // -----------------------------------------------------------------------
+
+  listCryptoBackends(): Promise<CryptoBackend[]> { return this.get("/crypto/backends"); }
+
+  listSigningKeys(backend = "pkcs11"): Promise<SigningKey[]> {
+    return this.get(`/crypto/signing-keys?backend=${encodeURIComponent(backend)}`);
+  }
+
+  sign(backend: string, keyId: string, message: string, purpose: string): Promise<SignResult> {
+    return this.post("/crypto/sign", { backend, key_id: keyId, message, purpose });
+  }
+
+  // -----------------------------------------------------------------------
+  // JKS keystores
+  // -----------------------------------------------------------------------
+
+  listJKSKeystores(): Promise<JKSKeystore[]> { return this.get("/jks-keystores"); }
+  getJKSKeystore(id: string): Promise<JKSKeystore> { return this.get(`/jks-keystores/${encodeURIComponent(id)}`); }
+  createJKSKeystore(input: CreateJKSKeystoreInput): Promise<JKSKeystore> {
+    return this.post("/jks-keystores", input);
+  }
+  updateJKSKeystore(id: string, input: Partial<CreateJKSKeystoreInput>): Promise<{ message: string }> {
+    return this.put(`/jks-keystores/${encodeURIComponent(id)}`, input);
+  }
+  deleteJKSKeystore(id: string): Promise<void> { return this.delete(`/jks-keystores/${encodeURIComponent(id)}`); }
+  exportJKSKeystore(id: string): Promise<JKSExport> { return this.get(`/jks-keystores/${encodeURIComponent(id)}/export`); }
+  listJKSEntries(id: string): Promise<JKSEntry[]> { return this.get(`/jks-keystores/${encodeURIComponent(id)}/entries`); }
+  createJKSEntry(id: string, input: CreateJKSEntryInput): Promise<JKSEntry> {
+    return this.post(`/jks-keystores/${encodeURIComponent(id)}/entries`, input);
+  }
+  deleteJKSEntry(id: string, alias: string): Promise<void> {
+    return this.delete(`/jks-keystores/${encodeURIComponent(id)}/entries/${encodeURIComponent(alias)}`);
+  }
 
   // Provider credentials are redacted unless reveal=true and the identity has export:read.
   listIntegrationProviders(): Promise<IntegrationProvider[]> { return this.get("/integration-providers"); }
@@ -307,7 +429,7 @@ export class SecretServerClient {
   // SSH Keys
   // -----------------------------------------------------------------------
 
-  listSSHKeys(): Promise<SSHKey[]> { return this.get("/ssh-keys"); }
+  listSSHKeys(): Promise<SSHKey[]> { return this.getList("/ssh-keys", "ssh_keys", "keys"); }
 
   generateSSHKey(name: string, keyType: "rsa" | "ed25519" | "ecdsa" = "ed25519", comment?: string): Promise<SSHKey> {
     return this.post("/ssh-keys/generate", { name, key_type: keyType, comment });
@@ -325,7 +447,7 @@ export class SecretServerClient {
   // Passwords
   // -----------------------------------------------------------------------
 
-  listPasswords(): Promise<Password[]> { return this.get("/passwords"); }
+  listPasswords(): Promise<Password[]> { return this.getList("/passwords", "passwords"); }
 
   createPassword(name: string, username: string, password: string, url?: string): Promise<Password> {
     return this.post("/passwords", { name, username, password, url });
@@ -339,7 +461,7 @@ export class SecretServerClient {
   // API Tokens
   // -----------------------------------------------------------------------
 
-  listAPITokens(): Promise<unknown[]> { return this.get("/api-tokens"); }
+  listAPITokens(): Promise<unknown[]> { return this.getList("/api-tokens", "tokens"); }
   createAPIToken(name: string, service: string, token: string): Promise<unknown> {
     return this.post("/api-tokens", { name, service, token });
   }
@@ -349,7 +471,7 @@ export class SecretServerClient {
   // GPG Keys
   // -----------------------------------------------------------------------
 
-  listGPGKeys(): Promise<unknown[]> { return this.get("/gpg-keys"); }
+  listGPGKeys(): Promise<unknown[]> { return this.getList("/gpg-keys", "keys"); }
   generateGPGKey(name: string, email: string, opts: { keyType?: string; expiresInDays?: number } = {}): Promise<unknown> {
     return this.post("/gpg-keys/generate", { name, email, key_type: opts.keyType, expires_in_days: opts.expiresInDays });
   }
@@ -458,7 +580,7 @@ export class SecretServerClient {
   // OpenSSL Keys
   // -----------------------------------------------------------------------
 
-  listOpenSSLKeys(): Promise<unknown[]> { return this.get("/openssl-keys"); }
+  listOpenSSLKeys(): Promise<unknown[]> { return this.getList("/openssl-keys", "openssl_keys", "keys"); }
   getOpenSSLKey(id: string): Promise<unknown> { return this.get(`/openssl-keys/${id}`); }
 
   generateOpenSSLKey(name: string, keyType = "rsa", bits = 4096): Promise<unknown> {
@@ -479,7 +601,7 @@ export class SecretServerClient {
   // NTLM Hashes
   // -----------------------------------------------------------------------
 
-  listNTLMHashes(): Promise<unknown[]> { return this.get("/ntlm"); }
+  listNTLMHashes(): Promise<unknown[]> { return this.getList("/ntlm", "ntlm_hashes", "hashes"); }
   getNTLMHash(id: string): Promise<unknown> { return this.get(`/ntlm/${id}`); }
 
   createNTLMHash(name: string, username: string, hash: string): Promise<unknown> {
@@ -502,14 +624,14 @@ export class SecretServerClient {
   // Webhooks
   // -----------------------------------------------------------------------
 
-  listWebhooks(): Promise<unknown[]> { return this.get("/webhooks"); }
+  listWebhooks(): Promise<unknown[]> { return this.getList("/webhooks", "webhooks"); }
 
   createWebhook(name: string, url: string, events: string[], authType = "none"): Promise<unknown> {
     return this.post("/webhooks", { name, url, events, auth_type: authType });
   }
 
   listWebhookDeliveries(webhookId: string): Promise<unknown[]> {
-    return this.get(`/webhooks/${webhookId}/deliveries`);
+    return this.getList(`/webhooks/${encodeURIComponent(webhookId)}/deliveries`, "deliveries");
   }
 
   testWebhook(webhookId: string): Promise<unknown> {

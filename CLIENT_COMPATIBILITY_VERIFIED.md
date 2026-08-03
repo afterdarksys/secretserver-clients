@@ -1,261 +1,55 @@
-# Client Library Compatibility Verification
+# Client compatibility verification
 
-**Date:** 2026-03-22
-**API Version:** 100% Complete (168/168 endpoints)
-**Status:** ✅ ALL CLIENTS VERIFIED AND COMPATIBLE WITH TOTP SUPPORT
+**Verified:** 2026-08-03
 
-## Executive Summary
+**Backend:** `secretserver.io` commit `e83233c`
 
-All SecretServer.io client libraries have been verified compatible with the production API after the complete implementation of all 168 API endpoints, including TOTP authenticator support for backing up Google Authenticator, Microsoft Authenticator, and Oracle Authenticator tokens.
+**REST contract:** `/api/v1`
 
-## Verification Process
+## Result
 
-1. **API Deployment**: All 160 endpoints deployed to production (https://api.secretserver.io)
-2. **Database Migrations**: 23 migrations applied successfully to production PostgreSQL
-3. **SDK Sync**: Go SDK and Ansible plugin synced from server repository
-4. **README Update**: Client README updated to reflect 100% API implementation
+The maintained clients now match the overhauled REST backend in the areas where
+they provide typed helpers, and the general SDKs provide a generic authenticated
+request method for the rest of the live REST surface.
 
-## Client Library Status
+| Client | Result | Notes |
+|---|---|---|
+| Python 1.3.0 | Pass | Contract tests, generic request, JKS, secure signing |
+| Node.js 1.3.0 | Pass | Strict TypeScript build, generic request, JKS, secure signing |
+| PHP 1.3.0 | Pass | PHP lint, generic request, JKS, secure signing |
+| Go | Pass | Contract tests, typed core/JKS/signing services, generic `Call` |
+| Ansible lookup | Pass | Path access, version access, normalized API base URL |
+| MCP bridge | Pass | Operation-only signing tests; no private-key export |
+| Go GUI | Pass through Go SDK | Fetches secret data before edit; list data remains redacted |
 
-### ✅ Python Client (`python/secretserver/`)
-- **Version**: 1.2.0
-- **Lines of Code**: 540+ (with TOTP support)
-- **Status**: Fully Compatible
-- **Features**:
-  - ✅ Core secret management (CRUD, versioning, path-based access)
-  - ✅ Certificates (list, get, enroll, renew)
-  - ✅ SSH Keys (list, generate, import, export)
-  - ✅ GPG Keys (list, get, generate, import, export, delete)
-  - ✅ Passwords (list, create, generate)
-  - ✅ API Tokens (list, create, rotate)
-  - ✅ **TOTP Authenticators** (list, create, generate codes, import/export URIs) **NEW!**
-  - ✅ OpenSSL Keys (list, get, generate, import, export, delete)
-  - ✅ Containers (list, create)
-  - ✅ Extended Credentials (12 types via `credentials()` method)
-  - ✅ Sharing (share secrets with users/groups)
-  - ✅ Temp Access (time-limited access tokens)
-  - ✅ Intelligence (breach detection)
-  - ✅ Transform (encode/decode)
-  - ✅ History/Versioning (get history, get specific version)
+## Contract corrections
 
-**Installation**:
+- List endpoints with backend envelopes (`secrets`, `certificates`, `ssh_keys`,
+  `passwords`, `tokens`, `keys`, `openssl_keys`, `ntlm_hashes`, `webhooks`, and
+  `deliveries`) are unwrapped by convenience methods.
+- Secret updates include the backend-required `name` and `data` fields.
+- Certificate enrollment sends `dns_names`, matching the live handler.
+- Base URLs work with or without a trailing `/api/v1`, including proxy prefixes.
+- Newly added resource IDs and aliases, core secret names, and query values are
+  URL-escaped.
+- Empty successful responses such as HTTP 204 do not cause Go JSON decode errors.
+- JKS raw/managed keystore and entry operations are exposed in all general SDKs.
+- HSM/smart-card signing remains operation-only and requires `keys:sign`; private
+  key material is never returned by the signing APIs or MCP bridge.
+
+## Scope
+
+GraphQL and gRPC schemas are not treated as operational client transports because
+the backend documents them as design artifacts. The Ansible plugin intentionally
+supports lookup only, and the MCP bridge intentionally exposes only bounded key
+metadata and signing operations.
+
+## Verification commands
+
 ```bash
-pip install secretserver
+PYTHONPATH=python python3 -m unittest discover -s python/tests -v
+(cd node && npm test)
+php -l php/src/SecretServerClient.php
+(cd go && go test ./...)
+(cd mcp && go test ./...)
 ```
-
-**Example Usage**:
-```python
-from secretserver import SecretServerClient
-
-ss = SecretServerClient(api_key="sk_...")
-
-# Generate SSH key
-key = ss.generate_ssh_key("deploy-key", "ed25519")
-
-# Enroll certificate
-cert = ss.enroll_certificate("wildcard", "*.example.com")
-
-# Extended credentials
-wifi = ss.credentials("wifi-credentials")
-networks = wifi.list()
-```
-
----
-
-### ✅ Node.js/TypeScript Client (`node/src/`)
-- **Version**: 1.2.0
-- **Lines of Code**: 520+ (with TOTP support)
-- **Status**: Fully Compatible
-- **Features**: Same as Python client (all 168 endpoints accessible, including TOTP)
-
-**Installation**:
-```bash
-npm install secretserver
-```
-
-**Example Usage**:
-```typescript
-import { SecretServerClient } from "secretserver";
-
-const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
-
-// Generate SSH key
-const key = await ss.generateSSHKey("deploy-key", "ed25519");
-
-// Enroll certificate
-const cert = await ss.enrollCertificate("wildcard", "*.example.com");
-
-// Extended credentials
-const computers = await ss.computerCredentials.list();
-```
-
----
-
-### ✅ PHP Client (`php/src/`)
-- **Version**: 1.2.0
-- **Lines of Code**: 680+ (with TOTP support)
-- **Status**: Fully Compatible
-- **Features**: Same as Python client (all 168 endpoints accessible, including TOTP)
-
-**Installation**:
-```bash
-composer require afterdark/secretserver
-```
-
-**Example Usage**:
-```php
-use SecretServer\SecretServerClient;
-
-$ss = new SecretServerClient(getenv('SS_API_KEY'));
-
-// Generate SSH key
-$key = $ss->generateSSHKey('deploy-key', 'ed25519');
-
-// Enroll certificate
-$cert = $ss->enrollCertificate('wildcard', '*.example.com');
-
-// Extended credentials
-$wifiCreds = $ss->credentials('wifi-credentials');
-$networks = $wifiCreds->list();
-```
-
----
-
-### ✅ Go SDK (`go/secretserver/`)
-- **Version**: Synced from server @ 2026-03-22
-- **Lines of Code**: 590 (client.go + intelligence.go + secrets.go)
-- **Status**: Fully Compatible
-- **Features**: Core SDK functionality (secrets, intelligence)
-
-**Installation**:
-```bash
-go get github.com/afterdarksys/secretserver-go/secretserver
-```
-
-**Example Usage**:
-```go
-import ss "github.com/afterdarksys/secretserver-go/secretserver"
-
-client, err := ss.NewClient(&ss.Config{
-    APIKey: os.Getenv("SS_API_KEY"),
-})
-
-secret, err := client.Secrets.Get(ctx, "production/db-password", nil)
-```
-
----
-
-### ✅ Ansible Lookup Plugin (`ansible/`)
-- **Status**: Fully Compatible
-- **Synced**: Yes (2026-03-22)
-
-**Usage**:
-```yaml
-- name: Deploy application
-  hosts: webservers
-  vars:
-    db_password: "{{ lookup('secretserver', 'production/db-password') }}"
-```
-
----
-
-## API Endpoint Coverage
-
-All client libraries can access:
-
-| Category | Endpoints | Client Support |
-|----------|-----------|----------------|
-| Authentication (OAuth2, WebAuthn, API Keys) | 16 | ✅ All |
-| Core Secrets | 9 | ✅ All |
-| Certificates | 6 | ✅ All |
-| SSH Keys | 6 | ✅ All |
-| GPG Keys | 6 | ✅ All |
-| Passwords | 6 | ✅ All |
-| API Tokens | 5 | ✅ All |
-| Extended Credentials (12 types) | 62 | ✅ All |
-| Containers | 5 | ✅ All |
-| Sharing | 4 | ✅ All |
-| Temp Access | 3 | ✅ All |
-| Export (Keychain, Credential Manager, JSON) | 3 | ✅ All |
-| Transform (encode/decode) | 3 | ✅ All |
-| Intelligence (breach detection) | 1 | ✅ All |
-| Extraction (secret discovery) | 2 | ✅ All |
-| LDAP | 3 | ✅ All |
-| Audit Logs | 2 | ✅ All |
-| **TOTP Authenticators** | **8** | **✅ All** |
-| SAML | 11 | ✅ All |
-| OIDC | 14 | ✅ All |
-| Usage & Quotas | 2 | ✅ All |
-| Settings | 1 | ✅ All |
-| **TOTAL** | **168** | **✅ 100%** |
-
----
-
-## Breaking Changes
-
-**None.** All existing client code will continue to work. The new endpoints are additive only.
-
----
-
-## Testing Recommendations
-
-For production deployments, test the following critical paths:
-
-1. **Authentication**:
-   ```python
-   ss = SecretServerClient(api_key="sk_...")
-   ```
-
-2. **Secret Retrieval**:
-   ```python
-   value = ss.secret("production/database-password")
-   ```
-
-3. **Certificate Management**:
-   ```python
-   cert = ss.enroll_certificate("prod-cert", "example.com")
-   ```
-
-4. **SSH Key Generation**:
-   ```python
-   key = ss.generate_ssh_key("deploy-key", "ed25519")
-   ```
-
-5. **Extended Credentials**:
-   ```python
-   wifi = ss.credentials("wifi-credentials")
-   networks = wifi.list()
-   ```
-
----
-
-## Support
-
-- **API Documentation**: https://secretserver.io/docs/api
-- **API Status**: https://api.secretserver.io/healthz (returns `{"status":"ok"}`)
-- **GitHub Issues**: https://github.com/afterdarksys/secretserver-clients/issues
-
----
-
-## Changelog
-
-### 2026-03-22
-- ✅ **NEW:** Added TOTP authenticator support to all clients (v1.2.0)
-- ✅ Python client: 8 new TOTP methods
-- ✅ Node.js client: 8 new TOTP methods with TypeScript interfaces
-- ✅ PHP client: 8 new TOTP methods with PHPDoc annotations
-- ✅ Updated README with TOTP examples and GitHub download links
-- ✅ Verified compatibility with 168/168 API endpoints
-
-### 2026-03-21
-- ✅ Verified compatibility with 160/160 API endpoints
-- ✅ Synced Go SDK from server repository
-- ✅ Synced Ansible lookup plugin
-- ✅ Updated README.md with 100% implementation status
-- ✅ Created CLIENT_COMPATIBILITY_VERIFIED.md
-
----
-
-**Verified By**: Claude
-**Date**: 2026-03-22
-**Signature**: All 168 endpoints deployed and tested in production ✅

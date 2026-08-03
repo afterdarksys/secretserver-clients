@@ -40,7 +40,19 @@ func NewSecretsUI(app *App) *SecretsUI {
 	)
 
 	s.list.OnSelected = func(id widget.ListItemID) {
-		s.showDetails(s.secrets[id])
+		if s.app.Client == nil || id < 0 || id >= len(s.secrets) {
+			return
+		}
+		// List responses intentionally contain metadata only. Fetch the selected
+		// secret explicitly so viewing or editing never treats redacted data as
+		// an empty value and overwrites the server copy.
+		secret, err := s.app.Client.Secrets.Get(context.Background(), s.secrets[id].Name, nil)
+		if err != nil {
+			dialog.ShowError(err, s.app.MainWindow)
+			return
+		}
+		s.secrets[id] = secret
+		s.showDetails(secret)
 	}
 
 	s.details = container.NewVBox(widget.NewLabel("Select a secret to view details"))
@@ -100,7 +112,7 @@ func (s *SecretsUI) showDetails(sec *secretserver.Secret) {
 	}
 
 	dataLabel := widget.NewLabel(dataStr)
-	
+
 	editBtn := widget.NewButton("Edit", func() {
 		s.showEditForm(sec)
 	})

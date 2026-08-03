@@ -22,7 +22,7 @@ namespace SecretServer;
 class SecretServerClient
 {
     private const DEFAULT_URL = 'https://api.secretserver.io';
-    private const USER_AGENT  = 'secretserver-php/1.2.0';
+    private const USER_AGENT  = 'secretserver-php/1.3.0';
 
     private string $apiKey;
     private string $apiUrl;
@@ -44,6 +44,9 @@ class SecretServerClient
     ) {
         $this->apiKey    = $apiKey ?? (string) getenv('SS_API_KEY');
         $this->apiUrl    = rtrim($apiUrl ?? (string)(getenv('SS_API_URL') ?: self::DEFAULT_URL), '/');
+        if (str_ends_with($this->apiUrl, '/api/v1')) {
+            $this->apiUrl = substr($this->apiUrl, 0, -7);
+        }
         $this->timeout   = $timeout;
         $this->verifySsl = $verifySsl;
 
@@ -91,7 +94,10 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listSecrets(): array { return $this->get('/secrets'); }
+    public function listSecrets(): array
+    {
+        return $this->getList('/secrets', 'secrets');
+    }
 
     /**
      * @param array<string, string> $opts  'description', 'container_id'
@@ -108,7 +114,10 @@ class SecretServerClient
     /** @return array<string, mixed> */
     public function updateSecret(string $name, string $value): array
     {
-        return $this->put('/secrets/' . rawurlencode($name), ['data' => ['value' => $value]]);
+        return $this->put('/secrets/' . rawurlencode($name), [
+            'name' => $name,
+            'data' => ['value' => $value],
+        ]);
     }
 
     public function deleteSecret(string $name): void { $this->delete('/secrets/' . rawurlencode($name)); }
@@ -136,7 +145,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listCertificates(): array { return $this->get('/certificates'); }
+    public function listCertificates(): array { return $this->getList('/certificates', 'certificates'); }
 
     /** @return array<string, mixed> */
     public function getCertificate(string $id): array { return $this->get('/certificates/' . $id); }
@@ -150,13 +159,87 @@ class SecretServerClient
         return $this->post('/certificates/enroll', [
             'name'        => $name,
             'common_name' => $commonName,
-            'sans'        => $sans,
+            'dns_names'   => $sans,
             'auto_renew'  => $autoRenew,
         ]);
     }
 
     /** @return array<string, mixed> */
     public function renewCertificate(string $id): array { return $this->post('/certificates/' . $id . '/renew'); }
+
+    // -----------------------------------------------------------------------
+    // Operation-only cryptographic backends
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listCryptoBackends(): array { return $this->get('/crypto/backends'); }
+
+    /** @return array<int, array<string, mixed>> */
+    public function listSigningKeys(string $backend = 'pkcs11'): array
+    {
+        return $this->get('/crypto/signing-keys?backend=' . rawurlencode($backend));
+    }
+
+    /** @return array<string, mixed> */
+    public function sign(string $backend, string $keyId, string $messageBase64, string $purpose): array
+    {
+        return $this->post('/crypto/sign', [
+            'backend' => $backend,
+            'key_id' => $keyId,
+            'message' => $messageBase64,
+            'purpose' => $purpose,
+        ]);
+    }
+
+    // -----------------------------------------------------------------------
+    // JKS keystores
+    // -----------------------------------------------------------------------
+
+    /** @return array<int, array<string, mixed>> */
+    public function listJKSKeystores(): array { return $this->get('/jks-keystores'); }
+
+    /** @return array<string, mixed> */
+    public function getJKSKeystore(string $id): array { return $this->get('/jks-keystores/' . rawurlencode($id)); }
+
+    /** @param array<string, mixed> $options @return array<string, mixed> */
+    public function createJKSKeystore(string $name, string $storeType = 'managed', array $options = []): array
+    {
+        return $this->post('/jks-keystores', array_merge($options, [
+            'name' => $name,
+            'store_type' => $storeType,
+        ]));
+    }
+
+    /** @param array<string, mixed> $data @return array<string, mixed> */
+    public function updateJKSKeystore(string $id, array $data): array
+    {
+        return $this->put('/jks-keystores/' . rawurlencode($id), $data);
+    }
+
+    public function deleteJKSKeystore(string $id): void { $this->delete('/jks-keystores/' . rawurlencode($id)); }
+
+    /** @return array<string, mixed> */
+    public function exportJKSKeystore(string $id): array
+    {
+        return $this->get('/jks-keystores/' . rawurlencode($id) . '/export');
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function listJKSEntries(string $id): array
+    {
+        return $this->get('/jks-keystores/' . rawurlencode($id) . '/entries');
+    }
+
+    /** @param array<string, mixed> $data @return array<string, mixed> */
+    public function createJKSEntry(string $id, array $data): array
+    {
+        return $this->post('/jks-keystores/' . rawurlencode($id) . '/entries', $data);
+    }
+
+    public function deleteJKSEntry(string $id, string $alias): void
+    {
+        $this->delete('/jks-keystores/' . rawurlencode($id) . '/entries/' . rawurlencode($alias));
+    }
 
     // -----------------------------------------------------------------------
     // Provider credentials and key taxonomy
@@ -191,7 +274,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listSSHKeys(): array { return $this->get('/ssh-keys'); }
+    public function listSSHKeys(): array { return $this->getList('/ssh-keys', 'ssh_keys', 'keys'); }
 
     /** @return array<string, mixed> */
     public function generateSSHKey(string $name, string $keyType = 'ed25519', string $comment = ''): array
@@ -213,7 +296,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listPasswords(): array { return $this->get('/passwords'); }
+    public function listPasswords(): array { return $this->getList('/passwords', 'passwords'); }
 
     /** @return array<string, mixed> */
     public function createPassword(string $name, string $username, string $password, string $url = ''): array
@@ -234,7 +317,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listAPITokens(): array { return $this->get('/api-tokens'); }
+    public function listAPITokens(): array { return $this->getList('/api-tokens', 'tokens'); }
 
     /** @return array<string, mixed> */
     public function createAPIToken(string $name, string $service, string $token): array
@@ -337,7 +420,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listGPGKeys(): array { return $this->get('/gpg-keys'); }
+    public function listGPGKeys(): array { return $this->getList('/gpg-keys', 'keys'); }
 
     /** @return array<string, mixed> */
     public function getGPGKey(string $id): array { return $this->get('/gpg-keys/' . $id); }
@@ -374,7 +457,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listOpenSSLKeys(): array { return $this->get('/openssl-keys'); }
+    public function listOpenSSLKeys(): array { return $this->getList('/openssl-keys', 'openssl_keys', 'keys'); }
 
     /** @return array<string, mixed> */
     public function getOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . $id); }
@@ -408,7 +491,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listNTLMHashes(): array { return $this->get('/ntlm'); }
+    public function listNTLMHashes(): array { return $this->getList('/ntlm', 'ntlm_hashes', 'hashes'); }
 
     /** @return array<string, mixed> */
     public function getNTLMHash(string $id): array { return $this->get('/ntlm/' . $id); }
@@ -445,7 +528,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /** @return array<int, array<string, mixed>> */
-    public function listWebhooks(): array { return $this->get('/webhooks'); }
+    public function listWebhooks(): array { return $this->getList('/webhooks', 'webhooks'); }
 
     /**
      * @param string[] $events
@@ -462,7 +545,10 @@ class SecretServerClient
     }
 
     /** @return array<int, array<string, mixed>> */
-    public function getWebhookDeliveries(string $webhookId): array { return $this->get('/webhooks/' . $webhookId . '/deliveries'); }
+    public function getWebhookDeliveries(string $webhookId): array
+    {
+        return $this->getList('/webhooks/' . rawurlencode($webhookId) . '/deliveries', 'deliveries');
+    }
 
     /** @return array<string, mixed> */
     public function testWebhook(string $webhookId): array { return $this->post('/webhooks/' . $webhookId . '/test'); }
@@ -684,13 +770,34 @@ class SecretServerClient
     /** @internal Used by CredentialResource */
     public function delete(string $path): void { $this->request('DELETE', $path); }
 
+    /** @return array<int, mixed> */
+    private function getList(string $path, string ...$envelopeKeys): array
+    {
+        $data = $this->get($path);
+        if ($data === [] || array_keys($data) === range(0, count($data) - 1)) {
+            return $data;
+        }
+        foreach ($envelopeKeys as $key) {
+            if (isset($data[$key]) && is_array($data[$key])) {
+                return $data[$key];
+            }
+        }
+        return [];
+    }
+
     /**
      * @param array<string, mixed>|null $body
      * @return array<string, mixed>
      * @throws SecretServerException
      */
-    private function request(string $method, string $path, ?array $body = null): array
+    public function request(string $method, string $path, ?array $body = null): array
     {
+        $path = '/' . ltrim($path, '/');
+        if ($path === '/api/v1') {
+            $path = '';
+        } elseif (str_starts_with($path, '/api/v1/')) {
+            $path = substr($path, 7);
+        }
         $url = $this->apiUrl . '/api/v1' . $path;
         $ch  = curl_init($url);
 
@@ -717,7 +824,6 @@ class SecretServerClient
         $raw    = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr = curl_error($ch);
-        curl_close($ch);
 
         if ($curlErr !== '') {
             throw new SecretServerException('cURL error: ' . $curlErr);

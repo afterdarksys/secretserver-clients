@@ -127,6 +127,8 @@ class LookupModule(LookupBase):
         self.set_options(var_options=variables, direct=kwargs)
 
         api_url = self.get_option("api_url").rstrip("/")
+        if api_url.endswith("/api/v1"):
+            api_url = api_url[:-7]
         api_key = self.get_option("api_key")
         timeout = int(self.get_option("timeout"))
         version_override = self.get_option("version")
@@ -198,6 +200,15 @@ class LookupModule(LookupBase):
         import os
         ctx = None
         if os.environ.get("SS_INSECURE") == "1":
+            msg = (
+                "SecretServer lookup: TLS verification is DISABLED (SS_INSECURE=1). "
+                "This must never be used in production."
+            )
+            try:
+                self._display.warning(msg)
+            except Exception:
+                import sys
+                print("WARNING: " + msg, file=sys.stderr)
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE

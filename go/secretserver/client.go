@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,8 @@ type Client struct {
 	LDAP         *LDAPService
 	Mock         *MockService
 	Integrations *IntegrationsService
+	Crypto       *CryptoService
+	JKS          *JKSService
 }
 
 // Config holds client configuration
@@ -50,14 +53,21 @@ type Config struct {
 
 // NewClient creates a new SecretServer client
 func NewClient(cfg *Config) (*Client, error) {
+	if cfg == nil {
+		cfg = &Config{}
+	}
 	if cfg.APIURL == "" {
 		cfg.APIURL = defaultBaseURL
+	}
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("API key is required")
 	}
 
 	baseURL, err := url.Parse(cfg.APIURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid API URL: %w", err)
 	}
+	baseURL.Path = strings.TrimSuffix(strings.TrimRight(baseURL.Path, "/"), "/api/v1")
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -88,16 +98,33 @@ func NewClient(cfg *Config) (*Client, error) {
 	c.LDAP = &LDAPService{client: c}
 	c.Mock = &MockService{client: c}
 	c.Integrations = &IntegrationsService{client: c}
+	c.Crypto = &CryptoService{client: c}
+	c.JKS = &JKSService{client: c}
 
 	return c, nil
 }
 
 // NewRequest creates an API request
 func (c *Client) NewRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
-	u, err := c.baseURL.Parse(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if path == "/api/v1" {
+		path = ""
+	} else if !strings.HasPrefix(path, "/api/v1/") {
+		path = "/api/v1" + path
+	}
+	ref, err := url.Parse(path)
 	if err != nil {
 		return nil, err
 	}
+	u := *c.baseURL
+	u.Path = strings.TrimRight(c.baseURL.Path, "/") + ref.Path
+	u.RawPath = strings.TrimRight(c.baseURL.EscapedPath(), "/") + ref.EscapedPath()
+	if u.RawPath == u.Path {
+		u.RawPath = ""
+	}
+	u.RawQuery = ref.RawQuery
 
 	var buf io.ReadWriter
 	if body != nil {
@@ -146,10 +173,23 @@ func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 			_, err = io.Copy(w, resp.Body)
 		} else {
 			err = json.NewDecoder(resp.Body).Decode(v)
+			if err == io.EOF {
+				err = nil
+			}
 		}
 	}
 
 	return response, err
+}
+
+// Call invokes any REST endpoint. Path may be relative to /api/v1 or include
+// that prefix, providing forward-compatible access before a typed helper exists.
+func (c *Client) Call(ctx context.Context, method, path string, body, output interface{}) (*Response, error) {
+	req, err := c.NewRequest(ctx, method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	return c.Do(req, output)
 }
 
 // Response wraps http.Response

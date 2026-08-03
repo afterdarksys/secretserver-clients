@@ -48,7 +48,7 @@ class SecretServerClient:
     """
 
     DEFAULT_URL = "https://api.secretserver.io"
-    USER_AGENT = "secretserver-python/1.2.0"
+    USER_AGENT = "secretserver-python/1.3.0"
 
     def __init__(
         self,
@@ -59,6 +59,8 @@ class SecretServerClient:
     ):
         self.api_key = api_key or os.environ.get("SS_API_KEY", "")
         self.api_url = (api_url or os.environ.get("SS_API_URL", self.DEFAULT_URL)).rstrip("/")
+        if self.api_url.endswith("/api/v1"):
+            self.api_url = self.api_url[:-7]
         self.timeout = timeout
         self._ssl_ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
 
@@ -77,12 +79,25 @@ class SecretServerClient:
             "User-Agent": self.USER_AGENT,
         }
 
-    def _request(
+    def request(
         self,
         method: str,
         path: str,
         body: Optional[Any] = None,
     ) -> Any:
+        """Call any REST endpoint using a path relative to ``/api/v1``.
+
+        ``path`` may be supplied as ``/secrets`` or ``/api/v1/secrets``.
+        This public escape hatch keeps the client usable as the REST API grows
+        before a convenience method is added.
+        """
+        method = method.upper()
+        if not path.startswith("/"):
+            path = "/" + path
+        if path == "/api/v1":
+            path = ""
+        elif path.startswith("/api/v1/"):
+            path = path[7:]
         url = f"{self.api_url}/api/v1{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
@@ -106,6 +121,10 @@ class SecretServerClient:
         except urllib.error.URLError as e:
             raise SecretServerError(f"Connection error: {e.reason}") from e
 
+    # Retained for compatibility with code which subclassed the client.
+    def _request(self, method: str, path: str, body: Optional[Any] = None) -> Any:
+        return self.request(method, path, body)
+
     def _get(self, path: str) -> Any:
         return self._request("GET", path)
 
@@ -115,8 +134,21 @@ class SecretServerClient:
     def _put(self, path: str, body: Any = None) -> Any:
         return self._request("PUT", path, body)
 
+    def _patch(self, path: str, body: Any = None) -> Any:
+        return self._request("PATCH", path, body)
+
     def _delete(self, path: str) -> Any:
         return self._request("DELETE", path)
+
+    def _get_list(self, path: str, *envelope_keys: str) -> List[Dict[str, Any]]:
+        data = self._get(path) or []
+        if isinstance(data, list):
+            return data
+        for key in envelope_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        return []
 
     # ------------------------------------------------------------------
     # Path-based secret access (primary interface)
@@ -154,7 +186,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_secrets(self) -> List[Dict]:
-        return self._get("/secrets") or []
+        return self._get_list("/secrets", "secrets")
 
     def create_secret(self, name: str, value: str, description: str = "", container_id: str = "") -> Dict:
         body: Dict[str, Any] = {"name": name, "data": {"value": value}}
@@ -165,7 +197,10 @@ class SecretServerClient:
         return self._post("/secrets", body)
 
     def update_secret(self, name: str, value: str) -> Dict:
-        return self._put(f"/secrets/{quote(name, safe='')}", {"data": {"value": value}})
+        return self._put(
+            f"/secrets/{quote(name, safe='')}",
+            {"name": name, "data": {"value": value}},
+        )
 
     def delete_secret(self, name: str) -> None:
         self._delete(f"/secrets/{quote(name, safe='')}")
@@ -190,7 +225,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_certificates(self) -> List[Dict]:
-        return self._get("/certificates") or []
+        return self._get_list("/certificates", "certificates")
 
     def get_certificate(self, cert_id: str) -> Dict:
         return self._get(f"/certificates/{cert_id}")
@@ -199,12 +234,65 @@ class SecretServerClient:
         return self._post("/certificates/enroll", {
             "name": name,
             "common_name": common_name,
-            "sans": sans or [],
+            "dns_names": sans or [],
             "auto_renew": auto_renew,
         })
 
     def renew_certificate(self, cert_id: str) -> Dict:
         return self._post(f"/certificates/{quote(cert_id, safe='')}/renew")
+
+    # ------------------------------------------------------------------
+    # Operation-only cryptographic backends
+    # ------------------------------------------------------------------
+
+    def list_crypto_backends(self) -> List[Dict[str, Any]]:
+        """List configured backends and their non-secret capabilities."""
+        return self._get("/crypto/backends") or []
+
+    def list_signing_keys(self, backend: str = "pkcs11") -> List[Dict[str, Any]]:
+        return self._get(f"/crypto/signing-keys?backend={quote(backend, safe='')}") or []
+
+    def sign(self, backend: str, key_id: str, message_b64: str, purpose: str) -> Dict[str, Any]:
+        """Sign base64-encoded bytes without exporting private key material."""
+        return self._post("/crypto/sign", {
+            "backend": backend,
+            "key_id": key_id,
+            "message": message_b64,
+            "purpose": purpose,
+        })
+
+    # ------------------------------------------------------------------
+    # JKS keystores
+    # ------------------------------------------------------------------
+
+    def list_jks_keystores(self) -> List[Dict[str, Any]]:
+        return self._get("/jks-keystores") or []
+
+    def get_jks_keystore(self, keystore_id: str) -> Dict[str, Any]:
+        return self._get(f"/jks-keystores/{quote(keystore_id, safe='')}")
+
+    def create_jks_keystore(self, name: str, store_type: str = "managed", **options: Any) -> Dict[str, Any]:
+        return self._post("/jks-keystores", {"name": name, "store_type": store_type, **options})
+
+    def update_jks_keystore(self, keystore_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        return self._put(f"/jks-keystores/{quote(keystore_id, safe='')}", data)
+
+    def delete_jks_keystore(self, keystore_id: str) -> None:
+        self._delete(f"/jks-keystores/{quote(keystore_id, safe='')}")
+
+    def export_jks_keystore(self, keystore_id: str) -> Dict[str, Any]:
+        return self._get(f"/jks-keystores/{quote(keystore_id, safe='')}/export")
+
+    def list_jks_entries(self, keystore_id: str) -> List[Dict[str, Any]]:
+        return self._get(f"/jks-keystores/{quote(keystore_id, safe='')}/entries") or []
+
+    def create_jks_entry(self, keystore_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        return self._post(f"/jks-keystores/{quote(keystore_id, safe='')}/entries", data)
+
+    def delete_jks_entry(self, keystore_id: str, alias: str) -> None:
+        self._delete(
+            f"/jks-keystores/{quote(keystore_id, safe='')}/entries/{quote(alias, safe='')}"
+        )
 
     # ------------------------------------------------------------------
     # Provider credentials and key taxonomy
@@ -239,7 +327,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_ssh_keys(self) -> List[Dict]:
-        return self._get("/ssh-keys") or []
+        return self._get_list("/ssh-keys", "ssh_keys", "keys")
 
     def generate_ssh_key(self, name: str, key_type: str = "ed25519", comment: str = "") -> Dict:
         return self._post("/ssh-keys/generate", {"name": name, "key_type": key_type, "comment": comment})
@@ -255,7 +343,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_passwords(self) -> List[Dict]:
-        return self._get("/passwords") or []
+        return self._get_list("/passwords", "passwords")
 
     def create_password(self, name: str, username: str, password: str, url: str = "") -> Dict:
         body: Dict[str, Any] = {"name": name, "username": username, "password": password}
@@ -272,7 +360,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_api_tokens(self) -> List[Dict]:
-        return self._get("/api-tokens") or []
+        return self._get_list("/api-tokens", "tokens")
 
     def create_api_token(self, name: str, service: str, token: str) -> Dict:
         return self._post("/api-tokens", {"name": name, "service": service, "token": token})
@@ -330,7 +418,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_gpg_keys(self) -> List[Dict]:
-        return self._get("/gpg-keys") or []
+        return self._get_list("/gpg-keys", "keys")
 
     def get_gpg_key(self, key_id: str) -> Dict:
         return self._get(f"/gpg-keys/{key_id}")
@@ -382,7 +470,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_openssl_keys(self) -> List[Dict]:
-        return self._get("/openssl-keys") or []
+        return self._get_list("/openssl-keys", "openssl_keys", "keys")
 
     def get_openssl_key(self, key_id: str) -> Dict:
         return self._get(f"/openssl-keys/{key_id}")
@@ -404,7 +492,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_ntlm_hashes(self) -> List[Dict]:
-        return self._get("/ntlm") or []
+        return self._get_list("/ntlm", "ntlm_hashes", "hashes")
 
     def get_ntlm_hash(self, hash_id: str) -> Dict:
         return self._get(f"/ntlm/{hash_id}")
@@ -433,7 +521,7 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def list_webhooks(self) -> List[Dict]:
-        return self._get("/webhooks") or []
+        return self._get_list("/webhooks", "webhooks")
 
     def create_webhook(self, name: str, url: str, events: List[str], auth_type: str = "none") -> Dict:
         return self._post("/webhooks", {
@@ -444,7 +532,7 @@ class SecretServerClient:
         })
 
     def get_webhook_deliveries(self, webhook_id: str) -> List[Dict]:
-        return self._get(f"/webhooks/{webhook_id}/deliveries") or []
+        return self._get_list(f"/webhooks/{quote(webhook_id, safe='')}/deliveries", "deliveries")
 
     def test_webhook(self, webhook_id: str) -> Dict:
         return self._post(f"/webhooks/{webhook_id}/test")
