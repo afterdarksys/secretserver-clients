@@ -189,3 +189,16 @@ func wipe(data []byte) {
 		data[i] = 0
 	}
 }
+
+func (c *Client) Render(ctx context.Context, template string) (string, error) {
+	var out struct {
+		Rendered *string `json:"rendered"`
+	}
+	if err := c.call(ctx, http.MethodPost, "/api/v1/variables/resolve", map[string]string{"template": template}, &out); err != nil {
+		return "", err
+	}
+	if out.Rendered == nil {
+		return "", fmt.Errorf("invalid rendered response")
+	}
+	return *out.Rendered, nil
+}

@@ -57,6 +57,19 @@ func main() {
 		return nil, *result, nil
 	})
 
+	if os.Getenv("SECRETSERVER_ENABLE_SECRET_RESOLUTION") == "1" {
+		mcp.AddTool(server, &mcp.Tool{Name: "resolve_secret_template", Description: "Resolve %%NAME%% assignments. The result contains plaintext secrets and enters the model context. Uses the caller's credential permissions.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld}}, func(ctx context.Context, _ *mcp.CallToolRequest, input struct {
+			Template string `json:"template"`
+		}) (*mcp.CallToolResult, struct {
+			Rendered string `json:"rendered"`
+		}, error) { result, err := client.Render(ctx, input.Template); if err != nil {
+			return toolError(err), struct {
+				Rendered string `json:"rendered"`
+			}{}, nil
+		}; return nil, struct {
+			Rendered string `json:"rendered"`
+		}{result}, nil })
+	}
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Printf("MCP server stopped: %v", err)
 	}

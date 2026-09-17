@@ -313,3 +313,10 @@ bash scripts/install-go.sh
 - [Daemon (ssd) Documentation](https://secretserver.io/docs/daemon)
 - [GitHub — Server](https://github.com/afterdarksys/secretserver.io)
 - [GitHub — Clients](https://github.com/afterdarksys/secretserver-clients)
+
+## Named secret variables
+
+Assign a name such as `LOG_SERVER_TX1_S` to a credential field and resolve
+`%%LOG_SERVER_TX1_S%%` through the shared server resolver. See the
+[variable assignment guide](docs/VARIABLE_ASSIGNMENTS.md) for APIs, SDK methods, Ansible lookup,
+Terraform ephemeral templates, CLI rendering, and agent grants.

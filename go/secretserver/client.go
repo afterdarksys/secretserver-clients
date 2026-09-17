@@ -72,7 +72,8 @@ func NewClient(cfg *Config) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{
-			Timeout: defaultTimeout,
+			Timeout:       defaultTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
 	}
 
@@ -223,15 +224,7 @@ func checkResponse(r *http.Response) error {
 		return nil
 	}
 
-	errorResponse := &ErrorResponse{Response: r}
-	data, err := io.ReadAll(r.Body)
-	if err == nil && data != nil {
-		json.Unmarshal(data, errorResponse)
-	}
-
-	if errorResponse.Message == "" {
-		errorResponse.Message = http.StatusText(r.StatusCode)
-	}
+	errorResponse := &ErrorResponse{Response: r, Message: fmt.Sprintf("SecretServer request failed (HTTP %d)", r.StatusCode)}
 
 	return errorResponse
 }
@@ -240,6 +233,7 @@ func checkResponse(r *http.Response) error {
 
 // Secret represents a secret
 type Secret struct {
+	ContainerID *string           `json:"container_id,omitempty"`
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`
 	Description string            `json:"description,omitempty"`

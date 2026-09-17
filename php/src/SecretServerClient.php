@@ -64,15 +64,40 @@ class SecretServerClient
      *
      * @throws SecretServerException
      */
+    private function scalar(array $payload): string
+    {
+        $data = $payload['data'] ?? $payload;
+        foreach (['value','password','token','key','passphrase','bind_password','certificate'] as $key) {
+            if (isset($data[$key]) && is_string($data[$key])) return $data[$key];
+        }
+        throw new SecretServerException('Secret response has no supported scalar field');
+    }
+
+    public function assignVariable(string $name, string $secretType, string $secretId, string $field): array
+    { return $this->put('/variables/' . rawurlencode($name), ['secret_type'=>$secretType, 'secret_id'=>$secretId, 'field'=>$field]); }
+    public function getVariable(string $name): array { return $this->get('/variables/' . rawurlencode($name)); }
+    public function listVariables(): array { return $this->get('/variables')['variables']; }
+    public function deleteVariable(string $name): void { $this->delete('/variables/' . rawurlencode($name)); }
+    public function render(string $template): string {
+        $result = $this->post('/variables/resolve', ['template'=>$template]);
+        if (!isset($result['rendered']) || !is_string($result['rendered'])) throw new SecretServerException('Invalid rendered response');
+        return $result['rendered'];
+    }
+    public function resolveDocument(mixed $document): mixed {
+        $result = $this->request('POST', '/variables/resolve', ['document'=>$document], true);
+        if (!array_key_exists('document', $result)) throw new SecretServerException('Invalid document response');
+        return $result['document'];
+    }
+
     public function secret(string $path): string
     {
         $parts = explode('/', trim($path, '/'));
         if (count($parts) === 1) {
             $data = $this->get('/secrets/' . rawurlencode($parts[0]));
-            return (string) ($data['value'] ?? $data['data']['value'] ?? '');
+            return $this->scalar($data);
         }
         $data = $this->get('/s/' . implode('/', array_map('rawurlencode', $parts)));
-        return (string) ($data['value'] ?? '');
+        return $this->scalar($data);
     }
 
     /**
@@ -790,7 +815,7 @@ class SecretServerClient
      * @return array<string, mixed>
      * @throws SecretServerException
      */
-    public function request(string $method, string $path, ?array $body = null): array
+    public function request(string $method, string $path, ?array $body = null, bool $preserveObjects = false): array
     {
         $path = '/' . ltrim($path, '/');
         if ($path === '/api/v1') {
@@ -826,23 +851,24 @@ class SecretServerClient
         $curlErr = curl_error($ch);
 
         if ($curlErr !== '') {
-            throw new SecretServerException('cURL error: ' . $curlErr);
+            throw new SecretServerException('SecretServer connection failed');
         }
 
         $data = [];
         if (is_string($raw) && $raw !== '') {
             try {
-                $data = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+                $data = json_decode($raw, !$preserveObjects, 512, JSON_THROW_ON_ERROR);
             } catch (\JsonException $e) {
-                $data = ['raw' => $raw];
+                throw new SecretServerException('Invalid server response', $status);
             }
         }
 
-        if ($status === 401) throw new AuthException($data['error'] ?? 'Unauthorized', $status);
-        if ($status === 403) throw new PermissionException($data['error'] ?? 'Forbidden', $status);
-        if ($status === 404) throw new NotFoundException($data['error'] ?? 'Not found', $status);
-        if ($status >= 400)  throw new SecretServerException($data['error'] ?? "HTTP $status", $status);
+        if ($status === 401) throw new AuthException('Unauthorized', $status);
+        if ($status === 403) throw new PermissionException('Forbidden', $status);
+        if ($status === 404) throw new NotFoundException('Not found', $status);
+        if ($status < 200 || $status >= 300)  throw new SecretServerException("HTTP $status", $status);
 
+        if ($preserveObjects && is_object($data)) $data = get_object_vars($data);
         return $data ?? [];
     }
 }

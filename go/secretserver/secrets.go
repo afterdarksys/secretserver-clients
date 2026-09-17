@@ -13,6 +13,7 @@ type SecretsService struct {
 
 // SecretCreateRequest represents a secret creation request
 type SecretCreateRequest struct {
+	ContainerID *string           `json:"container_id,omitempty"`
 	Name        string            `json:"name"`
 	Description string            `json:"description,omitempty"`
 	Data        map[string]string `json:"data"`
@@ -21,6 +22,7 @@ type SecretCreateRequest struct {
 
 // SecretUpdateRequest represents a secret update request
 type SecretUpdateRequest struct {
+	ContainerID *string           `json:"container_id"`
 	Name        string            `json:"name,omitempty"`
 	Description string            `json:"description,omitempty"`
 	Data        map[string]string `json:"data,omitempty"`
@@ -79,6 +81,9 @@ func (s *SecretsService) List(ctx context.Context, opts *SecretListOptions) ([]*
 func (s *SecretsService) Get(ctx context.Context, name string, opts *SecretGetOptions) (*Secret, error) {
 	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
 
+	if opts != nil && opts.Version != "" && opts.Version != "1" {
+		return nil, fmt.Errorf("historical reads require container path access via Call")
+	}
 	if opts != nil && opts.Version != "" {
 		params := url.Values{"version": []string{opts.Version}}
 		path = fmt.Sprintf("%s?%s", path, params.Encode())

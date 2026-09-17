@@ -8,11 +8,11 @@ import (
 
 // App holds the application state
 type App struct {
-	FyneApp        fyne.App
-	MainWindow     fyne.Window
-	Client         *secretserver.Client
-	Tabs           *container.AppTabs
-	
+	FyneApp    fyne.App
+	MainWindow fyne.Window
+	Client     *secretserver.Client
+	Tabs       *container.AppTabs
+
 	// UI Components
 	settingsUI  *SettingsUI
 	secretsUI   *SecretsUI
@@ -67,6 +67,7 @@ func (a *App) ReloadClient() {
 func (a *App) BuildUI() fyne.CanvasObject {
 	a.Tabs = container.NewAppTabs(
 		container.NewTabItem("Secrets", a.secretsUI.Content),
+		container.NewTabItem("Variables", a.variablesPanel()),
 		container.NewTabItem("Extractor", a.extractorUI.Content),
 		container.NewTabItem("Settings", a.settingsUI.Content),
 	)

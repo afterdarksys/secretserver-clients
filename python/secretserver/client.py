@@ -30,6 +30,22 @@ class NotFoundError(SecretServerError):
     """Raised on 404 Not Found."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _scalar(payload):
+    if not isinstance(payload, dict):
+        raise SecretServerError("Invalid secret response")
+    data = payload.get("data", payload)
+    if isinstance(data, dict):
+        for key in ("value", "password", "token", "key", "passphrase", "bind_password", "certificate"):
+            if isinstance(data.get(key), str):
+                return data[key]
+    raise SecretServerError("Secret response has no supported scalar field")
+
+
 class SecretServerClient:
     """
     SecretServer.io API client.
@@ -61,6 +77,8 @@ class SecretServerClient:
         self.api_url = (api_url or os.environ.get("SS_API_URL", self.DEFAULT_URL)).rstrip("/")
         if self.api_url.endswith("/api/v1"):
             self.api_url = self.api_url[:-7]
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
         self.timeout = timeout
         self._ssl_ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
 
@@ -102,24 +120,26 @@ class SecretServerClient:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_ctx) as resp:
-                raw = resp.read()
+            opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=self._ssl_ctx))
+            with opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise SecretServerError("Response too large")
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
-            raw = e.read()
-            try:
-                detail = json.loads(raw).get("error", str(e))
-            except Exception:
-                detail = str(e)
+            e.close()
+            detail = f"SecretServer request failed (HTTP {e.code})"
             if e.code == 401:
-                raise AuthError(detail, status_code=401) from e
+                raise AuthError(detail, status_code=401) from None
             if e.code == 403:
-                raise PermissionError(detail, status_code=403) from e
+                raise PermissionError(detail, status_code=403) from None
             if e.code == 404:
-                raise NotFoundError(detail, status_code=404) from e
-            raise SecretServerError(detail, status_code=e.code) from e
+                raise NotFoundError(detail, status_code=404) from None
+            raise SecretServerError(detail, status_code=e.code) from None
+        except (ValueError, UnicodeError):
+            raise SecretServerError("Invalid server response") from None
         except urllib.error.URLError as e:
-            raise SecretServerError(f"Connection error: {e.reason}") from e
+            raise SecretServerError("SecretServer connection failed") from None
 
     # Retained for compatibility with code which subclassed the client.
     def _request(self, method: str, path: str, body: Optional[Any] = None) -> Any:
@@ -154,6 +174,30 @@ class SecretServerClient:
     # Path-based secret access (primary interface)
     # ------------------------------------------------------------------
 
+    def assign_variable(self, name: str, secret_type: str, secret_id: str, field: str) -> Dict:
+        return self._put("/variables/" + quote(name, safe=""), {"secret_type": secret_type, "secret_id": secret_id, "field": field})
+
+    def get_variable(self, name: str) -> Dict:
+        return self._get("/variables/" + quote(name, safe=""))
+
+    def list_variables(self) -> List[Dict]:
+        return self._get("/variables")["variables"]
+
+    def delete_variable(self, name: str) -> None:
+        self._delete("/variables/" + quote(name, safe=""))
+
+    def render(self, template: str) -> str:
+        result = self._post("/variables/resolve", {"template": template})
+        if not isinstance(result, dict) or not isinstance(result.get("rendered"), str):
+            raise SecretServerError("Invalid rendered response")
+        return result["rendered"]
+
+    def resolve_document(self, document: Any) -> Any:
+        result = self._post("/variables/resolve", {"document": document})
+        if not isinstance(result, dict) or "document" not in result:
+            raise SecretServerError("Invalid document response")
+        return result["document"]
+
     def secret(self, path: str) -> str:
         """
         Get a secret value by path: container/key or container/key/version.
@@ -166,13 +210,13 @@ class SecretServerClient:
         parts = path.strip("/").split("/")
         if len(parts) == 1:
             data = self._get(f"/secrets/{quote(parts[0], safe='')}")
-            return data.get("value", data.get("data", {}).get("value", ""))
+            return _scalar(data)
         elif len(parts) == 2:
             data = self._get(f"/s/{quote(parts[0], safe='')}/{quote(parts[1], safe='')}")
-            return data.get("value", "")
+            return _scalar(data)
         else:
             data = self._get("/s/" + "/".join(quote(part, safe="") for part in parts[:3]))
-            return data.get("value", "")
+            return _scalar(data)
 
     def get_secret(self, path: str) -> Dict[str, Any]:
         """Get full secret metadata + value dict for a path."""

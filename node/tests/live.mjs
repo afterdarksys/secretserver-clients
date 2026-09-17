@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {SecretServerClient} from '../dist/index.js';
+const c=new SecretServerClient({apiKey:process.env.SS_LIVE_KEY,apiUrl:process.env.SS_LIVE_URL});
+await c.createSecret('node-live','first',{containerID:process.env.SS_LIVE_CONTAINER});
+assert.equal(await c.secret('prod/node-live'),'first');
+await c.updateSecret('node-live','second');
+assert.equal(await c.secret('node-live'),'second');
+const record=await c.getSecret('node-live');
+await c.assignVariable('NODE_LIVE',{secret_type:'secret',secret_id:record.id,field:'value'});
+assert.equal(await c.render('x=%%NODE_LIVE%%'),'x=second');
+assert.deepEqual(await c.resolveDocument({password:'%%NODE_LIVE%%',count:2}),{password:'second',count:2});
+assert.equal((await c.getVariable('NODE_LIVE')).secret_id,record.id);
+assert.ok((await c.listVariables()).some(v=>v.name==='NODE_LIVE'));
+await c.deleteVariable('NODE_LIVE');
+await c.deleteSecret('node-live');
+console.log('TypeScript live contract PASS');

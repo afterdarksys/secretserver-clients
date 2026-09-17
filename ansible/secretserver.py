@@ -7,7 +7,7 @@ __metaclass__ = type
 
 DOCUMENTATION = r"""
     name: secretserver
-    author: AfterDark Technologies <support@secretserver.io>
+    author: AfterDark Technologies (@afterdarksys)
     version_added: "1.0.0"
     short_description: Retrieve secrets from SecretServer.io
     description:
@@ -42,6 +42,10 @@ DOCUMENTATION = r"""
           - section: secretserver
             key: api_key
         type: str
+      render:
+        description: Resolve the term as a %%NAME%% template instead of a secret path.
+        type: bool
+        default: false
       timeout:
         description: HTTP request timeout in seconds.
         default: 10
@@ -52,44 +56,20 @@ DOCUMENTATION = r"""
           Overrides a version specified in the path term.
         type: int
     notes:
-      - Secret values are marked as no_log by Ansible automatically because
-        this is a lookup plugin. Still avoid printing them in debug tasks.
+      - Use no_log=true on every task consuming secrets. Lookup results are not automatically redacted.
       - Store the api_key in Ansible Vault, not in plaintext.
     seealso:
       - name: SecretServer API documentation
         link: https://secretserver.io/docs/api
+        description: REST API inventory.
     extends_documentation_fragment: []
 """
 
 EXAMPLES = r"""
-# Retrieve a secret by container/key path
-- name: Set DB password from SecretServer
+- name: Read a secret without logging its value
   ansible.builtin.set_fact:
-    db_pass: "{{ lookup('secretserver', 'production/database-password') }}"
-
-# Retrieve a historical version
-- name: Get previous version of a cert
-  ansible.builtin.set_fact:
-    old_cert: "{{ lookup('secretserver', 'certs/wildcard-cert/2') }}"
-
-# Use inline api_key (prefer Ansible Vault for this)
-- name: Lookup with explicit key
-  ansible.builtin.debug:
-    msg: "{{ lookup('secretserver', 'prod/my-secret', api_key=vault_ss_key) }}"
-
-# Multiple secrets in one lookup
-- name: Gather multiple secrets
-  ansible.builtin.set_fact:
-    secrets: "{{ lookup('secretserver', 'prod/db-pass', 'prod/smtp-pass', wantlist=True) }}"
-
-# Use in a template variable
-- name: Configure nginx with secrets from SecretServer
-  ansible.builtin.template:
-    src: nginx.conf.j2
-    dest: /etc/nginx/nginx.conf
-  vars:
-    tls_cert: "{{ lookup('secretserver', 'prod/nginx-tls-cert') }}"
-    tls_key:  "{{ lookup('secretserver', 'prod/nginx-tls-key') }}"
+    database_password: "{{ lookup('afterdark.secretserver.secretserver', 'prod/database-password', api_key=vault_ss_key) }}"
+  no_log: true
 """
 
 RETURN = r"""
@@ -108,7 +88,7 @@ from ansible.utils.display import Display
 
 try:
     # Python 3
-    from urllib.request import Request, urlopen
+    from urllib.request import Request, urlopen, build_opener, HTTPSHandler, HTTPRedirectHandler, ProxyHandler, getproxies_environment
     from urllib.error import HTTPError, URLError
     from urllib.parse import urljoin, quote
 except ImportError:
@@ -132,6 +112,10 @@ class LookupModule(LookupBase):
         api_key = self.get_option("api_key")
         timeout = int(self.get_option("timeout"))
         version_override = self.get_option("version")
+        if timeout <= 0:
+            raise AnsibleError("timeout must be positive")
+        if version_override is not None and not 1 <= int(version_override) <= 12:
+            raise AnsibleError("version must be between 1 and 12")
 
         if not api_key:
             raise AnsibleError(
@@ -141,10 +125,39 @@ class LookupModule(LookupBase):
 
         results = []
         for term in terms:
-            value = self._fetch_secret(api_url, api_key, term, version_override, timeout)
+            if self.get_option("render") or "%%" in term:
+                if version_override is not None:
+                    raise AnsibleError("Variable templates resolve current values; version is not supported")
+                value = self._render(api_url, api_key, term, timeout)
+            else:
+                value = self._fetch_secret(api_url, api_key, term, version_override, timeout)
             results.append(value)
 
         return results
+
+    def _render(self, api_url, api_key, template, timeout):
+        payload = json.dumps({"template": template}).encode("utf-8")
+        if len(payload) > 1024 * 1024:
+            raise AnsibleError("SecretServer template exceeds size limit")
+        req = Request(api_url + "/api/v1/variables/resolve", data=payload, headers={
+            "Authorization": "Bearer " + api_key, "Content-Type": "application/json",
+            "Accept": "application/json",
+        }, method="POST")
+        try:
+            opener = build_opener(ProxyHandler(getproxies_environment()), NoRedirect(), HTTPSHandler(context=ssl.create_default_context()))
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                raise AnsibleError("SecretServer response exceeds size limit")
+            result = json.loads(raw.decode("utf-8"))
+            if not isinstance(result, dict) or not isinstance(result.get("rendered"), str):
+                raise AnsibleError("SecretServer returned an invalid rendered response")
+            return result["rendered"]
+        except HTTPError as exc:
+            exc.close()
+            raise AnsibleError("SecretServer variable resolution failed (HTTP {})".format(exc.code)) from None
+        except (URLError, ValueError, UnicodeError):
+            raise AnsibleError("SecretServer variable resolution failed") from None
 
     def _fetch_secret(self, api_url, api_key, term, version_override, timeout):
         """Resolve the term to an API path and fetch the secret value."""
@@ -152,6 +165,8 @@ class LookupModule(LookupBase):
         parts = term.strip("/").split("/")
 
         if len(parts) == 1:
+            if version_override is not None and int(version_override) != 1:
+                raise AnsibleError("Historical reads require container/name/version")
             # Bare name — direct name lookup
             path = "/api/v1/secrets/" + quote(parts[0], safe="")
             display.vvv("SecretServer: name lookup: {}".format(path))
@@ -171,7 +186,12 @@ class LookupModule(LookupBase):
         elif len(parts) == 3:
             # container/key/version
             container, key, ver_str = parts
-            version = version_override or int(ver_str)
+            try:
+                version = version_override or int(ver_str)
+            except ValueError:
+                raise AnsibleError("version must be an integer")
+            if not 1 <= version <= 12:
+                raise AnsibleError("version must be between 1 and 12")
             if version == 1:
                 path = "/api/v1/s/{}/{}".format(
                     quote(container, safe=""), quote(key, safe="")
@@ -214,26 +234,41 @@ class LookupModule(LookupBase):
             ctx.verify_mode = ssl.CERT_NONE
 
         try:
-            resp = urlopen(req, timeout=timeout, context=ctx) if ctx else urlopen(req, timeout=timeout)
-            body = resp.read()
+            opener = build_opener(ProxyHandler(getproxies_environment()), NoRedirect(), HTTPSHandler(context=ctx or ssl.create_default_context()))
+            with opener.open(req, timeout=timeout) as resp:
+                body = resp.read(4 * 1024 * 1024 + 1)
+            if len(body) > 4 * 1024 * 1024:
+                raise AnsibleError("SecretServer response exceeds size limit")
             data = json.loads(body.decode("utf-8"))
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise AnsibleError(
-                "SecretServer API error {} for '{}': {}".format(exc.code, term, body)
-            )
+            raise AnsibleError("SecretServer API error {}".format(exc.code))
         except URLError as exc:
             raise AnsibleError(
-                "SecretServer connection error for '{}': {}".format(term, str(exc))
+                "SecretServer connection failed"
             )
 
-        # The API returns {"value": "..."} for secret lookups
-        if "value" not in data:
-            raise AnsibleError(
-                "SecretServer: unexpected response format for '{}': {}".format(
-                    term, json.dumps(data)[:200]
-                )
-            )
+        except (ValueError, UnicodeError):
+            raise AnsibleError("SecretServer returned invalid JSON")
+
+        value = extract_value(data)
 
         display.vvv("SecretServer: fetched value for '{}'".format(term))
-        return data["value"]
+        return value
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def extract_value(response):
+    if not isinstance(response, dict):
+        raise AnsibleError("SecretServer returned an invalid secret envelope")
+    sources = (response["data"],) if "data" in response else (response, response.get("meta"))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("value", "password", "token", "key", "passphrase", "bind_password", "certificate"):
+            if key in source and isinstance(source[key], str):
+                return source[key]
+    raise AnsibleError("SecretServer response contains no scalar secret; select a supported credential type")

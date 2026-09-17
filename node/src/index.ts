@@ -30,7 +30,11 @@ export interface ClientConfig {
   apiUrl?: string;
   /** Custom fetch implementation (default: global fetch) */
   fetchFn?: typeof fetch;
+  timeoutMs?: number;
 }
+
+export interface VariableAssignment { secret_type: string; secret_id: string; field: string; }
+export interface Variable extends VariableAssignment { id: string; name: string; }
 
 export interface Secret {
   id: string;
@@ -242,6 +246,7 @@ export class SecretServerClient {
   private readonly apiKey: string;
   private readonly apiUrl: string;
   private readonly fetchFn: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(config: ClientConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.SS_API_KEY ?? "";
@@ -249,6 +254,8 @@ export class SecretServerClient {
       .replace(/\/$/, "")
       .replace(/\/api\/v1$/, "");
     this.fetchFn = config.fetchFn ?? fetch;
+    this.timeoutMs = config.timeoutMs ?? 10000;
+    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) throw new SecretServerError("timeoutMs must be positive");
 
     if (!this.apiKey) {
       throw new AuthError("No API key provided. Set apiKey or SS_API_KEY env var.");
@@ -274,6 +281,8 @@ export class SecretServerClient {
     const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
     const res = await this.fetchFn(url, {
       method,
+      redirect: "error",
+      signal: AbortSignal.timeout(this.timeoutMs),
       headers: this.headers(),
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
@@ -283,7 +292,7 @@ export class SecretServerClient {
     try { data = JSON.parse(text); } catch { data = text; }
 
     if (!res.ok) {
-      const msg = (data as { error?: string })?.error ?? `HTTP ${res.status}`;
+      const msg = `SecretServer request failed (HTTP ${res.status})`;
       if (res.status === 401) throw new AuthError(msg);
       if (res.status === 403) throw new PermissionError(msg);
       if (res.status === 404) throw new NotFoundError(msg);
@@ -313,14 +322,31 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
 
   /** Get a secret value by path: "container/key" or "container/key/2" */
+  async assignVariable(name: string, assignment: VariableAssignment): Promise<Variable> {
+    return this.put<Variable>(`/variables/${encodeURIComponent(name)}`, assignment);
+  }
+  async getVariable(name: string): Promise<Variable> { return this.get<Variable>(`/variables/${encodeURIComponent(name)}`); }
+  async listVariables(): Promise<Variable[]> { return (await this.get<{variables: Variable[]}>("/variables")).variables; }
+  async deleteVariable(name: string): Promise<void> { await this.delete(`/variables/${encodeURIComponent(name)}`); }
+  async render(template: string): Promise<string> {
+    const result = await this.post<{rendered: string}>("/variables/resolve", {template});
+    if (typeof result?.rendered !== "string") throw new SecretServerError("Invalid rendered response");
+    return result.rendered;
+  }
+  async resolveDocument<T>(document: T): Promise<T> {
+    const result = await this.post<{document: T}>("/variables/resolve", {document});
+    if (!result || !("document" in result)) throw new SecretServerError("Invalid document response");
+    return result.document;
+  }
+
   async secret(path: string): Promise<string> {
     const parts = path.replace(/^\/|\/$/g, "").split("/");
     if (parts.length === 1) {
       const d = await this.get<{ value?: string; data?: { value?: string } }>(`/secrets/${encodeURIComponent(parts[0])}`);
-      return d.value ?? d.data?.value ?? "";
+      return scalar(d);
     }
-    const d = await this.get<{ value?: string }>(`/s/${parts.map(encodeURIComponent).join("/")}`);
-    return d.value ?? "";
+    const d = await this.get<{ value?: string; data?: Record<string, unknown> }>(`/s/${parts.map(encodeURIComponent).join("/")}`);
+    return scalar(d);
   }
 
   /** Get full secret object by path */
@@ -757,3 +783,11 @@ export class SecretServerClient {
 }
 
 export default SecretServerClient;
+
+function scalar(payload: {value?: string; data?: Record<string, unknown>}): string {
+ const data=payload.data ?? payload;
+ for (const key of ["value","password","token","key","passphrase","bind_password","certificate"]) {
+ const value=(data as Record<string,unknown>)[key];if(typeof value==="string") return value;
+ }
+ throw new SecretServerError("Secret response has no supported scalar field");
+}

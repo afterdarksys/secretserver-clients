@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "security_model": "operation_only",
+  "security_model": "operation_only_with_opt_in_secret_resolution",
   "tools": [
     {
       "name": "list_key_metadata",
@@ -12,6 +12,12 @@
       "permission": "keys:sign",
       "returns_secret_material": false,
       "requires_purpose": true
+    },
+    {
+      "name": "resolve_secret_template",
+      "returns_secret_material": true,
+      "enable_env": "SECRETSERVER_ENABLE_SECRET_RESOLUTION=1",
+      "permission": "underlying credential read/export permissions"
     }
   ]
 }
