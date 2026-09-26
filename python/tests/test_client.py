@@ -57,6 +57,29 @@ class ClientContractTests(unittest.TestCase):
         self.assertEqual(calls[4][2]["dns_names"], ["www.example.test"])
         self.assertNotIn("sans", calls[4][2])
 
+    def test_update_distinguishes_omitted_from_cleared_metadata(self):
+        client = SecretServerClient("sk_test", "https://example.test")
+        container = "5f0c5a4e-1111-4222-8333-444455556666"
+        puts = []
+
+        def respond(request, **_kwargs):
+            if request.get_method() == "GET":
+                return FakeResponse({"name": "db", "description": "keep", "tags": ["t"], "container_id": container})
+            puts.append(json.loads(request.data))
+            return FakeResponse({})
+
+        with patch("urllib.request.OpenerDirector.open", side_effect=respond):
+            client.update_secret("db", "kept")
+            client.update_secret("db", "cleared", description=None, tags=None, container_id=None)
+            client.update_secret("db", "moved", container_id="6f0c5a4e-1111-4222-8333-444455556666")
+
+        self.assertEqual((puts[0]["description"], puts[0]["tags"], puts[0]["container_id"]), ("keep", ["t"], container))
+        self.assertEqual((puts[1]["description"], puts[1]["tags"]), ("", []))
+        self.assertIn("container_id", puts[1])
+        self.assertIsNone(puts[1]["container_id"])
+        self.assertEqual(puts[2]["container_id"], "6f0c5a4e-1111-4222-8333-444455556666")
+        self.assertEqual((puts[2]["description"], puts[2]["tags"]), ("keep", ["t"]))
+
     def test_path_envelope_and_empty_value(self):
         client = SecretServerClient("sk_test", "https://example.test")
         for value in ("", "actual-value"):

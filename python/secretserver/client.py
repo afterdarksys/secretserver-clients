@@ -16,6 +16,9 @@ _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_RAW_BYTES = 16 * 1024 * 1024
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 
+# Marks an optional update argument the caller did not pass ("keep current").
+_UNSET: Any = object()
+
 # Values accepted by the server for :type in history, share and temp-access routes.
 SECRET_TYPES = frozenset({
     "secret", "password", "ssh_key", "gpg_key", "api_token", "openssl_key", "ntlm_hash",
@@ -358,14 +361,17 @@ class SecretServerClient:
         self,
         name: str,
         value: str,
-        description: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        container_id: Optional[str] = None,
+        description: Optional[str] = _UNSET,
+        tags: Optional[List[str]] = _UNSET,
+        container_id: Optional[str] = _UNSET,
     ) -> Dict:
         """Replace a secret's value, keeping metadata the caller does not override.
 
         The server's PUT replaces description, tags and container_id, so the
-        current record is read first and its metadata carried over.
+        current record is read first and its metadata carried over. Omitting an
+        argument keeps the current value; passing ``None`` clears it
+        (``container_id=None`` detaches the secret from its container,
+        ``description=None`` sends ``""`` and ``tags=None`` sends ``[]``).
         """
         route = f"/secrets/{_seg(name)}"
         current = self._get(route)
@@ -374,9 +380,9 @@ class SecretServerClient:
         body: Dict[str, Any] = {
             "name": name,
             "data": {"value": value},
-            "description": current.get("description", "") if description is None else description,
-            "tags": (current.get("tags") or []) if tags is None else tags,
-            "container_id": current.get("container_id") if container_id is None else container_id,
+            "description": current.get("description", "") if description is _UNSET else (description or ""),
+            "tags": (current.get("tags") or []) if tags is _UNSET else (tags or []),
+            "container_id": current.get("container_id") if container_id is _UNSET else container_id,
         }
         return self._put(route, body)
 
