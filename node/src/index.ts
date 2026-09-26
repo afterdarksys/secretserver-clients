@@ -43,6 +43,7 @@ export interface Variable extends VariableAssignment { id: string; name: string;
 
 export interface Secret {
   id: string;
+  container_id?: string | null;
   name: string;
   description?: string;
   data: Record<string, string>;
@@ -51,6 +52,27 @@ export interface Secret {
   created_at: string;
   updated_at: string;
 }
+
+/** Response of a container path lookup (/s/container/key[/version]). */
+export interface PathSecret {
+  meta: {
+    secret_id: string;
+    secret_type: SecretType;
+    name: string;
+    value: string;
+    version: number;
+    is_history: boolean;
+    created_at: string;
+  };
+  data: Record<string, unknown>;
+}
+
+export const SECRET_TYPES = [
+  "secret", "password", "ssh_key", "gpg_key", "api_token", "openssl_key", "ntlm_hash", "certificate",
+  "computer_credential", "wifi_credential", "windows_credential", "social_credential", "disk_credential",
+  "service_config_credential", "root_credential", "ldap_bind_credential", "integration_credential", "code_signing_key",
+] as const;
+export type SecretType = typeof SECRET_TYPES[number];
 
 export interface Container {
   id: string;
@@ -64,11 +86,23 @@ export interface Certificate {
   id: string;
   name: string;
   common_name: string;
-  issuer: string;
-  not_before: string;
-  not_after: string;
+  dns_names?: string[];
+  issuer_type: string;
+  issuer_name: string;
+  serial_number?: string;
+  status: string;
+  not_before?: string;
+  not_after?: string;
+  days_until_expiry?: number;
   auto_renew: boolean;
+  renew_before: number;
+  fingerprint?: string;
+  created_at: string;
+  updated_at: string;
 }
+
+export type CertificateTextFormat = "pem" | "pem-bundle" | "key";
+export type CertificateBinaryFormat = "pfx" | "p12";
 
 export interface SSHKey {
   id: string;
@@ -81,26 +115,124 @@ export interface SSHKey {
 export interface Password {
   id: string;
   name: string;
-  username: string;
+  description?: string;
+  username?: string;
   url?: string;
+  /** Only present on create/generate responses and explicit reads. */
+  value?: string;
+  tags?: string[];
+  strength?: Record<string, unknown>;
   created_at: string;
+  updated_at?: string;
+}
+
+export interface GeneratePasswordOptions {
+  /** 8..128, default 32 */
+  length?: number;
+  useLowercase?: boolean;
+  useUppercase?: boolean;
+  useDigits?: boolean;
+  useSymbols?: boolean;
+  description?: string;
+  username?: string;
+  url?: string;
+  tags?: string[];
+}
+
+export type APITokenEnvironment = "production" | "staging" | "development";
+
+export interface APIToken {
+  id: string;
+  name: string;
+  description?: string;
+  service: string;
+  token_prefix: string;
+  environment: APITokenEnvironment;
+  expires_at?: string;
+  last_used_at?: string;
+  created_at: string;
+  /** Only present on create/rotate responses. */
+  value?: string;
+}
+
+export type GPGAlgorithm = "RSA2048" | "RSA4096" | "ED25519";
+
+export interface GPGKeyGenerated {
+  id: string;
+  fingerprint: string;
+  key_id: string;
+  public_key: string;
+  algorithm: GPGAlgorithm;
+  name: string;
+  email: string;
+  created_at: string;
+}
+
+export interface GPGExport {
+  key: string;
+  format: "public" | "private";
+  fingerprint: string;
+  key_id: string;
+}
+
+export type OpenSSLAlgorithm = "rsa" | "ecdsa" | "ed25519";
+
+export interface OpenSSLKeyOptions {
+  /** RSA only: 2048 or 4096 (server default 4096) */
+  keySize?: number;
+  /** ECDSA only: P-256, P-384 or P-521 */
+  curve?: string;
+  description?: string;
+  passphrase?: string;
+}
+
+export interface ExportOptions {
+  includePasswords?: boolean;
+  includeSecrets?: boolean;
+  includeSSHKeys?: boolean;
+  includeCertificates?: boolean;
+  /** Only export items carrying at least one of these tags. */
+  tags?: string[];
+}
+
+export interface AuditLogQuery {
+  limit?: number;
+  offset?: number;
+  action?: string;
+  resource?: string;
+  resource_id?: string;
+  user_id?: string;
+  start_date?: string | Date;
+  end_date?: string | Date;
 }
 
 export interface VersionEntry {
+  id: string;
+  secret_id: string;
+  secret_type: SecretType;
   version_num: number;
-  created_by: string;
+  created_by?: string;
   created_at: string;
 }
 
+/** Share target: exactly one of userId / groupId (UUIDs). */
+export type ShareTarget = { userId: string; groupId?: undefined } | { groupId: string; userId?: undefined };
+
 export interface ShareResult {
   id: string;
-  shared_with_email: string;
+  secret_id: string;
+  secret_type: SecretType;
+  shared_with_user_id?: string;
+  shared_with_group_id?: string;
   permission: "read" | "manage";
   expires_at?: string;
+  created_at: string;
 }
 
 export interface TempAccessResult {
+  id: string;
   token: string;
+  duration_seconds: number;
   expires_at: string;
 }
 
@@ -119,15 +251,16 @@ export interface TOTPToken {
 export interface TOTPCode {
   code: string;
   expires_in: number;
+  period: number;
 }
 
 export interface TOTPExport {
   uri: string;
-  qr_code?: string;
 }
 
 export interface YubikeyCredential {
   id: string;
+  container_id?: string | null;
   name: string;
   serial_number?: string;
   public_id: string;
@@ -198,6 +331,7 @@ export interface SignResult {
 
 export interface JKSKeystore {
   id: string;
+  container_id?: string | null;
   name: string;
   store_type: "raw" | "managed";
   entry_count?: number;
@@ -269,6 +403,25 @@ function seg(value: string | number): string {
   const s = String(value);
   if (s === "" || s === "." || s === "..") throw new SecretServerError("Invalid path segment");
   return encodeURIComponent(s);
+}
+
+function secretTypeSeg(type: SecretType): string {
+  if (!(SECRET_TYPES as readonly string[]).includes(type)) throw new SecretServerError("Invalid secret type");
+  return seg(type);
+}
+
+/** Split and validate "name", "container/key" or "container/key/version" (version 1..12). */
+function secretPath(path: string): string[] {
+  const parts = path.replace(/^\/|\/$/g, "").split("/");
+  if (parts.length > 3 || parts.some(p => p === "")) throw new SecretServerError("Secret path must be name, container/key or container/key/version");
+  if (parts.length === 3 && !/^(?:[1-9]|1[0-2])$/.test(parts[2])) throw new SecretServerError("Secret version must be between 1 and 12");
+  return parts;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
 }
 
 async function discardBody(res: Response): Promise<void> {
@@ -403,12 +556,15 @@ export class SecretServerClient {
   // Path-based secret access (primary interface)
   // -----------------------------------------------------------------------
 
-  /** Get a secret value by path: "container/key" or "container/key/2" */
+  /** Assign a named variable. Requires an identity with admin:all. */
   async assignVariable(name: string, assignment: VariableAssignment): Promise<Variable> {
     return this.put<Variable>(`/variables/${seg(name)}`, assignment);
   }
+  /** Requires admin:all. */
   async getVariable(name: string): Promise<Variable> { return this.get<Variable>(`/variables/${seg(name)}`); }
+  /** Requires admin:all. */
   async listVariables(): Promise<Variable[]> { return (await this.get<{variables: Variable[]}>("/variables")).variables; }
+  /** Requires admin:all. */
   async deleteVariable(name: string): Promise<void> { await this.delete(`/variables/${seg(name)}`); }
   async render(template: string): Promise<string> {
     const result = await this.post<{rendered: string}>("/variables/resolve", {template});
@@ -421,8 +577,9 @@ export class SecretServerClient {
     return result.document;
   }
 
+  /** Get a secret value by path: "name", "container/key" or "container/key/2" (version 1..12). */
   async secret(path: string): Promise<string> {
-    const parts = path.replace(/^\/|\/$/g, "").split("/");
+    const parts = secretPath(path);
     if (parts.length === 1) {
       const d = await this.get<{ value?: string; data?: { value?: string } }>(`/secrets/${seg(parts[0])}`);
       return scalar(d);
@@ -431,9 +588,12 @@ export class SecretServerClient {
     return scalar(d);
   }
 
-  /** Get full secret object by path */
-  async getSecret(path: string): Promise<Secret> {
-    const parts = path.replace(/^\/|\/$/g, "").split("/");
+  /**
+   * Get the full secret: a Secret for a bare name, or {meta, data} (PathSecret)
+   * for "container/key[/version]".
+   */
+  async getSecret(path: string): Promise<Secret | PathSecret> {
+    const parts = secretPath(path);
     if (parts.length === 1) return this.get(`/secrets/${seg(parts[0])}`);
     return this.get(`/s/${parts.map(seg).join("/")}`);
   }
@@ -455,11 +615,26 @@ export class SecretServerClient {
     });
   }
 
-  async updateSecret(name: string, value: string): Promise<Secret> {
-    return this.put(`/secrets/${seg(name)}`, { name, data: { value } });
+  /**
+   * Replace a secret's value. The server PUT is a full replace, so the current
+   * description, tags and container are read first and preserved unless given.
+   */
+  async updateSecret(
+    name: string,
+    value: string,
+    opts: { description?: string; tags?: string[]; containerID?: string | null } = {},
+  ): Promise<Secret> {
+    const current = await this.get<Secret>(`/secrets/${seg(name)}`);
+    return this.put(`/secrets/${seg(name)}`, {
+      name,
+      data: { value },
+      description: opts.description ?? current.description ?? "",
+      tags: opts.tags ?? current.tags ?? [],
+      container_id: opts.containerID !== undefined ? opts.containerID : current.container_id ?? null,
+    });
   }
 
-  async deleteSecret(name: string): Promise<void> { return this.delete(`/secrets/${seg(name)}`); }
+  async deleteSecret(name: string): Promise<{ message: string }> { return this.delete(`/secrets/${seg(name)}`); }
 
   // -----------------------------------------------------------------------
   // Containers
@@ -483,7 +658,25 @@ export class SecretServerClient {
   }
 
   async renewCertificate(id: string): Promise<Certificate> { return this.post(`/certificates/${seg(id)}/renew`); }
-  async downloadCertificate(id: string): Promise<{ pem: string }> { return this.get(`/certificates/${seg(id)}/download`); }
+  /**
+   * Download certificate material. Text formats (pem, pem-bundle, key) return a
+   * string; pfx/p12 return bytes and require an export password.
+   */
+  async downloadCertificate(id: string, opts?: { format?: CertificateTextFormat }): Promise<string>;
+  async downloadCertificate(id: string, opts: { format: CertificateBinaryFormat; password: string }): Promise<Uint8Array>;
+  async downloadCertificate(
+    id: string,
+    opts: { format?: CertificateTextFormat | CertificateBinaryFormat; password?: string } = {},
+  ): Promise<string | Uint8Array> {
+    const format = opts.format ?? "pem";
+    const binary = format === "pfx" || format === "p12";
+    if (!["pem", "pem-bundle", "key", "pfx", "p12"].includes(format)) throw new SecretServerError("Invalid certificate format");
+    if (binary && !opts.password) throw new SecretServerError("A password is required for pfx/p12 export");
+    const q = new URLSearchParams({ format });
+    if (binary) q.set("password", opts.password as string);
+    const bytes = await this.download(`/certificates/${seg(id)}/download?${q}`);
+    return binary ? bytes : new TextDecoder().decode(bytes);
+  }
 
   // -----------------------------------------------------------------------
   // Operation-only cryptographic backends
@@ -495,8 +688,16 @@ export class SecretServerClient {
     return this.get(`/crypto/signing-keys?backend=${encodeURIComponent(backend)}`);
   }
 
-  async sign(backend: string, keyId: string, message: string, purpose: string): Promise<SignResult> {
-    return this.post("/crypto/sign", { backend, key_id: keyId, message, purpose });
+  /**
+   * Sign a message in place on the backend. `message` is the raw payload:
+   * bytes, or a string that is UTF-8 encoded. The client base64-encodes it.
+   */
+  async sign(backend: string, keyId: string, message: Uint8Array | string, purpose: string): Promise<SignResult> {
+    const bytes = typeof message === "string" ? new TextEncoder().encode(message) : message;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > 1024 * 1024) {
+      throw new SecretServerError("message must be between 1 byte and 1 MiB");
+    }
+    return this.post("/crypto/sign", { backend, key_id: keyId, message: bytesToBase64(bytes), purpose });
   }
 
   // -----------------------------------------------------------------------
@@ -505,11 +706,23 @@ export class SecretServerClient {
 
   async listJKSKeystores(): Promise<JKSKeystore[]> { return this.get("/jks-keystores"); }
   async getJKSKeystore(id: string): Promise<JKSKeystore> { return this.get(`/jks-keystores/${seg(id)}`); }
-  async createJKSKeystore(input: CreateJKSKeystoreInput): Promise<JKSKeystore> {
+  async createJKSKeystore(input: CreateJKSKeystoreInput): Promise<{ id: string; name: string; store_type: "raw" | "managed"; created_at: string }> {
     return this.post("/jks-keystores", input);
   }
-  async updateJKSKeystore(id: string, input: Partial<CreateJKSKeystoreInput>): Promise<{ message: string }> {
-    return this.put(`/jks-keystores/${seg(id)}`, input);
+  /**
+   * Update a keystore. The server PUT is a full replace of name, container,
+   * notes and tags, so the current record is read and merged first.
+   */
+  async updateJKSKeystore(id: string, input: Partial<Omit<CreateJKSKeystoreInput, "store_type">>): Promise<{ message: string }> {
+    const current = await this.get<JKSKeystore>(`/jks-keystores/${seg(id)}`);
+    return this.put(`/jks-keystores/${seg(id)}`, {
+      name: input.name ?? current.name,
+      container_id: input.container_id !== undefined ? input.container_id : current.container_id ?? null,
+      notes: input.notes ?? current.notes ?? "",
+      tags: input.tags ?? current.tags ?? [],
+      jks: input.jks,
+      password: input.password,
+    });
   }
   async deleteJKSKeystore(id: string): Promise<void> { return this.delete(`/jks-keystores/${seg(id)}`); }
   async exportJKSKeystore(id: string): Promise<JKSExport> { return this.get(`/jks-keystores/${seg(id)}/export`); }
@@ -557,34 +770,72 @@ export class SecretServerClient {
 
   async listPasswords(): Promise<Password[]> { return this.getList("/passwords", "passwords"); }
 
-  async createPassword(name: string, username: string, password: string, url?: string): Promise<Password> {
-    return this.post("/passwords", { name, username, password, url });
+  async createPassword(name: string, username: string, value: string, url?: string): Promise<Password> {
+    return this.post("/passwords", { name, username, value, url });
   }
 
-  async generatePassword(length = 32, includeSymbols = true): Promise<{ password: string }> {
-    return this.post("/passwords/generate", { length, include_symbols: includeSymbols });
+  /** Generate and STORE a new password record; the generated secret is in `value`. */
+  async generatePassword(name: string, opts: GeneratePasswordOptions = {}): Promise<Password> {
+    const length = opts.length ?? 32;
+    if (!name) throw new SecretServerError("name is required");
+    if (!Number.isInteger(length) || length < 8 || length > 128) throw new SecretServerError("length must be between 8 and 128");
+    return this.post("/passwords/generate", {
+      name,
+      description: opts.description,
+      username: opts.username,
+      url: opts.url,
+      tags: opts.tags,
+      length,
+      use_lowercase: opts.useLowercase ?? true,
+      use_uppercase: opts.useUppercase ?? true,
+      use_digits: opts.useDigits ?? true,
+      use_symbols: opts.useSymbols ?? true,
+    });
   }
 
   // -----------------------------------------------------------------------
   // API Tokens
   // -----------------------------------------------------------------------
 
-  async listAPITokens(): Promise<unknown[]> { return this.getList("/api-tokens", "tokens"); }
-  async createAPIToken(name: string, service: string, token: string): Promise<unknown> {
-    return this.post("/api-tokens", { name, service, token });
+  async listAPITokens(): Promise<APIToken[]> { return this.getList("/api-tokens", "tokens"); }
+  async createAPIToken(
+    name: string,
+    service: string,
+    value: string,
+    environment: APITokenEnvironment,
+    opts: { description?: string; expiresAt?: Date } = {},
+  ): Promise<APIToken> {
+    if (!["production", "staging", "development"].includes(environment)) {
+      throw new SecretServerError("environment must be production, staging or development");
+    }
+    return this.post("/api-tokens", {
+      name, service, value, environment,
+      description: opts.description,
+      expires_at: opts.expiresAt?.toISOString(),
+    });
   }
-  async rotateAPIToken(id: string): Promise<unknown> { return this.post(`/api-tokens/${seg(id)}/rotate`); }
+  /** Replace a token's stored value with `value`. */
+  async rotateAPIToken(id: string, value: string): Promise<APIToken> {
+    return this.post(`/api-tokens/${seg(id)}/rotate`, { value });
+  }
 
   // -----------------------------------------------------------------------
   // GPG Keys
   // -----------------------------------------------------------------------
 
   async listGPGKeys(): Promise<unknown[]> { return this.getList("/gpg-keys", "keys"); }
-  async generateGPGKey(name: string, email: string, opts: { keyType?: string; expiresInDays?: number } = {}): Promise<unknown> {
-    return this.post("/gpg-keys/generate", { name, email, key_type: opts.keyType, expires_in_days: opts.expiresInDays });
+  async generateGPGKey(
+    name: string,
+    email: string,
+    opts: { algorithm?: GPGAlgorithm; comment?: string; passphrase?: string } = {},
+  ): Promise<GPGKeyGenerated> {
+    const algorithm = opts.algorithm ?? "ED25519";
+    if (!["RSA2048", "RSA4096", "ED25519"].includes(algorithm)) throw new SecretServerError("algorithm must be RSA2048, RSA4096 or ED25519");
+    return this.post("/gpg-keys/generate", { name, email, algorithm, comment: opts.comment, passphrase: opts.passphrase });
   }
-  async exportGPGKey(id: string): Promise<{ public_key: string; private_key: string }> {
-    return this.get(`/gpg-keys/${seg(id)}/export`);
+  async exportGPGKey(id: string, format: "public" | "private" = "public"): Promise<GPGExport> {
+    if (format !== "public" && format !== "private") throw new SecretServerError("format must be public or private");
+    return this.get(`/gpg-keys/${seg(id)}/export?${new URLSearchParams({ format })}`);
   }
 
   async deleteGPGKey(id: string): Promise<void> { return this.delete(`/gpg-keys/${seg(id)}`); }
@@ -599,7 +850,7 @@ export class SecretServerClient {
       get: async (id: string) => this.get<unknown>(`/${resource}/${seg(id)}`),
       create: async (data: unknown) => this.post<unknown>(`/${resource}`, data),
       update: async (id: string, data: unknown) => this.put<unknown>(`/${resource}/${seg(id)}`, data),
-      delete: async (id: string) => this.delete<void>(`/${resource}/${seg(id)}`),
+      delete: async (id: string) => this.delete<{ message: string }>(`/${resource}/${seg(id)}`),
     };
   }
 
@@ -618,43 +869,55 @@ export class SecretServerClient {
   // Version history
   // -----------------------------------------------------------------------
 
-  async getHistory(secretType: string, secretId: string): Promise<VersionEntry[]> {
-    const d = await this.get<{ versions?: VersionEntry[] }>(`/${seg(secretType)}/${seg(secretId)}/history`);
-    return d.versions ?? [];
+  async getHistory(secretType: SecretType, secretId: string): Promise<VersionEntry[]> {
+    const d = await this.get<VersionEntry[] | null>(`/${secretTypeSeg(secretType)}/${seg(secretId)}/history`);
+    if (d === null || d === undefined) return [];
+    if (!Array.isArray(d)) throw new SecretServerError("Invalid history response");
+    return d;
   }
 
-  async getVersion(secretType: string, secretId: string, version: number): Promise<unknown> {
-    return this.get(`/${seg(secretType)}/${seg(secretId)}/history/${seg(version)}`);
+  async getVersion(secretType: SecretType, secretId: string, version: number): Promise<unknown> {
+    return this.get(`/${secretTypeSeg(secretType)}/${seg(secretId)}/history/${seg(version)}`);
   }
 
-  async getHistorySettings(secretType: string, secretId: string): Promise<{ history_enabled: boolean; max_versions: number }> {
-    return this.get(`/${seg(secretType)}/${seg(secretId)}/history-settings`);
+  async getHistorySettings(secretType: SecretType, secretId: string): Promise<{ history_enabled: boolean; max_versions: number }> {
+    return this.get(`/${secretTypeSeg(secretType)}/${seg(secretId)}/history-settings`);
   }
 
-  async updateHistorySettings(secretType: string, secretId: string, enabled: boolean, maxVersions: number): Promise<unknown> {
-    return this.put(`/${seg(secretType)}/${seg(secretId)}/history-settings`, { history_enabled: enabled, max_versions: maxVersions });
+  async updateHistorySettings(secretType: SecretType, secretId: string, enabled: boolean, maxVersions: number): Promise<{ message: string }> {
+    return this.put(`/${secretTypeSeg(secretType)}/${seg(secretId)}/history-settings`, { history_enabled: enabled, max_versions: maxVersions });
   }
 
   // -----------------------------------------------------------------------
   // Sharing & temp access
   // -----------------------------------------------------------------------
 
+  /** Share with exactly one user or group (UUIDs). */
   async share(
-    secretType: string,
+    secretType: SecretType,
     secretId: string,
-    email: string,
+    target: ShareTarget,
     permission: "read" | "manage" = "read",
     expiresAt?: Date,
   ): Promise<ShareResult> {
-    return this.post(`/${seg(secretType)}/${seg(secretId)}/shares`, {
-      shared_with_email: email,
+    const userId = target?.userId;
+    const groupId = target?.groupId;
+    if (Boolean(userId) === Boolean(groupId)) throw new SecretServerError("share requires exactly one of userId or groupId");
+    if (permission !== "read" && permission !== "manage") throw new SecretServerError("permission must be read or manage");
+    return this.post(`/${secretTypeSeg(secretType)}/${seg(secretId)}/shares`, {
+      shared_with_user_id: userId,
+      shared_with_group_id: groupId,
       permission,
       expires_at: expiresAt?.toISOString(),
     });
   }
 
-  async createTempAccess(secretType: string, secretId: string, durationSeconds = 900): Promise<TempAccessResult> {
-    return this.post(`/${seg(secretType)}/${seg(secretId)}/temp-access`, { duration_seconds: durationSeconds });
+  /** Create a token-gated read grant lasting 60..86400 seconds. */
+  async createTempAccess(secretType: SecretType, secretId: string, durationSeconds = 900): Promise<TempAccessResult> {
+    if (!Number.isInteger(durationSeconds) || durationSeconds < 60 || durationSeconds > 86400) {
+      throw new SecretServerError("durationSeconds must be between 60 and 86400");
+    }
+    return this.post(`/${secretTypeSeg(secretType)}/${seg(secretId)}/temp-access`, { duration_seconds: durationSeconds });
   }
 
   // -----------------------------------------------------------------------
@@ -677,12 +940,19 @@ export class SecretServerClient {
   // Audit
   // -----------------------------------------------------------------------
 
-  async getAuditLogs(opts: { limit?: number; offset?: number; action?: string } = {}): Promise<{ logs: unknown[]; total: number }> {
-    const q = new URLSearchParams(opts as Record<string, string>).toString();
-    return this.get(`/audit/logs${q ? `?${q}` : ""}`);
+  async getAuditLogs(opts: AuditLogQuery = {}): Promise<{ logs: unknown[]; total: number }> {
+    const q = new URLSearchParams();
+    for (const [key, value] of Object.entries(opts)) {
+      if (value === undefined || value === null) continue;
+      q.set(key, value instanceof Date ? value.toISOString() : String(value));
+    }
+    const qs = q.toString();
+    return this.get(`/audit/logs${qs ? `?${qs}` : ""}`);
   }
 
-  async exportAuditLogs(): Promise<unknown> { return this.get("/audit/logs/export"); }
+  async exportAuditLogs(): Promise<{ logs: unknown[]; total: number; exported_at: string }> {
+    return this.get("/audit/logs/export?format=json");
+  }
 
   // -----------------------------------------------------------------------
   // OpenSSL Keys
@@ -691,12 +961,27 @@ export class SecretServerClient {
   async listOpenSSLKeys(): Promise<unknown[]> { return this.getList("/openssl-keys", "openssl_keys", "keys"); }
   async getOpenSSLKey(id: string): Promise<unknown> { return this.get(`/openssl-keys/${seg(id)}`); }
 
-  async generateOpenSSLKey(name: string, keyType = "rsa", bits = 4096): Promise<unknown> {
-    return this.post("/openssl-keys/generate", { name, key_type: keyType, bits });
+  async generateOpenSSLKey(
+    name: string,
+    algorithm: OpenSSLAlgorithm = "rsa",
+    opts: OpenSSLKeyOptions = {},
+  ): Promise<{ id: string; name: string; algorithm: OpenSSLAlgorithm; public_key: string; created_at: string }> {
+    return this.post("/openssl-keys/generate", {
+      name, algorithm, key_size: opts.keySize, curve: opts.curve,
+      description: opts.description, passphrase: opts.passphrase,
+    });
   }
 
-  async importOpenSSLKey(name: string, privateKey: string): Promise<unknown> {
-    return this.post("/openssl-keys/import", { name, private_key: privateKey });
+  async importOpenSSLKey(
+    name: string,
+    privateKey: string,
+    algorithm: OpenSSLAlgorithm,
+    opts: OpenSSLKeyOptions & { publicKey?: string } = {},
+  ): Promise<{ id: string; name: string; algorithm: OpenSSLAlgorithm; created_at: string }> {
+    return this.post("/openssl-keys/import", {
+      name, algorithm, private_key: privateKey, public_key: opts.publicKey,
+      key_size: opts.keySize, curve: opts.curve, description: opts.description, passphrase: opts.passphrase,
+    });
   }
 
   async exportOpenSSLKey(id: string): Promise<{ public_key: string; private_key: string }> {
@@ -734,8 +1019,9 @@ export class SecretServerClient {
 
   async listWebhooks(): Promise<unknown[]> { return this.getList("/webhooks", "webhooks"); }
 
-  async createWebhook(name: string, url: string, events: string[], authType = "none"): Promise<unknown> {
-    return this.post("/webhooks", { name, url, events, auth_type: authType });
+  /** `secret`, when given, is used by the server to sign deliveries. */
+  async createWebhook(name: string, url: string, events: string[], secret?: string): Promise<unknown> {
+    return this.post("/webhooks", { name, url, secret, events });
   }
 
   async listWebhookDeliveries(webhookId: string): Promise<unknown[]> {
@@ -750,21 +1036,20 @@ export class SecretServerClient {
   // Export
   // -----------------------------------------------------------------------
 
-  async exportToKeychain(items: unknown[]): Promise<unknown> {
-    return this.post("/export/keychain", { items });
+  // Exports are tenant-wide. With every include flag false (the default) the
+  // server exports all categories; `tags` narrows the result.
+
+  async exportToKeychain(opts: ExportOptions = {}): Promise<unknown> {
+    return this.post("/export/keychain", exportBody(opts));
   }
 
-  async exportToCredentialManager(items: unknown[]): Promise<unknown> {
-    return this.post("/export/credential-manager", { items });
+  async exportToCredentialManager(opts: ExportOptions = {}): Promise<unknown> {
+    return this.post("/export/credential-manager", exportBody(opts));
   }
 
-  async exportToJSON(items: unknown[]): Promise<unknown> {
-    return this.post("/export/json", { items });
+  async exportToJSON(opts: ExportOptions = {}): Promise<{ format: "json"; items: unknown[] | null; count: number; exported_at: string; version: string }> {
+    return this.post("/export/json", exportBody(opts));
   }
-
-  // -----------------------------------------------------------------------
-  // TOTP Authenticators
-  // -----------------------------------------------------------------------
 
   // -----------------------------------------------------------------------
   // YubiKey OTP Credentials
@@ -776,15 +1061,33 @@ export class SecretServerClient {
   async createYubikey(
     name: string, publicId: string, clientId: string, apiKey: string,
     opts: { serialNumber?: string; validationServer?: string; notes?: string } = {}
-  ): Promise<YubikeyCredential> {
+  ): Promise<{ id: string; name: string; public_id: string; created_at: string }> {
     return this.post("/yubikeys", {
       name, public_id: publicId, client_id: clientId, api_key: apiKey,
       serial_number: opts.serialNumber, validation_server: opts.validationServer, notes: opts.notes,
     });
   }
 
-  async updateYubikey(id: string, data: Partial<YubikeyCredential & { api_key: string }>): Promise<unknown> {
-    return this.put(`/yubikeys/${seg(id)}`, data);
+  /**
+   * Update a YubiKey credential. The server PUT is a full replace of the
+   * metadata, so the current record is read and merged first.
+   */
+  async updateYubikey(
+    id: string,
+    data: Partial<Omit<YubikeyCredential, "id" | "created_at" | "updated_at"> & { api_key: string }>,
+  ): Promise<{ message: string }> {
+    const current = await this.get<YubikeyCredential>(`/yubikeys/${seg(id)}`);
+    return this.put(`/yubikeys/${seg(id)}`, {
+      name: data.name ?? current.name,
+      container_id: data.container_id !== undefined ? data.container_id : current.container_id ?? null,
+      serial_number: data.serial_number ?? current.serial_number ?? "",
+      public_id: data.public_id ?? current.public_id,
+      client_id: data.client_id ?? current.client_id,
+      validation_server: data.validation_server ?? current.validation_server,
+      notes: data.notes ?? current.notes ?? "",
+      tags: data.tags ?? current.tags ?? [],
+      api_key: data.api_key,
+    });
   }
 
   async deleteYubikey(id: string): Promise<void> { return this.delete(`/yubikeys/${seg(id)}`); }
@@ -794,8 +1097,12 @@ export class SecretServerClient {
     return this.post(`/yubikeys/${seg(id)}/validate`, { otp });
   }
 
+  // -----------------------------------------------------------------------
+  // TOTP Authenticators
+  // -----------------------------------------------------------------------
+
   /** List all TOTP authenticator tokens */
-  async listTOTPTokens(): Promise<TOTPToken[]> { return this.get("/totp-tokens"); }
+  async listTOTPTokens(): Promise<TOTPToken[]> { return this.getList("/totp-tokens", "tokens"); }
 
   /** Get a specific TOTP token by ID */
   async getTOTPToken(id: string): Promise<TOTPToken> { return this.get(`/totp-tokens/${seg(id)}`); }
@@ -838,7 +1145,7 @@ export class SecretServerClient {
   /**
    * Generate a TOTP code for the given token
    *
-   * Returns an object with 'code' and 'expires_in' (seconds remaining)
+   * Returns 'code', 'expires_in' (seconds remaining) and 'period'.
    */
   async generateTOTPCode(id: string): Promise<TOTPCode> {
     return this.post(`/totp-tokens/${seg(id)}/generate`);
@@ -857,7 +1164,7 @@ export class SecretServerClient {
   /**
    * Export a TOTP token to an otpauth:// URI
    *
-   * Returns an object with 'uri' and 'qr_code' (base64-encoded PNG)
+   * Returns an object with the otpauth:// 'uri'.
    */
   async exportTOTPToURI(id: string): Promise<TOTPExport> {
     return this.get(`/totp-tokens/${seg(id)}/export`);
@@ -865,6 +1172,16 @@ export class SecretServerClient {
 }
 
 export default SecretServerClient;
+
+function exportBody(opts: ExportOptions) {
+  return {
+    include_passwords: opts.includePasswords ?? false,
+    include_secrets: opts.includeSecrets ?? false,
+    include_ssh_keys: opts.includeSSHKeys ?? false,
+    include_certificates: opts.includeCertificates ?? false,
+    tags: opts.tags,
+  };
+}
 
 function scalar(payload: {value?: string; data?: Record<string, unknown>}): string {
  const data=payload.data ?? payload;

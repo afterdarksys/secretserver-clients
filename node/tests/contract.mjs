@@ -22,8 +22,11 @@ await client.enrollCertificate("wildcard", "example.test", ["www.example.test"])
 
 assert.equal(secrets[0].name, "db");
 assert.equal(calls[0].url, "https://example.test/api/v1/secrets");
-assert.equal(JSON.parse(calls[1].init.body).name, "prod/db");
-const enrollment = JSON.parse(calls[2].init.body);
+assert.equal(calls[1].init.method, "GET");
+assert.equal(calls[2].init.method, "PUT");
+assert.equal(calls[2].url, "https://example.test/api/v1/secrets/prod%2Fdb");
+assert.equal(JSON.parse(calls[2].init.body).name, "prod/db");
+const enrollment = JSON.parse(calls[3].init.body);
 assert.deepEqual(enrollment.dns_names, ["www.example.test"]);
 assert.equal("sans" in enrollment, false);
 
@@ -95,5 +98,142 @@ assert.equal(seen.length, before);
 
 // 3. Redirects are never followed.
 assert.equal(seen.at(-1).init.redirect, 'error');
+
+
+// --- Contract fixes against the server handlers ---
+function stub(routes) {
+  const log = [];
+  const client = new SecretServerClient({ apiKey: KEY, apiUrl: 'https://example.test', fetchFn: async (url, init) => {
+    const path = url.replace('https://example.test/api/v1', '');
+    log.push({ path, method: init.method, body: init.body ? JSON.parse(init.body) : undefined });
+    const hit = routes[`${init.method} ${path.split('?')[0]}`];
+    if (hit instanceof Uint8Array || typeof hit === 'string') return new Response(hit, { status: 200 });
+    return new Response(JSON.stringify(hit ?? {}), { status: 200 });
+  } });
+  return { client, log, last: () => log.at(-1) };
+}
+
+// updateSecret is read-merge-write: container, description and tags survive.
+{
+  const cid = '11111111-1111-1111-1111-111111111111';
+  const { client, log } = stub({ 'GET /secrets/db': { id: 'x', name: 'db', description: 'd', tags: ['t'], container_id: cid } });
+  await client.updateSecret('db', 'v2');
+  assert.deepEqual(log[1], { path: '/secrets/db', method: 'PUT', body: { name: 'db', data: { value: 'v2' }, description: 'd', tags: ['t'], container_id: cid } });
+  await client.updateSecret('db', 'v3', { containerID: null, tags: [] });
+  assert.equal(log[3].body.container_id, null);
+  assert.deepEqual(log[3].body.tags, []);
+}
+
+// secret()/getSecret(): 1..3 segments, version 1..12, container path returns {meta,data}.
+{
+  const { client, log } = stub({ 'GET /s/prod/db': { meta: { value: 'v' }, data: { value: 'v' } } });
+  assert.deepEqual(await client.getSecret('prod/db'), { meta: { value: 'v' }, data: { value: 'v' } });
+  for (const bad of ['a/b/c/d', 'a//b', 'a/b/0', 'a/b/13', 'a/b/x']) {
+    await assert.rejects(client.secret(bad), SecretServerError, bad);
+    await assert.rejects(client.getSecret(bad), SecretServerError, bad);
+  }
+  assert.equal(log.length, 1);
+  await assert.rejects(client.secret('prod/db/12'), /no supported scalar/);
+  assert.equal(log.at(-1).path, '/s/prod/db/12');
+}
+
+// :type validation, bare-array history, share by user/group id, temp access range.
+{
+  const { client, log, last } = stub({ 'GET /secret/abc/history': [{ id: 'h', version_num: 1 }] });
+  assert.deepEqual(await client.getHistory('secret', 'abc'), [{ id: 'h', version_num: 1 }]);
+  await assert.rejects(client.getHistory('secrets', 'abc'), /Invalid secret type/);
+  await assert.rejects(client.getHistory('../admin', 'abc'), /Invalid secret type/);
+  await client.share('password', 'abc', { userId: 'u-1' }, 'manage');
+  assert.deepEqual(last().body, { shared_with_user_id: 'u-1', permission: 'manage' });
+  await client.share('password', 'abc', { groupId: 'g-1' });
+  assert.deepEqual(last().body, { shared_with_group_id: 'g-1', permission: 'read' });
+  const n = log.length;
+  await assert.rejects(client.share('password', 'abc', { userId: 'u', groupId: 'g' }), /exactly one/);
+  await assert.rejects(client.share('password', 'abc', {}), /exactly one/);
+  await assert.rejects(client.share('password', 'abc', 'someone@example.test'), /exactly one/);
+  await assert.rejects(client.createTempAccess('secret', 'abc', 59), /between 60 and 86400/);
+  await assert.rejects(client.createTempAccess('secret', 'abc', 86401), /between 60 and 86400/);
+  assert.equal(log.length, n);
+  await client.createTempAccess('secret', 'abc', 60);
+  assert.deepEqual(last(), { path: '/secret/abc/temp-access', method: 'POST', body: { duration_seconds: 60 } });
+}
+
+// Passwords, API tokens, GPG, OpenSSL request shapes.
+{
+  const { client, last } = stub({});
+  await client.createPassword('p', 'u', 's3cret');
+  assert.deepEqual(last().body, { name: 'p', username: 'u', value: 's3cret' });
+  await client.generatePassword('gen', { length: 20, useSymbols: false });
+  assert.deepEqual(last().body, { name: 'gen', length: 20, use_lowercase: true, use_uppercase: true, use_digits: true, use_symbols: false });
+  await assert.rejects(client.generatePassword('gen', { length: 7 }), /between 8 and 128/);
+  await assert.rejects(client.generatePassword('gen', { length: 129 }), /between 8 and 128/);
+  await assert.rejects(client.generatePassword(''), /name is required/);
+  await client.createAPIToken('t', 'svc', 'tok-value', 'staging');
+  assert.deepEqual(last().body, { name: 't', service: 'svc', value: 'tok-value', environment: 'staging' });
+  await assert.rejects(client.createAPIToken('t', 'svc', 'v', 'prod'), /environment/);
+  await client.rotateAPIToken('id/1', 'new-value');
+  assert.deepEqual(last(), { path: '/api-tokens/id%2F1/rotate', method: 'POST', body: { value: 'new-value' } });
+  await client.generateGPGKey('n', 'n@example.test', { algorithm: 'RSA4096' });
+  assert.deepEqual(last().body, { name: 'n', email: 'n@example.test', algorithm: 'RSA4096' });
+  await assert.rejects(client.generateGPGKey('n', 'e@example.test', { algorithm: 'DSA' }), /algorithm/);
+  await client.exportGPGKey('k', 'private');
+  assert.equal(last().path, '/gpg-keys/k/export?format=private');
+  await assert.rejects(client.exportGPGKey('k', 'secret'), /format/);
+  await client.generateOpenSSLKey('o', 'ecdsa', { curve: 'P-256' });
+  assert.deepEqual(last().body, { name: 'o', algorithm: 'ecdsa', curve: 'P-256' });
+  await client.importOpenSSLKey('o', 'PEM', 'rsa', { keySize: 2048 });
+  assert.deepEqual(last().body, { name: 'o', algorithm: 'rsa', private_key: 'PEM', key_size: 2048 });
+}
+
+// TOTP envelope, certificates as raw text/bytes, sign base64, exports, webhook, audit.
+{
+  const pfx = new Uint8Array([0x30, 0x82, 0x00, 0xff]);
+  const { client, last } = stub({
+    'GET /totp-tokens': { tokens: [{ id: 't1' }], total: 1 },
+    'GET /certificates/c1/download': '-----BEGIN CERTIFICATE-----\n',
+  });
+  assert.deepEqual(await client.listTOTPTokens(), [{ id: 't1' }]);
+  assert.equal(await client.downloadCertificate('c1'), '-----BEGIN CERTIFICATE-----\n');
+  assert.equal(last().path, '/certificates/c1/download?format=pem');
+  await assert.rejects(client.downloadCertificate('c1', { format: 'pfx' }), /password is required/);
+  await assert.rejects(client.downloadCertificate('c1', { format: 'der' }), /Invalid certificate format/);
+  const binary = stub({ 'GET /certificates/c1/download': pfx });
+  const bytes = await binary.client.downloadCertificate('c1', { format: 'p12', password: 'p&w=1' });
+  assert.ok(bytes instanceof Uint8Array);
+  assert.deepEqual([...bytes], [...pfx]);
+  assert.equal(binary.last().path, '/certificates/c1/download?format=p12&password=p%26w%3D1');
+
+  await client.sign('pkcs11', 'k1', new Uint8Array([0, 255, 1]), 'test');
+  assert.deepEqual(last().body, { backend: 'pkcs11', key_id: 'k1', message: 'AP8B', purpose: 'test' });
+  await client.sign('pkcs11', 'k1', 'héllo', 'test');
+  assert.equal(last().body.message, Buffer.from('héllo', 'utf8').toString('base64'));
+  await assert.rejects(client.sign('pkcs11', 'k1', '', 'test'), /between 1 byte and 1 MiB/);
+
+  await client.exportToJSON({ includeSecrets: true, tags: ['prod'] });
+  assert.deepEqual(last().body, { include_passwords: false, include_secrets: true, include_ssh_keys: false, include_certificates: false, tags: ['prod'] });
+  await client.exportToKeychain();
+  assert.equal('items' in last().body, false);
+
+  await client.createWebhook('w', 'https://hooks.example.test', ['secret.update'], 'whsec');
+  assert.deepEqual(last().body, { name: 'w', url: 'https://hooks.example.test', secret: 'whsec', events: ['secret.update'] });
+
+  await client.getAuditLogs({ limit: 5, action: undefined, resource: 'a b&c', start_date: new Date('2026-01-02T03:04:05Z') });
+  assert.equal(last().path, '/audit/logs?limit=5&resource=a+b%26c&start_date=2026-01-02T03%3A04%3A05.000Z');
+  await client.exportAuditLogs();
+  assert.equal(last().path, '/audit/logs/export?format=json');
+}
+
+// JKS / YubiKey updates are read-merge-write.
+{
+  const cid = '22222222-2222-2222-2222-222222222222';
+  const { client, log } = stub({
+    'GET /jks-keystores/j1': { id: 'j1', name: 'ks', container_id: cid, notes: 'n', tags: ['a'] },
+    'GET /yubikeys/y1': { id: 'y1', name: 'yk', container_id: cid, serial_number: '1', public_id: 'cccccccccccb', client_id: '9', validation_server: 'https://v.example.test', notes: 'x', tags: ['b'] },
+  });
+  await client.updateJKSKeystore('j1', { notes: 'new' });
+  assert.deepEqual(log[1].body, { name: 'ks', container_id: cid, notes: 'new', tags: ['a'] });
+  await client.updateYubikey('y1', { name: 'renamed' });
+  assert.deepEqual(log[3].body, { name: 'renamed', container_id: cid, serial_number: '1', public_id: 'cccccccccccb', client_id: '9', validation_server: 'https://v.example.test', notes: 'x', tags: ['b'] });
+}
 
 console.log('contract + security tests PASS');
