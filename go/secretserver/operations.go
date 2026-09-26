@@ -123,8 +123,12 @@ func (s *JKSService) List(ctx context.Context) ([]JKSKeystore, error) {
 }
 
 func (s *JKSService) Get(ctx context.Context, id string) (*JKSKeystore, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result JKSKeystore
-	_, err := s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+url.PathEscape(id), nil, &result)
+	_, err = s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+p, nil, &result)
 	return &result, err
 }
 
@@ -138,25 +142,41 @@ func (s *JKSService) Create(ctx context.Context, input *CreateJKSKeystoreRequest
 }
 
 func (s *JKSService) Update(ctx context.Context, id string, input interface{}) (map[string]string, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result map[string]string
-	_, err := s.client.Call(ctx, http.MethodPut, "/jks-keystores/"+url.PathEscape(id), input, &result)
+	_, err = s.client.Call(ctx, http.MethodPut, "/jks-keystores/"+p, input, &result)
 	return result, err
 }
 
 func (s *JKSService) Delete(ctx context.Context, id string) error {
-	_, err := s.client.Call(ctx, http.MethodDelete, "/jks-keystores/"+url.PathEscape(id), nil, nil)
+	p, err := seg(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Call(ctx, http.MethodDelete, "/jks-keystores/"+p, nil, nil)
 	return err
 }
 
 func (s *JKSService) Export(ctx context.Context, id string) (*JKSExport, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result JKSExport
-	_, err := s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+url.PathEscape(id)+"/export", nil, &result)
+	_, err = s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+p+"/export", nil, &result)
 	return &result, err
 }
 
 func (s *JKSService) Entries(ctx context.Context, id string) ([]JKSEntry, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result []JKSEntry
-	_, err := s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+url.PathEscape(id)+"/entries", nil, &result)
+	_, err = s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+p+"/entries", nil, &result)
 	return result, err
 }
 
@@ -164,8 +184,12 @@ func (s *JKSService) CreateEntry(ctx context.Context, id string, input *CreateJK
 	if input == nil {
 		return nil, fmt.Errorf("create JKS entry request is required")
 	}
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result JKSEntry
-	_, err := s.client.Call(ctx, http.MethodPost, "/jks-keystores/"+url.PathEscape(id)+"/entries", input, &result)
+	_, err = s.client.Call(ctx, http.MethodPost, "/jks-keystores/"+p+"/entries", input, &result)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +198,14 @@ func (s *JKSService) CreateEntry(ctx context.Context, id string, input *CreateJK
 }
 
 func (s *JKSService) DeleteEntry(ctx context.Context, id, alias string) error {
-	path := "/jks-keystores/" + url.PathEscape(id) + "/entries/" + url.PathEscape(alias)
-	_, err := s.client.Call(ctx, http.MethodDelete, path, nil, nil)
+	p, err := seg(id)
+	if err != nil {
+		return err
+	}
+	a, err := seg(alias)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Call(ctx, http.MethodDelete, "/jks-keystores/"+p+"/entries/"+a, nil, nil)
 	return err
 }

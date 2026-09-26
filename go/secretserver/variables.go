@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/url"
 )
 
 // Variable is a field assignment; it contains no secret value.
@@ -26,13 +25,21 @@ func (c *Client) variablesCall(ctx context.Context, method, path string, body, o
 	return err
 }
 func (c *Client) AssignVariable(ctx context.Context, name string, assignment VariableAssignment) (*Variable, error) {
+	p, err := seg(name)
+	if err != nil {
+		return nil, err
+	}
 	var v Variable
-	err := c.variablesCall(ctx, "PUT", "/variables/"+url.PathEscape(name), assignment, &v)
+	err = c.variablesCall(ctx, "PUT", "/variables/"+p, assignment, &v)
 	return &v, err
 }
 func (c *Client) GetVariable(ctx context.Context, name string) (*Variable, error) {
+	p, err := seg(name)
+	if err != nil {
+		return nil, err
+	}
 	var v Variable
-	err := c.variablesCall(ctx, "GET", "/variables/"+url.PathEscape(name), nil, &v)
+	err = c.variablesCall(ctx, "GET", "/variables/"+p, nil, &v)
 	return &v, err
 }
 func (c *Client) ListVariables(ctx context.Context) ([]Variable, error) {
@@ -43,7 +50,11 @@ func (c *Client) ListVariables(ctx context.Context) ([]Variable, error) {
 	return out.Variables, err
 }
 func (c *Client) DeleteVariable(ctx context.Context, name string) error {
-	return c.variablesCall(ctx, "DELETE", "/variables/"+url.PathEscape(name), nil, nil)
+	p, err := seg(name)
+	if err != nil {
+		return err
+	}
+	return c.variablesCall(ctx, "DELETE", "/variables/"+p, nil, nil)
 }
 func (c *Client) Render(ctx context.Context, template string) (string, error) {
 	var out struct {

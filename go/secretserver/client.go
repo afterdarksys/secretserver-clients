@@ -172,6 +172,19 @@ func safeTransport(rt http.RoundTripper) (*http.Transport, error) {
 	return clone, nil
 }
 
+// seg percent-encodes one caller-supplied path segment. Empty, "." and ".."
+// are rejected because escaping leaves them unchanged and they would address
+// a different resource.
+func seg(s string) (string, error) {
+	switch s {
+	case "":
+		return "", fmt.Errorf("path segment must not be empty")
+	case ".", "..":
+		return "", fmt.Errorf("path segment must not be %q", s)
+	}
+	return url.PathEscape(s), nil
+}
+
 // ValidateAPIURL parses and checks a SecretServer base URL: https is required
 // unless the host is loopback, and embedded credentials are rejected.
 func ValidateAPIURL(raw string) (*url.URL, error) {

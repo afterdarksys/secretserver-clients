@@ -28,19 +28,27 @@ func (s *CertificatesService) List(ctx context.Context) ([]*Certificate, error) 
 }
 
 func (s *CertificatesService) Get(ctx context.Context, id string) (*Certificate, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result Certificate
-	_, err := s.client.Call(ctx, http.MethodGet, "/certificates/"+url.PathEscape(id), nil, &result)
+	_, err = s.client.Call(ctx, http.MethodGet, "/certificates/"+p, nil, &result)
 	return &result, err
 }
 
 // GetWithPEM returns certificate metadata with CertificatePEM populated
 // (GET /certificates/:id?include_pem=true). The private key is not included.
 func (s *CertificatesService) GetWithPEM(ctx context.Context, id string) (*Certificate, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var envelope struct {
 		Certificate    *Certificate `json:"certificate"`
 		CertificatePEM string       `json:"certificate_pem"`
 	}
-	_, err := s.client.Call(ctx, http.MethodGet, "/certificates/"+url.PathEscape(id)+"?include_pem=true", nil, &envelope)
+	_, err = s.client.Call(ctx, http.MethodGet, "/certificates/"+p+"?include_pem=true", nil, &envelope)
 	if err != nil {
 		return nil, err
 	}
@@ -61,13 +69,21 @@ func (s *CertificatesService) Enroll(ctx context.Context, input *CertificateEnro
 }
 
 func (s *CertificatesService) Renew(ctx context.Context, id string) (*Certificate, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result Certificate
-	_, err := s.client.Call(ctx, http.MethodPost, "/certificates/"+url.PathEscape(id)+"/renew", nil, &result)
+	_, err = s.client.Call(ctx, http.MethodPost, "/certificates/"+p+"/renew", nil, &result)
 	return &result, err
 }
 
 func (s *CertificatesService) Revoke(ctx context.Context, id string) error {
-	_, err := s.client.Call(ctx, http.MethodPost, "/certificates/"+url.PathEscape(id)+"/revoke", nil, nil)
+	p, err := seg(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Call(ctx, http.MethodPost, "/certificates/"+p+"/revoke", nil, nil)
 	return err
 }
 
@@ -84,6 +100,10 @@ type CertificateDownloadOptions struct {
 func (s *CertificatesService) Download(ctx context.Context, id string, opts *CertificateDownloadOptions, w io.Writer) error {
 	if w == nil {
 		return fmt.Errorf("download writer is required")
+	}
+	p, err := seg(id)
+	if err != nil {
+		return err
 	}
 	params := url.Values{}
 	if opts != nil {
@@ -104,7 +124,7 @@ func (s *CertificatesService) Download(ctx context.Context, id string, opts *Cer
 			params.Set("format", opts.Format)
 		}
 	}
-	path := "/certificates/" + url.PathEscape(id) + "/download"
+	path := "/certificates/" + p + "/download"
 	if len(params) > 0 {
 		path += "?" + params.Encode()
 	}
@@ -145,8 +165,12 @@ func (s *SSHKeysService) List(ctx context.Context) ([]*SSHKey, error) {
 }
 
 func (s *SSHKeysService) Get(ctx context.Context, id string) (*SSHKey, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result SSHKey
-	_, err := s.client.Call(ctx, http.MethodGet, "/ssh-keys/"+url.PathEscape(id), nil, &result)
+	_, err = s.client.Call(ctx, http.MethodGet, "/ssh-keys/"+p, nil, &result)
 	return &result, err
 }
 
@@ -177,8 +201,12 @@ func (s *SSHKeysService) Import(ctx context.Context, input *ImportSSHKeyRequest)
 
 // Export returns the key including PrivateKey.
 func (s *SSHKeysService) Export(ctx context.Context, id string) (*SSHKey, error) {
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
 	var result SSHKey
-	_, err := s.client.Call(ctx, http.MethodGet, "/ssh-keys/"+url.PathEscape(id)+"/export", nil, &result)
+	_, err = s.client.Call(ctx, http.MethodGet, "/ssh-keys/"+p+"/export", nil, &result)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +214,10 @@ func (s *SSHKeysService) Export(ctx context.Context, id string) (*SSHKey, error)
 }
 
 func (s *SSHKeysService) Delete(ctx context.Context, id string) error {
-	_, err := s.client.Call(ctx, http.MethodDelete, "/ssh-keys/"+url.PathEscape(id), nil, nil)
+	p, err := seg(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Call(ctx, http.MethodDelete, "/ssh-keys/"+p, nil, nil)
 	return err
 }

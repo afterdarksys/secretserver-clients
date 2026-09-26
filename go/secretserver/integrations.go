@@ -2,9 +2,7 @@ package secretserver
 
 import (
 	"context"
-	"fmt"
 	"net/http"
-	"net/url"
 )
 
 // IntegrationProvider describes one allowlisted provider credential schema.
@@ -85,7 +83,11 @@ func (s *IntegrationsService) Create(ctx context.Context, input *IntegrationCred
 // Get returns metadata by default. reveal=true requires export:read and should
 // only be used by an interactive caller that can protect the returned values.
 func (s *IntegrationsService) Get(ctx context.Context, id string, reveal bool) (*IntegrationCredential, error) {
-	path := fmt.Sprintf("/api/v1/integrations/%s", url.PathEscape(id))
+	p, err := seg(id)
+	if err != nil {
+		return nil, err
+	}
+	path := "/api/v1/integrations/" + p
 	if reveal {
 		path += "?reveal=true"
 	}

@@ -119,7 +119,11 @@ func (s *SecretsService) Get(ctx context.Context, name string, opts *SecretGetOp
 	if opts != nil && opts.Version != "" {
 		return nil, fmt.Errorf("secret versions are not selectable here; read history via Call on /secret/<id>/history")
 	}
-	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
+	p, err := seg(name)
+	if err != nil {
+		return nil, err
+	}
+	path := "/api/v1/secrets/" + p
 
 	req, err := s.client.NewRequest(ctx, "GET", path, nil)
 	if err != nil {
@@ -166,6 +170,10 @@ func (s *SecretsService) Update(ctx context.Context, name string, updateReq *Sec
 	if updateReq.Name != "" && updateReq.Name != name {
 		return nil, fmt.Errorf("secret name is immutable")
 	}
+	p, err := seg(name)
+	if err != nil {
+		return nil, err
+	}
 
 	current, err := s.Get(ctx, name, nil)
 	if err != nil {
@@ -183,8 +191,7 @@ func (s *SecretsService) Update(ctx context.Context, name string, updateReq *Sec
 		merged.Tags = current.Tags
 	}
 
-	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
-	req, err := s.client.NewRequest(ctx, "PUT", path, &merged)
+	req, err := s.client.NewRequest(ctx, "PUT", "/api/v1/secrets/"+p, &merged)
 	if err != nil {
 		return nil, err
 	}
@@ -200,9 +207,12 @@ func (s *SecretsService) Update(ctx context.Context, name string, updateReq *Sec
 
 // Delete deletes a secret
 func (s *SecretsService) Delete(ctx context.Context, name string) error {
-	path := fmt.Sprintf("/api/v1/secrets/%s", url.PathEscape(name))
+	p, err := seg(name)
+	if err != nil {
+		return err
+	}
 
-	req, err := s.client.NewRequest(ctx, "DELETE", path, nil)
+	req, err := s.client.NewRequest(ctx, "DELETE", "/api/v1/secrets/"+p, nil)
 	if err != nil {
 		return err
 	}

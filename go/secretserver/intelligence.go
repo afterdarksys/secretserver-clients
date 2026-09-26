@@ -180,8 +180,9 @@ type LDAPSearchResponse struct {
 }
 
 func (s *LDAPService) Search(ctx context.Context, connectionID string, input *LDAPSearchRequest) (*LDAPSearchResponse, error) {
-	if connectionID == "" {
-		return nil, fmt.Errorf("connection ID is required")
+	p, err := seg(connectionID)
+	if err != nil {
+		return nil, err
 	}
 	if input == nil || input.Filter == "" || input.BaseDN == "" {
 		return nil, fmt.Errorf("LDAP search requires filter and base_dn")
@@ -190,7 +191,7 @@ func (s *LDAPService) Search(ctx context.Context, connectionID string, input *LD
 		return nil, fmt.Errorf("size_limit must not be negative")
 	}
 	var resp LDAPSearchResponse
-	_, err := s.client.Call(ctx, http.MethodPost, "/ldap/connections/"+url.PathEscape(connectionID)+"/search", input, &resp)
+	_, err = s.client.Call(ctx, http.MethodPost, "/ldap/connections/"+p+"/search", input, &resp)
 	if err != nil {
 		return nil, err
 	}
