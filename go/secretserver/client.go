@@ -3,7 +3,9 @@ package secretserver
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,7 +17,15 @@ import (
 const (
 	defaultTimeout = 30 * time.Second
 	defaultBaseURL = "https://api.secretserver.io"
+
+	// maxJSONResponseBytes caps decoded JSON responses.
+	maxJSONResponseBytes = 4 << 20
+	// maxDownloadBytes caps raw downloads streamed to an io.Writer.
+	maxDownloadBytes = 16 << 20
 )
+
+// ErrResponseTooLarge is returned when a response body exceeds the client cap.
+var ErrResponseTooLarge = errors.New("SecretServer response exceeds size limit")
 
 // Client is the SecretServer API client
 type Client struct {
@@ -43,7 +53,12 @@ type Client struct {
 	JKS          *JKSService
 }
 
-// Config holds client configuration
+// Config holds client configuration.
+//
+// APIURL must use https; plain http is accepted only for loopback hosts
+// (localhost, 127.0.0.1, ::1). To trust a private CA, pass an HTTPClient whose
+// transport sets TLSClientConfig.RootCAs. TLS verification cannot be disabled
+// and redirects are never followed, even with a caller-supplied HTTPClient.
 type Config struct {
 	APIURL     string
 	APIKey     string
@@ -63,19 +78,25 @@ func NewClient(cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("API key is required")
 	}
 
-	baseURL, err := url.Parse(cfg.APIURL)
+	baseURL, err := ValidateAPIURL(cfg.APIURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid API URL: %w", err)
+		return nil, err
 	}
 	baseURL.Path = strings.TrimSuffix(strings.TrimRight(baseURL.Path, "/"), "/api/v1")
 
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout:       defaultTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	var httpClient *http.Client
+	if cfg.HTTPClient == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		httpClient = &http.Client{Timeout: defaultTimeout, Transport: transport}
+	} else {
+		if t, ok := cfg.HTTPClient.Transport.(*http.Transport); ok && t.TLSClientConfig != nil && t.TLSClientConfig.InsecureSkipVerify {
+			return nil, fmt.Errorf("TLS certificate verification cannot be disabled")
 		}
+		copied := *cfg.HTTPClient
+		httpClient = &copied
 	}
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	c := &Client{
 		baseURL:    baseURL,
@@ -105,8 +126,51 @@ func NewClient(cfg *Config) (*Client, error) {
 	return c, nil
 }
 
-// NewRequest creates an API request
+// ValidateAPIURL parses and checks a SecretServer base URL: https is required
+// unless the host is loopback, and embedded credentials are rejected.
+func ValidateAPIURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid API URL")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("invalid API URL: credentials in the URL are not allowed")
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return nil, fmt.Errorf("invalid API URL: host is required")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+	case "http":
+		switch strings.ToLower(u.Hostname()) {
+		case "localhost", "127.0.0.1", "::1":
+		default:
+			return nil, fmt.Errorf("invalid API URL: https is required for non-loopback hosts")
+		}
+	default:
+		return nil, fmt.Errorf("invalid API URL: scheme must be https")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid API URL: query and fragment are not allowed")
+	}
+	return u, nil
+}
+
+// NewRequest creates a JSON API request
 func (c *Client) NewRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
+	var buf io.Reader
+	if body != nil {
+		b := new(bytes.Buffer)
+		if err := json.NewEncoder(b).Encode(body); err != nil {
+			return nil, err
+		}
+		buf = b
+	}
+	return c.newRequest(ctx, method, path, buf, "application/json")
+}
+
+// newRequest builds an authenticated request with an explicit body content type.
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader, contentType string) (*http.Request, error) {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -127,22 +191,13 @@ func (c *Client) NewRequest(ctx context.Context, method, path string, body inter
 	}
 	u.RawQuery = ref.RawQuery
 
-	var buf io.ReadWriter
-	if body != nil {
-		buf = new(bytes.Buffer)
-		enc := json.NewEncoder(buf)
-		if err := enc.Encode(body); err != nil {
-			return nil, err
-		}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), buf)
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
 
 	// Set headers
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
 
@@ -153,10 +208,21 @@ func (c *Client) NewRequest(ctx context.Context, method, path string, body inter
 	return req, nil
 }
 
-// Do executes an API request
+// Do executes an API request. When v is an io.Writer the raw body (at most
+// 16 MiB) is streamed into it; otherwise the body (at most 4 MiB) is decoded
+// as JSON into v. Oversized or malformed responses return an error that never
+// includes the response body.
 func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// Strip the query string: it can carry caller-supplied values such as
+		// export passwords.
+		var ue *url.Error
+		if errors.As(err, &ue) && req.URL != nil {
+			redacted := *req.URL
+			redacted.RawQuery = ""
+			ue.URL = redacted.String()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -168,19 +234,33 @@ func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 		return response, err
 	}
 
-	// Decode response
-	if v != nil {
-		if w, ok := v.(io.Writer); ok {
-			_, err = io.Copy(w, resp.Body)
-		} else {
-			err = json.NewDecoder(resp.Body).Decode(v)
-			if err == io.EOF {
-				err = nil
-			}
-		}
+	if v == nil {
+		return response, nil
 	}
-
-	return response, err
+	if w, ok := v.(io.Writer); ok {
+		if _, err := io.Copy(w, io.LimitReader(resp.Body, maxDownloadBytes)); err != nil {
+			return response, err
+		}
+		var probe [1]byte
+		if n, _ := resp.Body.Read(probe[:]); n > 0 {
+			return response, ErrResponseTooLarge
+		}
+		return response, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONResponseBytes+1))
+	if err != nil {
+		return response, err
+	}
+	if len(body) > maxJSONResponseBytes {
+		return response, ErrResponseTooLarge
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return response, nil
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return response, fmt.Errorf("SecretServer returned an invalid JSON response (HTTP %d)", resp.StatusCode)
+	}
+	return response, nil
 }
 
 // Call invokes any REST endpoint. Path may be relative to /api/v1 or include

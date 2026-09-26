@@ -3,6 +3,7 @@ package secretserver
 import (
 	"context"
 	"fmt"
+	"net/url"
 )
 
 // TransformService handles data transformation
@@ -117,7 +118,7 @@ func (s *LDAPService) Import(ctx context.Context, ldifData string) (map[string]i
 }
 
 func (s *LDAPService) Search(ctx context.Context, connectionID string, query string) (interface{}, error) {
-	path := fmt.Sprintf("/api/v1/ldap/connections/%s/search", connectionID)
+	path := fmt.Sprintf("/api/v1/ldap/connections/%s/search", url.PathEscape(connectionID))
 	req, err := s.client.NewRequest(ctx, "POST", path, map[string]string{"query": query})
 	if err != nil {
 		return nil, err
