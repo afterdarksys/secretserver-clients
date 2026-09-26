@@ -3,9 +3,14 @@ package secretserver
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -15,13 +20,15 @@ import (
 func recordingTLSServer(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
 	var requests, auths atomic.Int32
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		if r.Header.Get("Authorization") != "" {
 			auths.Add(1)
 		}
 		_, _ = w.Write([]byte(`{"secrets":[]}`))
 	}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // expected handshake failures
+	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	return srv, &requests, &auths
 }
@@ -96,5 +103,41 @@ func TestCallerTransportIsClonedAtConstruction(t *testing.T) {
 	got := c.httpClient.Transport.(*http.Transport)
 	if got == tr || got.TLSClientConfig.MinVersion != tls.VersionTLS12 {
 		t.Fatal("caller transport not cloned with TLS 1.2 minimum")
+	}
+}
+
+func TestDefaultClientRejectsUntrustedCertificate(t *testing.T) {
+	srv, requests, auths := recordingTLSServer(t)
+	c, err := NewClient(&Config{APIURL: srv.URL, APIKey: testKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Secrets.List(context.Background(), nil)
+	var verr *tls.CertificateVerificationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected a certificate verification failure, got %v", err)
+	}
+	if strings.Contains(err.Error(), testKey) {
+		t.Fatal("handshake error contains the API key")
+	}
+	if requests.Load() != 0 || auths.Load() != 0 {
+		t.Fatalf("server saw %d requests (%d with Authorization)", requests.Load(), auths.Load())
+	}
+}
+
+func TestCallerRootCAsTrustPrivateCA(t *testing.T) {
+	srv, requests, auths := recordingTLSServer(t)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+	c, err := NewClient(&Config{APIURL: srv.URL, APIKey: testKey, HTTPClient: hc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Secrets.List(context.Background(), nil); err != nil {
+		t.Fatalf("request with trusted private CA failed: %v", err)
+	}
+	if requests.Load() != 1 || auths.Load() != 1 {
+		t.Fatalf("server saw %d requests (%d with Authorization), want 1", requests.Load(), auths.Load())
 	}
 }
