@@ -32,21 +32,30 @@ class ClientContractTests(unittest.TestCase):
             self.assertEqual(client.list_secrets()[0]["name"], "db")
         self.assertEqual(urlopen.call_args.args[0].full_url, "https://example.test/api/v1/secrets")
 
-    def test_update_and_enrollment_match_backend_fields(self):
+    def test_update_preserves_metadata_and_enrollment_matches_backend_fields(self):
         client = SecretServerClient("sk_test", "https://example.test")
-        captured = []
+        container = "5f0c5a4e-1111-4222-8333-444455556666"
+        calls = []
 
         def respond(request, **_kwargs):
-            captured.append(json.loads(request.data))
+            calls.append((request.get_method(), request.full_url, json.loads(request.data) if request.data else None))
+            if request.get_method() == "GET":
+                return FakeResponse({"name": "db", "description": "keep", "tags": ["t"], "container_id": container})
             return FakeResponse({})
 
         with patch("urllib.request.OpenerDirector.open", side_effect=respond):
-            client.update_secret("prod/db", "new")
+            client.update_secret("db", "new")
+            client.update_secret("db", "newer", description="changed", tags=[])
             client.enroll_certificate("wildcard", "example.test", ["www.example.test"])
 
-        self.assertEqual(captured[0]["name"], "prod/db")
-        self.assertEqual(captured[1]["dns_names"], ["www.example.test"])
-        self.assertNotIn("sans", captured[1])
+        self.assertEqual([c[0] for c in calls], ["GET", "PUT", "GET", "PUT", "POST"])
+        self.assertEqual(calls[1][2], {"name": "db", "data": {"value": "new"}, "description": "keep",
+                                       "tags": ["t"], "container_id": container})
+        self.assertEqual(calls[3][2]["description"], "changed")
+        self.assertEqual(calls[3][2]["tags"], [])
+        self.assertEqual(calls[3][2]["container_id"], container)
+        self.assertEqual(calls[4][2]["dns_names"], ["www.example.test"])
+        self.assertNotIn("sans", calls[4][2])
 
     def test_path_envelope_and_empty_value(self):
         client = SecretServerClient("sk_test", "https://example.test")

@@ -7,12 +7,22 @@ import json
 import urllib.request
 import urllib.error
 import ssl
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlsplit
 from typing import Any, Dict, List, Optional
 
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_RAW_BYTES = 16 * 1024 * 1024
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# Values accepted by the server for :type in history, share and temp-access routes.
+SECRET_TYPES = frozenset({
+    "secret", "password", "ssh_key", "gpg_key", "api_token", "openssl_key", "ntlm_hash",
+    "certificate", "computer_credential", "wifi_credential", "windows_credential",
+    "social_credential", "disk_credential", "service_config_credential", "root_credential",
+    "ldap_bind_credential", "integration_credential", "code_signing_key",
+})
 
 
 class SecretServerError(Exception):
@@ -71,6 +81,60 @@ def _seg(value: Any) -> str:
     if text in ("", ".", ".."):
         raise ValueError("path segment must not be empty, '.' or '..'")
     return quote(text, safe="")
+
+
+def _secret_type(secret_type: str) -> str:
+    if secret_type not in SECRET_TYPES:
+        raise ValueError("unsupported secret_type")
+    return secret_type
+
+
+def _uuid(value: Any, field: str) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError:
+        raise ValueError(f"{field} must be a UUID") from None
+
+
+def _timestamp(value: Any) -> str:
+    """RFC 3339 string for a datetime (naive values are treated as UTC) or a passthrough string."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
+
+
+def _audit_filters(**filters: Any) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    for key, value in filters.items():
+        if value is None or value == "":
+            continue
+        if key in ("resource_id", "user_id"):
+            params[key] = _uuid(value, key)
+        elif key in ("start_date", "end_date"):
+            params[key] = _timestamp(value)
+        else:
+            params[key] = str(value)
+    return params
+
+
+def _secret_route(path: str) -> str:
+    """API route for name, container/key or container/key/version (1..12)."""
+    parts = path.strip("/").split("/")
+    if len(parts) == 1:
+        return f"/secrets/{_seg(parts[0])}"
+    if len(parts) == 2:
+        return f"/s/{_seg(parts[0])}/{_seg(parts[1])}"
+    if len(parts) == 3:
+        try:
+            version = int(parts[2])
+        except ValueError:
+            raise ValueError("version must be an integer") from None
+        if not 1 <= version <= 12:
+            raise ValueError("version must be between 1 and 12")
+        return f"/s/{_seg(parts[0])}/{_seg(parts[1])}/{version}"
+    raise ValueError("path must be name, container/key or container/key/version")
 
 
 def _scalar(payload):
@@ -230,15 +294,19 @@ class SecretServerClient:
     # ------------------------------------------------------------------
 
     def assign_variable(self, name: str, secret_type: str, secret_id: str, field: str) -> Dict:
+        """Bind a %%NAME%% variable to a secret field (PUT /variables/:name, needs admin:all)."""
         return self._put("/variables/" + _seg(name), {"secret_type": secret_type, "secret_id": secret_id, "field": field})
 
     def get_variable(self, name: str) -> Dict:
+        """Get a variable binding (needs admin:all)."""
         return self._get("/variables/" + _seg(name))
 
     def list_variables(self) -> List[Dict]:
+        """List variable bindings (needs admin:all)."""
         return self._get("/variables")["variables"]
 
     def delete_variable(self, name: str) -> None:
+        """Delete a variable binding (needs admin:all)."""
         self._delete("/variables/" + _seg(name))
 
     def render(self, template: str) -> str:
@@ -255,30 +323,20 @@ class SecretServerClient:
 
     def secret(self, path: str) -> str:
         """
-        Get a secret value by path: container/key or container/key/version.
+        Get a secret value by name, container/key or container/key/version.
+
+        Versions are 1 (current) to 12; any other shape raises ValueError.
 
         >>> ss.secret("production/db-password")
         'hunter2'
         >>> ss.secret("production/db-password/2")  # previous version
         'old-hunter2'
         """
-        parts = path.strip("/").split("/")
-        if len(parts) == 1:
-            data = self._get(f"/secrets/{_seg(parts[0])}")
-            return _scalar(data)
-        elif len(parts) == 2:
-            data = self._get(f"/s/{_seg(parts[0])}/{_seg(parts[1])}")
-            return _scalar(data)
-        else:
-            data = self._get("/s/" + "/".join(_seg(part) for part in parts[:3]))
-            return _scalar(data)
+        return _scalar(self._get(_secret_route(path)))
 
     def get_secret(self, path: str) -> Dict[str, Any]:
-        """Get full secret metadata + value dict for a path."""
-        parts = path.strip("/").split("/")
-        if len(parts) == 1:
-            return self._get(f"/secrets/{_seg(parts[0])}")
-        return self._get("/s/" + "/".join(_seg(part) for part in parts))
+        """Get the full secret record for a name, container/key or container/key/version."""
+        return self._get(_secret_route(path))
 
     # ------------------------------------------------------------------
     # Secrets
@@ -288,6 +346,7 @@ class SecretServerClient:
         return self._get_list("/secrets", "secrets")
 
     def create_secret(self, name: str, value: str, description: str = "", container_id: str = "") -> Dict:
+        """Create a secret. ``container_id`` must be a container UUID, not its slug."""
         body: Dict[str, Any] = {"name": name, "data": {"value": value}}
         if description:
             body["description"] = description
@@ -295,11 +354,31 @@ class SecretServerClient:
             body["container_id"] = container_id
         return self._post("/secrets", body)
 
-    def update_secret(self, name: str, value: str) -> Dict:
-        return self._put(
-            f"/secrets/{_seg(name)}",
-            {"name": name, "data": {"value": value}},
-        )
+    def update_secret(
+        self,
+        name: str,
+        value: str,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        container_id: Optional[str] = None,
+    ) -> Dict:
+        """Replace a secret's value, keeping metadata the caller does not override.
+
+        The server's PUT replaces description, tags and container_id, so the
+        current record is read first and its metadata carried over.
+        """
+        route = f"/secrets/{_seg(name)}"
+        current = self._get(route)
+        if not isinstance(current, dict):
+            raise SecretServerError("Invalid secret response")
+        body: Dict[str, Any] = {
+            "name": name,
+            "data": {"value": value},
+            "description": current.get("description", "") if description is None else description,
+            "tags": (current.get("tags") or []) if tags is None else tags,
+            "container_id": current.get("container_id") if container_id is None else container_id,
+        }
+        return self._put(route, body)
 
     def delete_secret(self, name: str) -> None:
         self._delete(f"/secrets/{_seg(name)}")
@@ -374,7 +453,14 @@ class SecretServerClient:
         return self._post("/jks-keystores", {"name": name, "store_type": store_type, **options})
 
     def update_jks_keystore(self, keystore_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self._put(f"/jks-keystores/{_seg(keystore_id)}", data)
+        """Update a keystore; fields absent from ``data`` keep their current values."""
+        route = f"/jks-keystores/{_seg(keystore_id)}"
+        current = self._get(route)
+        if not isinstance(current, dict):
+            raise SecretServerError("Invalid keystore response")
+        body = {key: current.get(key) for key in ("container_id", "name", "notes", "tags")}
+        body.update(data)
+        return self._put(route, body)
 
     def delete_jks_keystore(self, keystore_id: str) -> None:
         self._delete(f"/jks-keystores/{_seg(keystore_id)}")
@@ -444,15 +530,50 @@ class SecretServerClient:
     def list_passwords(self) -> List[Dict]:
         return self._get_list("/passwords", "passwords")
 
-    def create_password(self, name: str, username: str, password: str, url: str = "") -> Dict:
-        body: Dict[str, Any] = {"name": name, "username": username, "password": password}
+    def create_password(self, name: str, username: str, value: str, url: str = "",
+                        description: str = "", tags: Optional[List[str]] = None) -> Dict:
+        body: Dict[str, Any] = {"name": name, "username": username, "value": value}
         if url:
             body["url"] = url
+        if description:
+            body["description"] = description
+        if tags:
+            body["tags"] = tags
         return self._post("/passwords", body)
 
-    def generate_password(self, length: int = 32, special: bool = True) -> str:
-        data = self._post("/passwords/generate", {"length": length, "include_symbols": special})
-        return data.get("password", "")
+    def generate_password(
+        self,
+        name: str,
+        length: int = 32,
+        use_lowercase: bool = True,
+        use_uppercase: bool = True,
+        use_digits: bool = True,
+        use_symbols: bool = True,
+        username: str = "",
+        url: str = "",
+        description: str = "",
+        tags: Optional[List[str]] = None,
+    ) -> Dict:
+        """Generate and store a password record named ``name``.
+
+        Returns the created password record; the generated secret is in ``value``.
+        """
+        if not 8 <= length <= 128:
+            raise ValueError("length must be between 8 and 128")
+        body: Dict[str, Any] = {
+            "name": name,
+            "length": length,
+            "use_lowercase": use_lowercase,
+            "use_uppercase": use_uppercase,
+            "use_digits": use_digits,
+            "use_symbols": use_symbols,
+        }
+        for key, value in (("username", username), ("url", url), ("description", description)):
+            if value:
+                body[key] = value
+        if tags:
+            body["tags"] = tags
+        return self._post("/passwords/generate", body)
 
     # ------------------------------------------------------------------
     # API Tokens
@@ -461,37 +582,80 @@ class SecretServerClient:
     def list_api_tokens(self) -> List[Dict]:
         return self._get_list("/api-tokens", "tokens")
 
-    def create_api_token(self, name: str, service: str, token: str) -> Dict:
-        return self._post("/api-tokens", {"name": name, "service": service, "token": token})
+    API_TOKEN_ENVIRONMENTS = ("production", "staging", "development")
 
-    def rotate_api_token(self, token_id: str) -> Dict:
-        return self._post(f"/api-tokens/{_seg(token_id)}/rotate")
+    def create_api_token(self, name: str, service: str, value: str, environment: str,
+                         description: str = "", expires_at: Any = None) -> Dict:
+        """Store a third-party API token. ``environment`` is production, staging or development."""
+        if environment not in self.API_TOKEN_ENVIRONMENTS:
+            raise ValueError("environment must be production, staging or development")
+        body: Dict[str, Any] = {"name": name, "service": service, "value": value, "environment": environment}
+        if description:
+            body["description"] = description
+        if expires_at is not None:
+            body["expires_at"] = _timestamp(expires_at)
+        return self._post("/api-tokens", body)
+
+    def rotate_api_token(self, token_id: str, value: str) -> Dict:
+        """Replace a stored token with ``value``."""
+        return self._post(f"/api-tokens/{_seg(token_id)}/rotate", {"value": value})
 
     # ------------------------------------------------------------------
     # Version history
     # ------------------------------------------------------------------
 
     def get_history(self, secret_type: str, secret_id: str) -> List[Dict]:
-        data = self._get(f"/{_seg(secret_type)}/{_seg(secret_id)}/history")
-        return data.get("versions", [])
+        """List prior versions. ``secret_type`` must be one of SECRET_TYPES."""
+        data = self._get(f"/{_secret_type(secret_type)}/{_uuid(secret_id, 'secret_id')}/history")
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise SecretServerError("Invalid history response")
+        return data
 
     def get_version(self, secret_type: str, secret_id: str, version: int) -> Dict:
-        return self._get(f"/{_seg(secret_type)}/{_seg(secret_id)}/history/{_seg(version)}")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("version must be a positive integer")
+        return self._get(f"/{_secret_type(secret_type)}/{_uuid(secret_id, 'secret_id')}/history/{version}")
 
     # ------------------------------------------------------------------
     # Sharing & temp access
     # ------------------------------------------------------------------
 
-    def share(self, secret_type: str, secret_id: str, email: str, permission: str = "read", expires_hours: Optional[int] = 72) -> Dict:
-        body: Dict[str, Any] = {"shared_with_email": email, "permission": permission}
-        if expires_hours is not None:
-            from datetime import datetime, timedelta, timezone
-            body["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=expires_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return self._post(f"/{_seg(secret_type)}/{_seg(secret_id)}/shares", body)
+    def share(
+        self,
+        secret_type: str,
+        secret_id: str,
+        user_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        permission: str = "read",
+        expires_at: Any = None,
+    ) -> Dict:
+        """Share with exactly one user or group (UUIDs). ``permission`` is read or manage.
+
+        ``expires_at`` may be a datetime or an RFC 3339 string.
+        """
+        if (user_id is None) == (group_id is None):
+            raise ValueError("specify exactly one of user_id or group_id")
+        if permission not in ("read", "manage"):
+            raise ValueError("permission must be read or manage")
+        body: Dict[str, Any] = {"permission": permission}
+        if user_id is not None:
+            body["shared_with_user_id"] = _uuid(user_id, "user_id")
+        else:
+            body["shared_with_group_id"] = _uuid(group_id, "group_id")
+        if expires_at is not None:
+            body["expires_at"] = _timestamp(expires_at)
+        return self._post(f"/{_secret_type(secret_type)}/{_uuid(secret_id, 'secret_id')}/shares", body)
 
     def create_temp_access(self, secret_type: str, secret_id: str, duration_seconds: int = 900) -> Dict:
-        """Returns dict with 'token' and 'expires_at'."""
-        return self._post(f"/{_seg(secret_type)}/{_seg(secret_id)}/temp-access", {"duration_seconds": duration_seconds})
+        """Returns dict with 'token' and 'expires_at'. Duration is 60..86400 seconds."""
+        if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int) or not 60 <= duration_seconds <= 86400:
+            raise ValueError("duration_seconds must be between 60 and 86400")
+        return self._post(
+            f"/{_secret_type(secret_type)}/{_uuid(secret_id, 'secret_id')}/temp-access",
+            {"duration_seconds": duration_seconds},
+        )
 
     # ------------------------------------------------------------------
     # Intelligence
@@ -508,9 +672,12 @@ class SecretServerClient:
         result = self._post("/transform/encode", {"input": data, "target_type": format})
         return result.get("result", "")
 
-    def decode(self, data: str, format: str = "base64") -> str:
+    def decode(self, data: str, format: str = "base64") -> Any:
+        """Decode ``data``. Returns a string, or an object for jwt/json sources."""
         result = self._post("/transform/decode", {"input": data, "source_type": format})
-        return result.get("result", "")
+        if not isinstance(result, dict) or "result" not in result:
+            raise SecretServerError("Invalid decode response")
+        return result["result"]
 
     # ------------------------------------------------------------------
     # GPG Keys
@@ -522,17 +689,33 @@ class SecretServerClient:
     def get_gpg_key(self, key_id: str) -> Dict:
         return self._get(f"/gpg-keys/{_seg(key_id)}")
 
-    def generate_gpg_key(self, name: str, email: str, key_type: str = "rsa4096", expires_days: Optional[int] = None) -> Dict:
-        body: Dict[str, Any] = {"name": name, "email": email, "key_type": key_type}
-        if expires_days is not None:
-            body["expires_in_days"] = expires_days
+    GPG_ALGORITHMS = ("RSA2048", "RSA4096", "ED25519")
+
+    def generate_gpg_key(self, name: str, email: str, algorithm: str = "RSA4096",
+                         comment: str = "", passphrase: str = "") -> Dict:
+        """Generate a GPG key. ``algorithm`` is RSA2048, RSA4096 or ED25519 (no expiry)."""
+        if algorithm not in self.GPG_ALGORITHMS:
+            raise ValueError("algorithm must be RSA2048, RSA4096 or ED25519")
+        body: Dict[str, Any] = {"name": name, "email": email, "algorithm": algorithm}
+        if comment:
+            body["comment"] = comment
+        if passphrase:
+            body["passphrase"] = passphrase
         return self._post("/gpg-keys/generate", body)
 
-    def import_gpg_key(self, name: str, email: str, private_key: str) -> Dict:
-        return self._post("/gpg-keys/import", {"name": name, "email": email, "private_key": private_key})
+    def import_gpg_key(self, armored_key: str, passphrase: str = "", name: str = "") -> Dict:
+        body: Dict[str, Any] = {"armored_key": armored_key}
+        if passphrase:
+            body["passphrase"] = passphrase
+        if name:
+            body["name"] = name
+        return self._post("/gpg-keys/import", body)
 
-    def export_gpg_key(self, key_id: str) -> Dict:
-        return self._get(f"/gpg-keys/{_seg(key_id)}/export")
+    def export_gpg_key(self, key_id: str, format: str = "public") -> Dict:
+        """Returns {key, format, fingerprint, key_id}; ``format`` is public or private."""
+        if format not in ("public", "private"):
+            raise ValueError("format must be public or private")
+        return self._get(f"/gpg-keys/{_seg(key_id)}/export?" + urlencode({"format": format}))
 
     def delete_gpg_key(self, key_id: str) -> None:
         self._delete(f"/gpg-keys/{_seg(key_id)}")
@@ -574,11 +757,32 @@ class SecretServerClient:
     def get_openssl_key(self, key_id: str) -> Dict:
         return self._get(f"/openssl-keys/{_seg(key_id)}")
 
-    def generate_openssl_key(self, name: str, key_type: str = "rsa", bits: int = 4096) -> Dict:
-        return self._post("/openssl-keys/generate", {"name": name, "key_type": key_type, "bits": bits})
+    OPENSSL_ALGORITHMS = ("rsa", "ecdsa", "ed25519")
 
-    def import_openssl_key(self, name: str, private_key: str) -> Dict:
-        return self._post("/openssl-keys/import", {"name": name, "private_key": private_key})
+    def generate_openssl_key(self, name: str, algorithm: str = "rsa", key_size: int = 4096,
+                             curve: str = "", description: str = "") -> Dict:
+        """Generate a key pair. ``key_size`` applies to rsa, ``curve`` (e.g. P-256) to ecdsa."""
+        if algorithm not in self.OPENSSL_ALGORITHMS:
+            raise ValueError("algorithm must be rsa, ecdsa or ed25519")
+        body: Dict[str, Any] = {"name": name, "algorithm": algorithm}
+        if algorithm == "rsa":
+            body["key_size"] = key_size
+        if curve:
+            body["curve"] = curve
+        if description:
+            body["description"] = description
+        return self._post("/openssl-keys/generate", body)
+
+    def import_openssl_key(self, name: str, algorithm: str, private_key: str,
+                           public_key: str = "", passphrase: str = "") -> Dict:
+        if algorithm not in self.OPENSSL_ALGORITHMS:
+            raise ValueError("algorithm must be rsa, ecdsa or ed25519")
+        body: Dict[str, Any] = {"name": name, "algorithm": algorithm, "private_key": private_key}
+        if public_key:
+            body["public_key"] = public_key
+        if passphrase:
+            body["passphrase"] = passphrase
+        return self._post("/openssl-keys/import", body)
 
     def export_openssl_key(self, key_id: str) -> Dict:
         return self._get(f"/openssl-keys/{_seg(key_id)}/export")
@@ -612,8 +816,21 @@ class SecretServerClient:
     def revoke_certificate(self, cert_id: str) -> Dict:
         return self._post(f"/certificates/{_seg(cert_id)}/revoke")
 
-    def download_certificate(self, cert_id: str) -> Dict:
-        return self._get(f"/certificates/{_seg(cert_id)}/download")
+    CERT_DOWNLOAD_FORMATS = ("pem", "pem-bundle", "key", "pfx", "p12")
+
+    def download_certificate(self, cert_id: str, format: str = "pem", password: Optional[str] = None) -> bytes:
+        """Download raw certificate material (PEM text or PKCS#12 bytes).
+
+        ``format`` is pem, pem-bundle, key, pfx or p12; pfx/p12 require ``password``.
+        """
+        if format not in self.CERT_DOWNLOAD_FORMATS:
+            raise ValueError("format must be pem, pem-bundle, key, pfx or p12")
+        params = {"format": format}
+        if format in ("pfx", "p12"):
+            if not password:
+                raise ValueError("password is required for pfx/p12 downloads")
+            params["password"] = password
+        return self._send("GET", f"/certificates/{_seg(cert_id)}/download?" + urlencode(params), raw=True)
 
     # ------------------------------------------------------------------
     # Webhooks
@@ -622,13 +839,12 @@ class SecretServerClient:
     def list_webhooks(self) -> List[Dict]:
         return self._get_list("/webhooks", "webhooks")
 
-    def create_webhook(self, name: str, url: str, events: List[str], auth_type: str = "none") -> Dict:
-        return self._post("/webhooks", {
-            "name": name,
-            "url": url,
-            "events": events,
-            "auth_type": auth_type,
-        })
+    def create_webhook(self, name: str, url: str, events: List[str], secret: str = "") -> Dict:
+        """Create a webhook; ``secret`` is the optional delivery signing secret."""
+        body: Dict[str, Any] = {"name": name, "url": url, "events": events}
+        if secret:
+            body["secret"] = secret
+        return self._post("/webhooks", body)
 
     def get_webhook_deliveries(self, webhook_id: str) -> List[Dict]:
         return self._get_list(f"/webhooks/{_seg(webhook_id)}/deliveries", "deliveries")
@@ -640,35 +856,80 @@ class SecretServerClient:
     # Export
     # ------------------------------------------------------------------
 
-    def export_to_keychain(self, items: List[Dict]) -> Dict:
-        return self._post("/export/keychain", {"items": items})
+    # Exports are tenant-wide. With every include_* flag False the server
+    # exports all four kinds; ``tags`` narrows the result.
 
-    def export_to_credential_manager(self, items: List[Dict]) -> Dict:
-        return self._post("/export/credential-manager", {"items": items})
+    @staticmethod
+    def _export_body(include_passwords: bool, include_secrets: bool, include_ssh_keys: bool,
+                     include_certificates: bool, tags: Optional[List[str]]) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "include_passwords": include_passwords,
+            "include_secrets": include_secrets,
+            "include_ssh_keys": include_ssh_keys,
+            "include_certificates": include_certificates,
+        }
+        if tags:
+            body["tags"] = tags
+        return body
 
-    def export_to_json(self, items: List[Dict]) -> Dict:
-        return self._post("/export/json", {"items": items})
+    def export_to_keychain(self, include_passwords: bool = False, include_secrets: bool = False,
+                           include_ssh_keys: bool = False, include_certificates: bool = False,
+                           tags: Optional[List[str]] = None) -> Dict:
+        return self._post("/export/keychain", self._export_body(
+            include_passwords, include_secrets, include_ssh_keys, include_certificates, tags))
+
+    def export_to_credential_manager(self, include_passwords: bool = False, include_secrets: bool = False,
+                                     include_ssh_keys: bool = False, include_certificates: bool = False,
+                                     tags: Optional[List[str]] = None) -> Dict:
+        return self._post("/export/credential-manager", self._export_body(
+            include_passwords, include_secrets, include_ssh_keys, include_certificates, tags))
+
+    def export_to_json(self, include_passwords: bool = False, include_secrets: bool = False,
+                       include_ssh_keys: bool = False, include_certificates: bool = False,
+                       tags: Optional[List[str]] = None) -> Dict:
+        return self._post("/export/json", self._export_body(
+            include_passwords, include_secrets, include_ssh_keys, include_certificates, tags))
 
     # ------------------------------------------------------------------
     # Audit logs
     # ------------------------------------------------------------------
 
-    def get_audit_logs(self, limit: int = 100, offset: int = 0, action: str = "") -> Dict:
-        params = {"limit": str(limit), "offset": str(offset)}
-        if action:
-            params["action"] = action
+    def get_audit_logs(self, limit: int = 100, offset: int = 0, action: str = "", resource: str = "",
+                       resource_id: Optional[str] = None, user_id: Optional[str] = None,
+                       start_date: Any = None, end_date: Any = None) -> Dict:
+        """Query audit logs. Dates may be datetimes or RFC 3339 strings; empty filters are omitted.
+
+        ``resource_id``/``user_id`` are sent as UUIDs; server builds whose query
+        binder cannot parse UUIDs answer those filters with HTTP 400.
+        """
+        params = _audit_filters(limit=limit, offset=offset, action=action, resource=resource,
+                                resource_id=resource_id, user_id=user_id,
+                                start_date=start_date, end_date=end_date)
         return self._get("/audit/logs?" + urlencode(params))
 
-    def export_audit_logs(self) -> Dict:
-        return self._get("/audit/logs/export")
+    def export_audit_logs(self, format: str = "csv", action: str = "", resource: str = "",
+                          resource_id: Optional[str] = None, user_id: Optional[str] = None,
+                          start_date: Any = None, end_date: Any = None) -> Any:
+        """Export audit logs. ``format="csv"`` returns CSV text; ``"json"`` returns parsed JSON."""
+        if format not in ("csv", "json"):
+            raise ValueError("format must be csv or json")
+        params = _audit_filters(format=format, action=action, resource=resource,
+                                resource_id=resource_id, user_id=user_id,
+                                start_date=start_date, end_date=end_date)
+        raw = self._send("GET", "/audit/logs/export?" + urlencode(params), raw=True)
+        try:
+            text = raw.decode("utf-8")
+            return json.loads(text) if format == "json" else text
+        except (ValueError, UnicodeError):
+            raise SecretServerError("Invalid server response") from None
 
     # ------------------------------------------------------------------
     # TOTP Authenticators
     # ------------------------------------------------------------------
 
     def list_totp_tokens(self) -> List[Dict]:
-        """List all TOTP authenticator tokens."""
-        return self._get("/totp-tokens") or []
+        """List all TOTP authenticator tokens (secret keys are never returned)."""
+        return self._get_list("/totp-tokens", "tokens")
 
     def get_totp_token(self, id: str) -> Dict:
         """Get a specific TOTP token by ID."""
@@ -743,8 +1004,21 @@ class SecretServerClient:
             body["notes"] = notes
         return self._post("/yubikeys", body)
 
+    YUBIKEY_FIELDS = ("container_id", "name", "serial_number", "public_id", "client_id",
+                      "validation_server", "notes", "tags")
+
     def update_yubikey(self, yubikey_id: str, data: Dict) -> Dict:
-        return self._put(f"/yubikeys/{_seg(yubikey_id)}", data)
+        """Update a YubiKey; fields absent from ``data`` keep their current values.
+
+        ``api_key`` is only sent when supplied in ``data``.
+        """
+        route = f"/yubikeys/{_seg(yubikey_id)}"
+        current = self._get(route)
+        if not isinstance(current, dict):
+            raise SecretServerError("Invalid yubikey response")
+        body = {key: current.get(key) for key in self.YUBIKEY_FIELDS}
+        body.update(data)
+        return self._put(route, body)
 
     def delete_yubikey(self, yubikey_id: str) -> None:
         self._delete(f"/yubikeys/{_seg(yubikey_id)}")
@@ -768,7 +1042,7 @@ class SecretServerClient:
         """
         Export a TOTP token to an otpauth:// URI.
 
-        Returns dict with 'uri' and 'qr_code' (base64-encoded PNG).
+        Returns dict with 'uri'.
         """
         return self._get(f"/totp-tokens/{_seg(id)}/export")
 
