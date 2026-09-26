@@ -15,10 +15,10 @@ for flow, reason in (
     ("gpg", "server build returns HTTP 500 'failed to store key metadata' on generate/import"),
     ("totp", "server build returns HTTP 500 'failed to store secret key' on create"),
     ("jks", "server build returns HTTP 500 'failed to store keystore' on create"),
-    ("yubikey", "needs a real YubiKey and the external Yubico validation service"),
-    ("certificate download", "enroll/download needs an ACME issuer, unavailable locally"),
+    ("yubikey", "OTP validation needs the external Yubico service; create/update covered offline only"),
+    ("certificate download", "server build returns HTTP 500 'failed to create certificate metadata' on enroll"),
     ("share", "needs a second user or group UUID the harness does not provision"),
-    ("webhook create", "needs a reachable external webhook receiver"),
+    ("webhook create", "server validates the webhook URL; needs an externally resolvable receiver"),
 ):
     print(f"SKIP {flow}: {reason}")
 
