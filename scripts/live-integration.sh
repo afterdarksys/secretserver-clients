@@ -23,13 +23,17 @@ done
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ss-client-live.XXXXXX")
 chmod 700 "$WORK"
+# Unix socket paths are limited to ~104 bytes; keep the PostgreSQL socket in a
+# short private directory so a long TMPDIR still works.
+SOCK=$(mktemp -d /tmp/ssli.XXXXXX)
+chmod 700 "$SOCK"
 PIDS=()
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     [[ -n "$pid" ]] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
   done
   pg_ctl -D "$WORK/pg" -m fast stop >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+  rm -rf "$WORK" "$SOCK"
 }
 trap cleanup EXIT
 
@@ -47,12 +51,15 @@ umask 077
 echo "==> PostgreSQL on 127.0.0.1:$PG_PORT"
 printf '%s\n' "$PG_PASSWORD" > "$WORK/pgpass"
 initdb -D "$WORK/pg" -U ss_admin --auth-local=trust --auth-host=scram-sha-256 --pwfile="$WORK/pgpass" >"$WORK/initdb.log"
-pg_ctl -D "$WORK/pg" -l "$WORK/pg.log" -o "-p $PG_PORT -h 127.0.0.1 -k $WORK" -w start >/dev/null
-createdb -h "$WORK" -p "$PG_PORT" -U ss_admin ss_live
+pg_ctl -D "$WORK/pg" -l "$WORK/pg.log" -o "-p $PG_PORT -h 127.0.0.1 -k $SOCK" -w start >/dev/null
+createdb -h "$SOCK" -p "$PG_PORT" -U ss_admin ss_live
 DSN="postgres://ss_admin:$PG_PASSWORD@127.0.0.1:$PG_PORT/ss_live?sslmode=disable"
 
 echo "==> Vault dev on 127.0.0.1:$VAULT_PORT"
-vault server -dev -dev-no-store-token -dev-listen-address="127.0.0.1:$VAULT_PORT" -dev-root-token-id="$VAULT_TOKEN" >"$WORK/vault.log" 2>&1 &
+# The root token is passed through the environment, not argv, so it is not
+# visible in the process list.
+VAULT_DEV_ROOT_TOKEN_ID="$VAULT_TOKEN" vault server -dev -dev-no-store-token \
+  -dev-listen-address="127.0.0.1:$VAULT_PORT" >"$WORK/vault.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$VAULT_PORT/v1/sys/health" >/dev/null 2>&1 && break; sleep 0.1; done
 
@@ -73,7 +80,7 @@ if [[ $ready != 1 ]]; then echo "API did not become ready" >&2; curl -sS "$API/r
 echo "==> Bootstrap tenant, API key and 'prod' container"
 RAW_KEY="sk_$(openssl rand -hex 24)"
 KEY_HASH=$(printf '%s' "$RAW_KEY" | shasum -a 256 | cut -d' ' -f1)
-psql -q -h "$WORK" -p "$PG_PORT" -U ss_admin -d ss_live -v ON_ERROR_STOP=1 \
+psql -q -h "$SOCK" -p "$PG_PORT" -U ss_admin -d ss_live -v ON_ERROR_STOP=1 \
   -v key_hash="$KEY_HASH" -v key_prefix="${RAW_KEY:0:11}" <<'SQL' >/dev/null
 WITH t AS (
   INSERT INTO tenants (name, email, password_hash, vault_path, plan, max_secrets, max_certs, max_api_keys)
@@ -94,11 +101,18 @@ run() {
   local name=$1 dir=$2; shift 2
   echo "==> $name"
   if (cd "$ROOT/$dir" && "$@") >"$WORK/$name.out" 2>&1; then
-    STATUS+=(PASS)
+    # A client that exits 0 but reports skipped or server-blocked checks is
+    # not a full pass.
+    if grep -qE '^(NOT VERIFIED|SKIP)' "$WORK/$name.out"; then
+      STATUS+=("NOT VERIFIED")
+    else
+      STATUS+=(PASS)
+    fi
   else
     STATUS+=(FAIL); sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | tail -30 >&2
   fi
   NAMES+=("$name")
+  sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | grep -E '^(NOT VERIFIED|SKIP)' || true
   sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | tail -3
 }
 
@@ -115,7 +129,10 @@ printf '%-10s %s\n' CLIENT RESULT
 failed=0
 for i in "${!NAMES[@]}"; do
   printf '%-10s %s\n' "${NAMES[$i]}" "${STATUS[$i]}"
-  [[ "${STATUS[$i]}" == PASS ]] || failed=1
+  if [[ "${STATUS[$i]}" == FAIL ]]; then failed=1; fi
 done
 if grep -qF "$RAW_KEY" "$WORK/api.log"; then echo "FAIL: API key appeared in server log" >&2; failed=1; fi
+if [[ $failed == 0 ]] && printf '%s\n' "${STATUS[@]}" | grep -q "NOT VERIFIED"; then
+  echo "All clients passed their executed checks; NOT VERIFIED rows list checks that were skipped or blocked by server defects."
+fi
 exit $failed
