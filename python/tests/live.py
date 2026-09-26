@@ -9,6 +9,19 @@ URL, KEY, CONTAINER = os.environ["SS_LIVE_URL"], os.environ["SS_LIVE_KEY"], os.e
 c = SecretServerClient(KEY, URL)
 cleanup = []
 
+# Flows deliberately not exercised live; their request shapes are pinned by
+# tests/test_contract.py instead. Printed so the harness marks the run honestly.
+for flow, reason in (
+    ("gpg", "server build returns HTTP 500 'failed to store key metadata' on generate/import"),
+    ("totp", "server build returns HTTP 500 'failed to store secret key' on create"),
+    ("jks", "server build returns HTTP 500 'failed to store keystore' on create"),
+    ("yubikey", "needs a real YubiKey and the external Yubico validation service"),
+    ("certificate download", "enroll/download needs an ACME issuer, unavailable locally"),
+    ("share", "needs a second user or group UUID the harness does not provision"),
+    ("webhook create", "needs a reachable external webhook receiver"),
+):
+    print(f"SKIP {flow}: {reason}")
+
 try:
     # Secrets, path access and read-merge-write update.
     c.create_secret("python-live", "first", description="live description", container_id=CONTAINER)
@@ -61,12 +74,6 @@ try:
     # OpenSSL.
     ossl = c.generate_openssl_key("python-live-ossl", "ecdsa", curve="P-256")
     cleanup.append(lambda: c.delete_openssl_key(ossl["id"]))
-
-    # Not exercised live: on this server build GPG generate/import ("failed to
-    # store key metadata"), TOTP create ("failed to store secret key") and JKS
-    # create ("failed to store keystore") return HTTP 500 for any client, and
-    # certificate enroll/download needs ACME; their request shapes are pinned
-    # by tests/test_contract.py instead.
 
     # Export with include flags, audit query and export.
     # This server build skips items whose Vault read fails and can return
