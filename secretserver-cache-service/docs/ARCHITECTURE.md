@@ -66,6 +66,17 @@ Use a single-writer transactional embedded database. Store:
 
 Never store decrypted values. Decrypt into locked memory only for a permitted delivery and wipe immediately afterward. Disable core dumps and prevent inclusion in backup, indexing, telemetry, and support-bundle tooling.
 
+Filesystem permissions (fail closed):
+
+- The store directory is owned by the daemon's dedicated service account with mode `0700`; database and journal files are `0600`. The daemon refuses to start if the directory or any store file has a different owner, group/other permission bits, or is a symlink.
+- Temporary and journal files are created inside the store directory, never in a shared temp directory.
+
+Eviction and removal:
+
+- There is no access-pattern eviction (no LRU). Capacity (maximum entries and encrypted bytes) is enforced by the server at issuance and re-checked by the daemon on install; a bundle that exceeds the signed policy limits is rejected as a whole and audited.
+- Expired, revoked, and quarantined leases are purged at daemon start and on a periodic timer: the wrapped lease key is overwritten and deleted first (crypto-shredding the records), then the encrypted records and manifests are removed in the same transaction.
+- A lookup that finds an expired lease denies and triggers the purge; it never serves stale data.
+
 ## Local IPC and consumers
 
 - Linux/macOS: root-owned Unix domain socket, no TCP listener.
