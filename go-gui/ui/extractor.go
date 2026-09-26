@@ -2,7 +2,10 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -24,9 +27,9 @@ type ExtractorUI struct {
 }
 
 type extractedItem struct {
-	Source      string // "Keychain" or "File"
-	Name        string // e.g file path or label
-	Description string // e.g match context or account definition
+	Source      string            // "Keychain" or "File"
+	Name        string            // e.g file path or label
+	Description string            // e.g match context or account definition
 	Data        map[string]string // e.g username/password, or secret value
 }
 
@@ -129,7 +132,7 @@ func (e *ExtractorUI) showDetails(item extractedItem) {
 		dataStr += fmt.Sprintf("%s: %s\n", k, v)
 	}
 	dataLabel := widget.NewLabel(dataStr)
-	
+
 	importBtn := widget.NewButton("Import to SecretServer", func() {
 		e.importSecret(item)
 	})
@@ -151,6 +154,28 @@ func (e *ExtractorUI) showDetails(item extractedItem) {
 	e.details.Refresh()
 }
 
+// secretNameFor maps an extracted item name onto the server's name pattern
+// ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$: other characters become '-', leading
+// non-alphanumerics are trimmed and the result is capped at 255 bytes.
+func secretNameFor(itemName string) string {
+	var b strings.Builder
+	for _, r := range "Extracted-" + itemName {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	name := strings.TrimLeftFunc(b.String(), func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	})
+	if len(name) > 255 {
+		name = name[:255]
+	}
+	return name
+}
+
 func (e *ExtractorUI) importSecret(item extractedItem) {
 	if e.app.Client == nil {
 		dialog.ShowError(fmt.Errorf("SecretServer client not configured"), e.app.MainWindow)
@@ -162,25 +187,25 @@ func (e *ExtractorUI) importSecret(item extractedItem) {
 			return
 		}
 
-		// Clean up name for API usage
-		name := item.Name
-		if len(name) > 50 {
-			name = name[:50]
-		}
-		
+		name := secretNameFor(item.Name)
 		req := &secretserver.SecretCreateRequest{
-			Name:        "Extracted-" + name,
+			Name:        name,
 			Description: fmt.Sprintf("Extracted from %s\n%s", item.Source, item.Description),
 			Data:        item.Data,
 			Tags:        []string{"extracted", item.Source},
 		}
 
 		_, err := e.app.Client.Secrets.Create(context.Background(), req)
+		var apiErr *secretserver.ErrorResponse
+		if errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == http.StatusConflict {
+			dialog.ShowError(fmt.Errorf("a secret named %q already exists; rename or delete it before importing", name), e.app.MainWindow)
+			return
+		}
 		if err != nil {
 			dialog.ShowError(err, e.app.MainWindow)
 			return
 		}
-		
+
 		dialog.ShowInformation("Success", "Secret imported successfully", e.app.MainWindow)
 		e.app.secretsUI.Refresh() // Tell secrets UI to fetch new data
 	}, e.app.MainWindow)

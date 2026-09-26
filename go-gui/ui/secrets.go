@@ -227,9 +227,18 @@ func (s *SecretsUI) showEditForm(sec *secretserver.Secret) {
 			}
 		}
 
+		if len(dataMap) == 0 {
+			dialog.ShowError(fmt.Errorf("secret data must contain at least one key=value pair"), s.app.MainWindow)
+			return
+		}
+
+		// The server replaces the whole record on update; carry the loaded
+		// container and tags so the secret stays in its container.
 		req := &secretserver.SecretUpdateRequest{
+			ContainerID: sec.ContainerID,
 			Description: descEntry.Text,
 			Data:        dataMap,
+			Tags:        sec.Tags,
 		}
 
 		_, err := s.app.Client.Secrets.Update(context.Background(), sec.Name, req)
