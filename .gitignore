@@ -21,3 +21,4 @@ go/secretserver/*.bak
 .DS_Store
 .idea/
 .vscode/
+.omc/
