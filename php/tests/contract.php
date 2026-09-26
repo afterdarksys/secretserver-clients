@@ -148,7 +148,79 @@ $secrets = $client->listSecrets();
 check(($secrets[0]['name'] ?? null) === 'db', 'secret list envelope unwrapped');
 
 $update = $client->updateSecret('prod/db', 'new');
-check(($update['body']['name'] ?? null) === 'prod/db' && ($update['path'] ?? null) === '/api/v1/secrets/prod%2Fdb', 'secret update matches backend contract');
+check(($update['method'] ?? null) === 'PUT' && ($update['path'] ?? null) === '/api/v1/secrets/prod%2Fdb', 'secret update path');
+check($update['body'] === ['name' => 'prod/db', 'data' => ['value' => 'new'], 'description' => 'keep-desc', 'tags' => ['t1'], 'container_id' => 'c-1'], 'secret update preserves description/tags/container_id');
+$update = $client->updateSecret('prod/db', 'new', ['description' => 'new-desc', 'container_id' => null]);
+check($update['body']['description'] === 'new-desc' && $update['body']['container_id'] === null && $update['body']['tags'] === ['t1'], 'secret update caller fields override');
+
+$jks = $client->updateJKSKeystore('j1', ['notes' => 'n2']);
+check($jks['body'] === ['container_id' => 'c-1', 'name' => 'jks-name', 'notes' => 'n2', 'tags' => ['t1']], 'JKS update is read-merge-write');
+$yk = $client->updateYubikey('y1', ['name' => 'yk2']);
+check($yk['body']['name'] === 'yk2' && $yk['body']['public_id'] === 'cccccccccccc' && $yk['body']['tags'] === ['t2'] && !isset($yk['body']['id']), 'YubiKey update is read-merge-write');
+
+$pw = $client->createPassword('pw', 'alice', 's3cret');
+check(($pw['body']['value'] ?? null) === 's3cret' && !isset($pw['body']['password']), 'createPassword sends value');
+$gen = $client->generatePassword('gp', 20, false);
+check($gen['body'] === ['name' => 'gp', 'length' => 20, 'use_lowercase' => true, 'use_uppercase' => true, 'use_digits' => true, 'use_symbols' => false], 'generatePassword body');
+expectFailure(fn () => $client->generatePassword('gp', 7), 'password length below 8 rejected');
+expectFailure(fn () => $client->generatePassword('gp', 129), 'password length above 128 rejected');
+
+$tok = $client->createAPIToken('t', 'github', 'ghp_x', 'staging');
+check($tok['body'] === ['name' => 't', 'service' => 'github', 'value' => 'ghp_x', 'environment' => 'staging'], 'createAPIToken body');
+expectFailure(fn () => $client->createAPIToken('t', 'github', 'ghp_x', 'prod'), 'invalid token environment rejected');
+$rot = $client->rotateAPIToken('tk1', 'ghp_y');
+check($rot['path'] === '/api/v1/api-tokens/tk1/rotate' && $rot['body'] === ['value' => 'ghp_y'], 'rotateAPIToken body');
+
+$share = $client->share('password', 'p1', 'u-1', null, 'manage', null);
+check($share['path'] === '/api/v1/password/p1/shares' && $share['body'] === ['permission' => 'manage', 'shared_with_user_id' => 'u-1'], 'share with user');
+$share = $client->share('secret', 's1', null, 'g-1');
+check(($share['body']['shared_with_group_id'] ?? null) === 'g-1' && isset($share['body']['expires_at']) && !isset($share['body']['shared_with_user_id']), 'share with group');
+expectFailure(fn () => $client->share('secret', 's1', 'u-1', 'g-1'), 'share with both user and group rejected');
+expectFailure(fn () => $client->share('secret', 's1'), 'share with neither user nor group rejected');
+expectFailure(fn () => $client->share('secret', 's1', 'u-1', null, 'write'), 'invalid share permission rejected');
+expectFailure(fn () => $client->share('secrets', 's1', 'u-1'), 'invalid share type rejected');
+
+check($client->createTempAccess('secret', 's1', 60)['body'] === ['duration_seconds' => 60], 'temp access minimum accepted');
+expectFailure(fn () => $client->createTempAccess('secret', 's1', 59), 'temp access below 60s rejected');
+expectFailure(fn () => $client->createTempAccess('secret', 's1', 86401), 'temp access above 86400s rejected');
+
+check($client->getHistory('secret', 's1') === [['version_num' => 1, 'secret_type' => 'secret']], 'history is a bare array');
+expectFailure(fn () => $client->getHistory('secret', 'not-a-list'), 'non-list history rejected');
+
+$gpg = $client->generateGPGKey('g', 'g@example.test', 'RSA4096', ['comment' => 'c']);
+check($gpg['body'] === ['comment' => 'c', 'name' => 'g', 'email' => 'g@example.test', 'algorithm' => 'RSA4096'], 'generateGPGKey body');
+expectFailure(fn () => $client->generateGPGKey('g', 'g@example.test', 'rsa'), 'invalid GPG algorithm rejected');
+check($client->importGPGKey('-----BEGIN PGP-----', 'pp')['body'] === ['armored_key' => '-----BEGIN PGP-----', 'passphrase' => 'pp'], 'importGPGKey body');
+check($client->exportGPGKey('g1', 'private')['path'] === '/api/v1/gpg-keys/g1/export?format=private', 'exportGPGKey format param');
+expectFailure(fn () => $client->exportGPGKey('g1', 'secret'), 'invalid GPG export format rejected');
+
+check($client->generateOpenSSLKey('o', 'ecdsa', 4096, 'P-384')['body'] === ['name' => 'o', 'algorithm' => 'ecdsa', 'curve' => 'P-384'], 'generateOpenSSLKey ecdsa body');
+check($client->generateOpenSSLKey('o', 'rsa', 2048)['body'] === ['name' => 'o', 'algorithm' => 'rsa', 'key_size' => 2048], 'generateOpenSSLKey rsa body');
+expectFailure(fn () => $client->generateOpenSSLKey('o', 'dsa'), 'invalid OpenSSL algorithm rejected');
+check($client->importOpenSSLKey('o', 'rsa', 'PEM')['body'] === ['name' => 'o', 'algorithm' => 'rsa', 'private_key' => 'PEM'], 'importOpenSSLKey body');
+
+check($client->downloadCertificate('c1') === 'RAW-PEM:format=pem', 'certificate download returns raw body');
+check($client->downloadCertificate('c1', 'pfx', 'p w&x') === 'RAW-PEM:format=pfx&password=p%20w%26x', 'certificate pfx password encoded');
+expectFailure(fn () => $client->downloadCertificate('c1', 'p12'), 'pfx/p12 without password rejected');
+expectFailure(fn () => $client->downloadCertificate('c1', 'der'), 'invalid certificate format rejected');
+check(strlen($client->downloadCertificate('mid')) === 5 * 1024 * 1024, 'raw download allows up to 16 MiB');
+$e = expectFailure(fn () => $client->downloadCertificate('big'), 'raw download over 16 MiB rejected');
+check(str_contains($e->getMessage(), 'size limit'), 'raw oversize error names the size limit');
+
+check($client->exportAuditLogs(['action' => 'a b', 'user_id' => null])['path'] === '/api/v1/audit/logs/export?action=a%20b&format=json', 'exportAuditLogs requests JSON with encoded filters');
+check($client->listTOTPTokens() === [['id' => 't1']], 'TOTP list envelope unwrapped');
+check($client->exportToJSON(true, false, true, false, ['prod'])['body'] === ['include_passwords' => true, 'include_secrets' => false, 'include_ssh_keys' => true, 'include_certificates' => false, 'tags' => ['prod']], 'exportToJSON flags');
+check($client->exportToKeychain()['path'] === '/api/v1/export/keychain' && !isset($client->exportToKeychain()['body']['items']), 'exportToKeychain has no items');
+check($client->exportToCredentialManager(false)['body']['include_passwords'] === false, 'exportToCredentialManager flags');
+$hook = $client->createWebhook('h', 'https://hooks.example.test', ['secret.create'], 'whsec');
+check($hook['body'] === ['name' => 'h', 'url' => 'https://hooks.example.test', 'events' => ['secret.create'], 'secret' => 'whsec'], 'createWebhook sends secret, no auth_type');
+check($client->decode('eyJ...', 'jwt') === ['sub' => 'x'], 'decode returns structured result for jwt');
+
+check($client->getSecret('a/b/12')['path'] === '/api/v1/s/a/b/12', 'three-segment path with version accepted');
+expectFailure(fn () => $client->secret('a/b/c/d'), 'four-segment secret path rejected');
+expectFailure(fn () => $client->secret('a/b/13'), 'version above 12 rejected');
+expectFailure(fn () => $client->secret('a/b/0'), 'version 0 rejected');
+expectFailure(fn () => $client->secret('a/b/x'), 'non-numeric version rejected');
 
 $enroll = $client->enrollCertificate('wildcard', 'example.test', ['www.example.test']);
 check(($enroll['body']['dns_names'][0] ?? null) === 'www.example.test' && !isset($enroll['body']['sans']), 'certificate enrollment matches backend contract');

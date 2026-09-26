@@ -229,13 +229,27 @@ class SecretServerClient
         ], $opts));
     }
 
-    /** @return array<string, mixed> */
-    public function updateSecret(string $name, string $value): array
+    /**
+     * Replace a secret's value. The server PUT is a full replace, so the current
+     * description, tags and container_id are read first and preserved unless
+     * overridden in $opts.
+     *
+     * @param array<string, mixed> $opts 'description', 'tags', 'container_id'
+     * @return array<string, mixed>
+     */
+    public function updateSecret(string $name, string $value, array $opts = []): array
     {
-        return $this->put('/secrets/' . self::pathSegment($name), [
-            'name' => $name,
-            'data' => ['value' => $value],
-        ]);
+        $path    = '/secrets/' . self::pathSegment($name);
+        $current = $this->get($path);
+        $body    = ['name' => $name, 'data' => ['value' => $value]];
+        foreach (['description', 'tags', 'container_id'] as $field) {
+            if (array_key_exists($field, $opts)) {
+                $body[$field] = $opts[$field];
+            } elseif (array_key_exists($field, $current)) {
+                $body[$field] = $current[$field];
+            }
+        }
+        return $this->put($path, $body);
     }
 
     public function deleteSecret(string $name): void { $this->delete('/secrets/' . self::pathSegment($name)); }
@@ -328,10 +342,16 @@ class SecretServerClient
         ]));
     }
 
-    /** @param array<string, mixed> $data @return array<string, mixed> */
+    /**
+     * Update keystore metadata. The server PUT is a full replace, so the current
+     * container_id, name, notes and tags are read first and $data is overlaid.
+     *
+     * @param array<string, mixed> $data @return array<string, mixed>
+     */
     public function updateJKSKeystore(string $id, array $data): array
     {
-        return $this->put('/jks-keystores/' . self::pathSegment($id), $data);
+        $path = '/jks-keystores/' . self::pathSegment($id);
+        return $this->put($path, $this->mergeCurrent($path, ['container_id', 'name', 'notes', 'tags'], $data));
     }
 
     public function deleteJKSKeystore(string $id): void { $this->delete('/jks-keystores/' . self::pathSegment($id)); }
@@ -417,17 +437,40 @@ class SecretServerClient
     public function listPasswords(): array { return $this->getList('/passwords', 'passwords'); }
 
     /** @return array<string, mixed> */
-    public function createPassword(string $name, string $username, string $password, string $url = ''): array
+    public function createPassword(string $name, string $username, string $value, string $url = ''): array
     {
-        $body = ['name' => $name, 'username' => $username, 'password' => $password];
+        $body = ['name' => $name, 'username' => $username, 'value' => $value];
         if ($url) $body['url'] = $url;
         return $this->post('/passwords', $body);
     }
 
-    public function generatePassword(int $length = 32, bool $includeSymbols = true): string
-    {
-        $data = $this->post('/passwords/generate', ['length' => $length, 'include_symbols' => $includeSymbols]);
-        return (string) ($data['password'] ?? '');
+    /**
+     * Generate and PERSIST a password record. The generated secret is in 'value'.
+     *
+     * @param array<string, mixed> $opts 'description', 'username', 'url', 'tags',
+     *                                   'exclude_similar', 'min_uppercase', 'min_digits', 'min_symbols'
+     * @return array<string, mixed> PasswordResponse
+     */
+    public function generatePassword(
+        string $name,
+        int    $length = 32,
+        bool   $useSymbols = true,
+        bool   $useLowercase = true,
+        bool   $useUppercase = true,
+        bool   $useDigits = true,
+        array  $opts = []
+    ): array {
+        if ($length < 8 || $length > 128) {
+            throw new SecretServerException('Password length must be between 8 and 128');
+        }
+        return $this->post('/passwords/generate', array_merge($opts, [
+            'name'          => $name,
+            'length'        => $length,
+            'use_lowercase' => $useLowercase,
+            'use_uppercase' => $useUppercase,
+            'use_digits'    => $useDigits,
+            'use_symbols'   => $useSymbols,
+        ]));
     }
 
     // -----------------------------------------------------------------------
@@ -437,14 +480,26 @@ class SecretServerClient
     /** @return array<int, array<string, mixed>> */
     public function listAPITokens(): array { return $this->getList('/api-tokens', 'tokens'); }
 
-    /** @return array<string, mixed> */
-    public function createAPIToken(string $name, string $service, string $token): array
+    /**
+     * @param string $environment production, staging or development
+     * @param array<string, mixed> $opts 'description', 'expires_at' (RFC 3339)
+     * @return array<string, mixed>
+     */
+    public function createAPIToken(string $name, string $service, string $value, string $environment, array $opts = []): array
     {
-        return $this->post('/api-tokens', ['name' => $name, 'service' => $service, 'token' => $token]);
+        if (!in_array($environment, ['production', 'staging', 'development'], true)) {
+            throw new SecretServerException('Environment must be production, staging or development');
+        }
+        return $this->post('/api-tokens', array_merge($opts, [
+            'name' => $name, 'service' => $service, 'value' => $value, 'environment' => $environment,
+        ]));
     }
 
-    /** @return array<string, mixed> */
-    public function rotateAPIToken(string $id): array { return $this->post('/api-tokens/' . self::pathSegment($id) . '/rotate'); }
+    /** Replace a stored token with $newValue. @return array<string, mixed> */
+    public function rotateAPIToken(string $id, string $newValue): array
+    {
+        return $this->post('/api-tokens/' . self::pathSegment($id) . '/rotate', ['value' => $newValue]);
+    }
 
     // -----------------------------------------------------------------------
     // Extended credential type helper
@@ -466,12 +521,16 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /**
+     * @param string $secretType one of self::SECRET_TYPES
      * @return array<int, array<string, mixed>>
      */
     public function getHistory(string $secretType, string $secretId): array
     {
         $data = $this->get('/' . self::secretType($secretType) . '/' . self::pathSegment($secretId) . '/history');
-        return $data['versions'] ?? [];
+        if ($data !== [] && array_keys($data) !== range(0, count($data) - 1)) {
+            throw new SecretServerException('Invalid server response');
+        }
+        return $data;
     }
 
     /** @return array<string, mixed> */
@@ -485,16 +544,31 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /**
+     * Share with exactly one user or group (UUIDs).
+     *
+     * @param string $permission read or manage
      * @return array<string, mixed>
      */
     public function share(
         string  $secretType,
         string  $secretId,
-        string  $email,
+        ?string $userId = null,
+        ?string $groupId = null,
         string  $permission = 'read',
         ?int    $expiresHours = 72
     ): array {
-        $body = ['shared_with_email' => $email, 'permission' => $permission];
+        if (($userId === null || $userId === '') === ($groupId === null || $groupId === '')) {
+            throw new SecretServerException('Specify exactly one of userId or groupId');
+        }
+        if (!in_array($permission, ['read', 'manage'], true)) {
+            throw new SecretServerException('Permission must be read or manage');
+        }
+        $body = ['permission' => $permission];
+        if ($userId !== null && $userId !== '') {
+            $body['shared_with_user_id'] = $userId;
+        } else {
+            $body['shared_with_group_id'] = $groupId;
+        }
         if ($expiresHours !== null) {
             $body['expires_at'] = (new \DateTimeImmutable('+' . $expiresHours . ' hours'))->format(\DateTimeInterface::ATOM);
         }
@@ -506,6 +580,9 @@ class SecretServerClient
      */
     public function createTempAccess(string $secretType, string $secretId, int $durationSeconds = 900): array
     {
+        if ($durationSeconds < 60 || $durationSeconds > 86400) {
+            throw new SecretServerException('Temp access duration must be between 60 and 86400 seconds');
+        }
         return $this->post('/' . self::secretType($secretType) . '/' . self::pathSegment($secretId) . '/temp-access', [
             'duration_seconds' => $durationSeconds,
         ]);
@@ -527,10 +604,17 @@ class SecretServerClient
         return (string) ($r['result'] ?? '');
     }
 
-    public function decode(string $data, string $format = 'base64'): string
+    /**
+     * Decode $data. Returns a string for base64; for jwt (claims) and json the
+     * decoded structure is returned as-is.
+     */
+    public function decode(string $data, string $format = 'base64'): mixed
     {
         $r = $this->post('/transform/decode', ['input' => $data, 'source_type' => $format]);
-        return (string) ($r['result'] ?? '');
+        if (!array_key_exists('result', $r)) {
+            throw new SecretServerException('Invalid server response');
+        }
+        return $r['result'];
     }
 
     // -----------------------------------------------------------------------
@@ -544,29 +628,42 @@ class SecretServerClient
     public function getGPGKey(string $id): array { return $this->get('/gpg-keys/' . self::pathSegment($id)); }
 
     /**
-     * @param array<string, mixed> $opts 'key_type', 'expires_in_days'
+     * @param string $algorithm RSA2048, RSA4096 or ED25519
+     * @param array<string, mixed> $opts 'comment', 'passphrase'
      * @return array<string, mixed>
      */
-    public function generateGPGKey(string $name, string $email, array $opts = []): array
+    public function generateGPGKey(string $name, string $email, string $algorithm = 'ED25519', array $opts = []): array
     {
-        return $this->post('/gpg-keys/generate', array_merge([
+        if (!in_array($algorithm, ['RSA2048', 'RSA4096', 'ED25519'], true)) {
+            throw new SecretServerException('GPG algorithm must be RSA2048, RSA4096 or ED25519');
+        }
+        return $this->post('/gpg-keys/generate', array_merge($opts, [
             'name' => $name,
             'email' => $email,
-        ], $opts));
+            'algorithm' => $algorithm,
+        ]));
     }
 
     /** @return array<string, mixed> */
-    public function importGPGKey(string $name, string $email, string $privateKey): array
+    public function importGPGKey(string $armoredKey, ?string $passphrase = null, ?string $name = null): array
     {
-        return $this->post('/gpg-keys/import', [
-            'name' => $name,
-            'email' => $email,
-            'private_key' => $privateKey,
-        ]);
+        $body = ['armored_key' => $armoredKey];
+        if ($passphrase !== null) $body['passphrase'] = $passphrase;
+        if ($name !== null)       $body['name']       = $name;
+        return $this->post('/gpg-keys/import', $body);
     }
 
-    /** @return array<string, mixed> */
-    public function exportGPGKey(string $id): array { return $this->get('/gpg-keys/' . self::pathSegment($id) . '/export'); }
+    /**
+     * @param string $format public or private
+     * @return array{key: string, format: string, fingerprint: string, key_id: string}
+     */
+    public function exportGPGKey(string $id, string $format = 'public'): array
+    {
+        if (!in_array($format, ['public', 'private'], true)) {
+            throw new SecretServerException('GPG export format must be public or private');
+        }
+        return $this->get('/gpg-keys/' . self::pathSegment($id) . '/export' . self::query(['format' => $format]));
+    }
 
     public function deleteGPGKey(string $id): void { $this->delete('/gpg-keys/' . self::pathSegment($id)); }
 
@@ -580,23 +677,34 @@ class SecretServerClient
     /** @return array<string, mixed> */
     public function getOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . self::pathSegment($id)); }
 
-    /** @return array<string, mixed> */
-    public function generateOpenSSLKey(string $name, string $keyType = 'rsa', int $bits = 4096): array
+    /**
+     * @param string $algorithm rsa, ecdsa or ed25519
+     * @param int    $keySize   RSA key size (2048..8192); ignored for ecdsa/ed25519
+     * @param string|null $curve ECDSA curve (P-256, P-384, P-521)
+     * @return array<string, mixed>
+     */
+    public function generateOpenSSLKey(string $name, string $algorithm = 'rsa', int $keySize = 4096, ?string $curve = null): array
     {
-        return $this->post('/openssl-keys/generate', [
-            'name' => $name,
-            'key_type' => $keyType,
-            'bits' => $bits,
-        ]);
+        if (!in_array($algorithm, ['rsa', 'ecdsa', 'ed25519'], true)) {
+            throw new SecretServerException('OpenSSL algorithm must be rsa, ecdsa or ed25519');
+        }
+        $body = ['name' => $name, 'algorithm' => $algorithm];
+        if ($algorithm === 'rsa') $body['key_size'] = $keySize;
+        if ($curve !== null)      $body['curve']    = $curve;
+        return $this->post('/openssl-keys/generate', $body);
     }
 
-    /** @return array<string, mixed> */
-    public function importOpenSSLKey(string $name, string $privateKey): array
+    /**
+     * @param array<string, mixed> $opts 'description', 'key_size', 'curve', 'public_key', 'passphrase', 'format'
+     * @return array<string, mixed>
+     */
+    public function importOpenSSLKey(string $name, string $algorithm, string $privateKey, array $opts = []): array
     {
-        return $this->post('/openssl-keys/import', [
+        return $this->post('/openssl-keys/import', array_merge($opts, [
             'name' => $name,
+            'algorithm' => $algorithm,
             'private_key' => $privateKey,
-        ]);
+        ]));
     }
 
     /** @return array<string, mixed> */
@@ -638,8 +746,23 @@ class SecretServerClient
     /** @return array<string, mixed> */
     public function revokeCertificate(string $id): array { return $this->post('/certificates/' . self::pathSegment($id) . '/revoke'); }
 
-    /** @return array<string, mixed> */
-    public function downloadCertificate(string $id): array { return $this->get('/certificates/' . self::pathSegment($id) . '/download'); }
+    /**
+     * Download certificate material as raw bytes (not JSON).
+     *
+     * @param string      $format   pem, pem-bundle, key, pfx or p12
+     * @param string|null $password required for pfx/p12
+     */
+    public function downloadCertificate(string $id, string $format = 'pem', ?string $password = null): string
+    {
+        if (!in_array($format, ['pem', 'pem-bundle', 'key', 'pfx', 'p12'], true)) {
+            throw new SecretServerException('Certificate format must be pem, pem-bundle, key, pfx or p12');
+        }
+        if (in_array($format, ['pfx', 'p12'], true) && ($password === null || $password === '')) {
+            throw new SecretServerException('A password is required for pfx/p12 downloads');
+        }
+        return $this->requestRaw('GET', '/certificates/' . self::pathSegment($id) . '/download'
+            . self::query(['format' => $format, 'password' => $password]));
+    }
 
     // -----------------------------------------------------------------------
     // Webhooks
@@ -652,14 +775,11 @@ class SecretServerClient
      * @param string[] $events
      * @return array<string, mixed>
      */
-    public function createWebhook(string $name, string $url, array $events, string $authType = 'none'): array
+    public function createWebhook(string $name, string $url, array $events, string $secret = ''): array
     {
-        return $this->post('/webhooks', [
-            'name' => $name,
-            'url' => $url,
-            'events' => $events,
-            'auth_type' => $authType,
-        ]);
+        $body = ['name' => $name, 'url' => $url, 'events' => $events];
+        if ($secret !== '') $body['secret'] = $secret;
+        return $this->post('/webhooks', $body);
     }
 
     /** @return array<int, array<string, mixed>> */
@@ -676,30 +796,67 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /**
-     * @param array<int, array<string, mixed>> $items
+     * Export tenant-wide credentials in macOS Keychain format.
+     *
+     * @param string[] $tags optional tag filter
      * @return array<string, mixed>
      */
-    public function exportToKeychain(array $items): array
-    {
-        return $this->post('/export/keychain', ['items' => $items]);
+    public function exportToKeychain(
+        bool  $includePasswords = true,
+        bool  $includeSecrets = true,
+        bool  $includeSSHKeys = true,
+        bool  $includeCertificates = true,
+        array $tags = []
+    ): array {
+        return $this->post('/export/keychain', self::exportBody($includePasswords, $includeSecrets, $includeSSHKeys, $includeCertificates, $tags));
     }
 
     /**
-     * @param array<int, array<string, mixed>> $items
+     * Export tenant-wide credentials in Windows Credential Manager format.
+     *
+     * @param string[] $tags optional tag filter
      * @return array<string, mixed>
      */
-    public function exportToCredentialManager(array $items): array
-    {
-        return $this->post('/export/credential-manager', ['items' => $items]);
+    public function exportToCredentialManager(
+        bool  $includePasswords = true,
+        bool  $includeSecrets = true,
+        bool  $includeSSHKeys = true,
+        bool  $includeCertificates = true,
+        array $tags = []
+    ): array {
+        return $this->post('/export/credential-manager', self::exportBody($includePasswords, $includeSecrets, $includeSSHKeys, $includeCertificates, $tags));
     }
 
     /**
-     * @param array<int, array<string, mixed>> $items
+     * Export tenant-wide credentials as JSON.
+     *
+     * @param string[] $tags optional tag filter
      * @return array<string, mixed>
      */
-    public function exportToJSON(array $items): array
+    public function exportToJSON(
+        bool  $includePasswords = true,
+        bool  $includeSecrets = true,
+        bool  $includeSSHKeys = true,
+        bool  $includeCertificates = true,
+        array $tags = []
+    ): array {
+        return $this->post('/export/json', self::exportBody($includePasswords, $includeSecrets, $includeSSHKeys, $includeCertificates, $tags));
+    }
+
+    /**
+     * @param string[] $tags
+     * @return array<string, mixed>
+     */
+    private static function exportBody(bool $passwords, bool $secrets, bool $sshKeys, bool $certificates, array $tags): array
     {
-        return $this->post('/export/json', ['items' => $items]);
+        $body = [
+            'include_passwords'    => $passwords,
+            'include_secrets'      => $secrets,
+            'include_ssh_keys'     => $sshKeys,
+            'include_certificates' => $certificates,
+        ];
+        if ($tags !== []) $body['tags'] = array_values($tags);
+        return $body;
     }
 
     // -----------------------------------------------------------------------
@@ -715,8 +872,16 @@ class SecretServerClient
         return $this->get('/audit/logs' . self::query($opts));
     }
 
-    /** @return array<string, mixed> */
-    public function exportAuditLogs(): array { return $this->get('/audit/logs/export'); }
+    /**
+     * Export audit logs as JSON ({logs, total, exported_at}).
+     *
+     * @param array<string, mixed> $filters 'action', 'resource', 'resource_id', 'user_id', 'start_date', 'end_date'
+     * @return array<string, mixed>
+     */
+    public function exportAuditLogs(array $filters = []): array
+    {
+        return $this->get('/audit/logs/export' . self::query(array_merge($filters, ['format' => 'json'])));
+    }
 
     // -----------------------------------------------------------------------
     // TOTP Authenticators
@@ -746,9 +911,20 @@ class SecretServerClient
         ], $opts));
     }
 
-    /** @param array<string, mixed> $data
-     *  @return array<string, mixed> */
-    public function updateYubikey(string $id, array $data): array { return $this->put('/yubikeys/' . self::pathSegment($id), $data); }
+    /**
+     * Update a YubiKey. The server PUT is a full replace, so current metadata is
+     * read first and $data is overlaid.
+     *
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    public function updateYubikey(string $id, array $data): array
+    {
+        $path = '/yubikeys/' . self::pathSegment($id);
+        return $this->put($path, $this->mergeCurrent($path, [
+            'container_id', 'name', 'serial_number', 'public_id', 'client_id', 'validation_server', 'notes', 'tags',
+        ], $data));
+    }
 
     public function deleteYubikey(string $id): void { $this->delete('/yubikeys/' . self::pathSegment($id)); }
 
@@ -767,7 +943,7 @@ class SecretServerClient
      *
      * @return array<int, array<string, mixed>>
      */
-    public function listTOTPTokens(): array { return $this->get('/totp-tokens'); }
+    public function listTOTPTokens(): array { return $this->getList('/totp-tokens', 'tokens'); }
 
     /**
      * Get a specific TOTP token by ID.
@@ -851,9 +1027,7 @@ class SecretServerClient
     /**
      * Export a TOTP token to an otpauth:// URI.
      *
-     * Returns array with 'uri' and 'qr_code' (base64-encoded PNG).
-     *
-     * @return array{uri: string, qr_code: string}
+     * @return array{uri: string}
      */
     public function exportTOTPToURI(string $id): array
     {
@@ -886,6 +1060,25 @@ class SecretServerClient
 
     /** @internal Used by CredentialResource */
     public function delete(string $path): void { $this->request('DELETE', $path); }
+
+    /**
+     * GET $path and return the listed fields of the current record, overlaid with $data.
+     *
+     * @param string[] $fields
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    private function mergeCurrent(string $path, array $fields, array $data): array
+    {
+        $current = $this->get($path);
+        $body    = [];
+        foreach ($fields as $field) {
+            if (array_key_exists($field, $current)) {
+                $body[$field] = $current[$field];
+            }
+        }
+        return array_merge($body, $data);
+    }
 
     /** @return array<int, mixed> */
     private function getList(string $path, string ...$envelopeKeys): array

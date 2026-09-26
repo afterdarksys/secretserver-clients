@@ -45,7 +45,40 @@ switch ($uri) {
         return;
 }
 
+$route = parse_url($uri, PHP_URL_PATH);
+if ($method === 'GET' && preg_match('#^/api/v1/certificates/(\w+)/download$#', $route, $m)) {
+    header('Content-Type: text/plain');
+    $sizes = ['mid' => 5 * 1024 * 1024, 'big' => 17 * 1024 * 1024];
+    echo isset($sizes[$m[1]]) ? str_repeat('b', $sizes[$m[1]]) : 'RAW-PEM:' . (string) parse_url($uri, PHP_URL_QUERY);
+    return;
+}
+
 header('Content-Type: application/json');
+
+$records = [
+    '/api/v1/secrets/prod%2Fdb' => [
+        'id' => 'id-db', 'name' => 'prod/db', 'description' => 'keep-desc', 'tags' => ['t1'],
+        'container_id' => 'c-1', 'data' => ['value' => 'old'], 'version' => 3,
+    ],
+    '/api/v1/jks-keystores/j1' => [
+        'id' => 'j1', 'name' => 'jks-name', 'container_id' => 'c-1', 'notes' => 'n1', 'tags' => ['t1'],
+        'store_type' => 'managed', 'created_at' => '2026-01-01T00:00:00Z',
+    ],
+    '/api/v1/yubikeys/y1' => [
+        'id' => 'y1', 'name' => 'yk', 'container_id' => null, 'serial_number' => '123', 'public_id' => 'cccccccccccc',
+        'client_id' => '42', 'validation_server' => 'api.yubico.com', 'notes' => '', 'tags' => ['t2'],
+    ],
+    '/api/v1/secret/s1/history' => [['version_num' => 1, 'secret_type' => 'secret']],
+    '/api/v1/totp-tokens' => ['tokens' => [['id' => 't1']], 'total' => 1],
+];
+if ($method === 'GET' && isset($records[$uri])) {
+    echo json_encode($records[$uri]);
+    return;
+}
+if ($method === 'POST' && $uri === '/api/v1/transform/decode') {
+    echo json_encode(['result' => ['sub' => 'x'], 'type' => 'jwt']);
+    return;
+}
 
 if ($method === 'GET' && $uri === '/api/v1/secrets') {
     echo json_encode(['secrets' => [['id' => '1', 'name' => 'db']], 'total' => 1]);
