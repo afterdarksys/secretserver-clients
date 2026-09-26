@@ -19,5 +19,8 @@
   "homepage": "https://secretserver.io",
   "support": {
     "source": "https://github.com/afterdarksys/secretserver-clients"
+  },
+  "scripts": {
+    "test": "tests/run.sh"
   }
 }

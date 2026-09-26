@@ -24,23 +24,46 @@ class SecretServerClient
     private const DEFAULT_URL = 'https://api.secretserver.io';
     private const USER_AGENT  = 'secretserver-php/1.3.0';
 
-    private string $apiKey;
-    private string $apiUrl;
-    private int    $timeout;
-    private bool   $verifySsl;
+    /** Maximum body size for JSON responses. */
+    private const MAX_JSON_BYTES = 4 * 1024 * 1024;
+    /** Maximum body size for raw download responses. */
+    private const MAX_RAW_BYTES = 16 * 1024 * 1024;
+    private const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]'];
+    /** Values accepted by the server for the :type path parameter. */
+    public const SECRET_TYPES = [
+        'secret', 'password', 'ssh_key', 'gpg_key', 'api_token', 'openssl_key', 'ntlm_hash',
+        'certificate', 'computer_credential', 'wifi_credential', 'windows_credential',
+        'social_credential', 'disk_credential', 'service_config_credential', 'root_credential',
+        'ldap_bind_credential', 'integration_credential', 'code_signing_key',
+    ];
+
+    private string  $apiKey;
+    private string  $apiUrl;
+    private int     $timeout;
+    private bool    $allowHttp;
+    private ?string $caFile;
 
     /**
+     * Threats: rejects plaintext transport to non-loopback hosts, credentials
+     * embedded in the base URL, disabled TLS verification, redirects and
+     * oversized responses. It does NOT protect against a compromised CA the
+     * caller chose to trust via $caFile.
+     *
      * @param string|null $apiKey    API key (or set SS_API_KEY env var)
-     * @param string|null $apiUrl    Base URL (or set SS_API_URL env var)
+     * @param string|null $apiUrl    Base URL (or set SS_API_URL env var). Must be https;
+     *                               plain http is accepted only for loopback hosts.
      * @param int         $timeout   Request timeout in seconds
-     * @param bool        $verifySsl Verify TLS certificates
-     * @throws AuthException
+     * @param bool        $verifySsl Kept for signature compatibility; TLS verification
+     *                               cannot be disabled and false throws.
+     * @param string|null $caFile    PEM bundle used to trust a private CA
+     * @throws AuthException|SecretServerException
      */
     public function __construct(
         ?string $apiKey   = null,
         ?string $apiUrl   = null,
         int     $timeout  = 10,
-        bool    $verifySsl = true
+        bool    $verifySsl = true,
+        ?string $caFile   = null
     ) {
         $this->apiKey    = $apiKey ?? (string) getenv('SS_API_KEY');
         $this->apiUrl    = rtrim($apiUrl ?? (string)(getenv('SS_API_URL') ?: self::DEFAULT_URL), '/');
@@ -48,11 +71,78 @@ class SecretServerClient
             $this->apiUrl = substr($this->apiUrl, 0, -7);
         }
         $this->timeout   = $timeout;
-        $this->verifySsl = $verifySsl;
 
         if ($this->apiKey === '') {
             throw new AuthException('No API key provided. Pass $apiKey or set SS_API_KEY env var.');
         }
+        if (!$verifySsl) {
+            throw new SecretServerException('TLS verification cannot be disabled; pass $caFile to trust a private CA');
+        }
+        if ($caFile !== null && !is_file($caFile)) {
+            throw new SecretServerException('CA file does not exist');
+        }
+        $this->caFile = $caFile;
+
+        $parts  = parse_url($this->apiUrl);
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        $host   = strtolower((string) ($parts['host'] ?? ''));
+        if ($parts === false || $host === '' || !in_array($scheme, ['https', 'http'], true)) {
+            throw new SecretServerException('Invalid SecretServer base URL');
+        }
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            throw new SecretServerException('SecretServer base URL must not contain credentials');
+        }
+        if (isset($parts['query']) || isset($parts['fragment'])) {
+            throw new SecretServerException('SecretServer base URL must not contain a query or fragment');
+        }
+        $this->allowHttp = in_array($host, self::LOOPBACK_HOSTS, true);
+        if ($scheme === 'http' && !$this->allowHttp) {
+            throw new SecretServerException('SecretServer base URL must use https (http is allowed only for loopback hosts)');
+        }
+    }
+
+    /**
+     * Percent-encode one caller-supplied path segment.
+     *
+     * @internal Used by CredentialResource
+     * @throws SecretServerException
+     */
+    public static function pathSegment(string|int $segment): string
+    {
+        $segment = (string) $segment;
+        if ($segment === '' || $segment === '.' || $segment === '..') {
+            throw new SecretServerException('Invalid path segment');
+        }
+        return rawurlencode($segment);
+    }
+
+    private static function secretType(string $type): string
+    {
+        if (!in_array($type, self::SECRET_TYPES, true)) {
+            throw new SecretServerException('Unsupported secret type');
+        }
+        return $type;
+    }
+
+    /** @param array<string, mixed> $params */
+    private static function query(array $params): string
+    {
+        $params = array_filter($params, static fn ($v) => $v !== null);
+        $query  = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        return $query === '' ? '' : '?' . $query;
+    }
+
+    /** @return string[] */
+    private static function secretPath(string $path): array
+    {
+        $parts = explode('/', trim($path, '/'));
+        if (count($parts) > 3) {
+            throw new SecretServerException('Secret path must be name, container/key or container/key/version');
+        }
+        if (count($parts) === 3 && (!ctype_digit($parts[2]) || (int) $parts[2] < 1 || (int) $parts[2] > 12)) {
+            throw new SecretServerException('Secret path version must be between 1 and 12');
+        }
+        return $parts;
     }
 
     // -----------------------------------------------------------------------
@@ -60,7 +150,7 @@ class SecretServerClient
     // -----------------------------------------------------------------------
 
     /**
-     * Get a secret value by path: "container/key" or "container/key/2"
+     * Extract the scalar secret value from a secret payload.
      *
      * @throws SecretServerException
      */
@@ -73,11 +163,15 @@ class SecretServerClient
         throw new SecretServerException('Secret response has no supported scalar field');
     }
 
+    /** Bind a named variable to a secret field. Requires the admin:all permission. */
     public function assignVariable(string $name, string $secretType, string $secretId, string $field): array
-    { return $this->put('/variables/' . rawurlencode($name), ['secret_type'=>$secretType, 'secret_id'=>$secretId, 'field'=>$field]); }
-    public function getVariable(string $name): array { return $this->get('/variables/' . rawurlencode($name)); }
+    { return $this->put('/variables/' . self::pathSegment($name), ['secret_type'=>$secretType, 'secret_id'=>$secretId, 'field'=>$field]); }
+    /** Requires the admin:all permission. */
+    public function getVariable(string $name): array { return $this->get('/variables/' . self::pathSegment($name)); }
+    /** Requires the admin:all permission. */
     public function listVariables(): array { return $this->get('/variables')['variables']; }
-    public function deleteVariable(string $name): void { $this->delete('/variables/' . rawurlencode($name)); }
+    /** Requires the admin:all permission. */
+    public function deleteVariable(string $name): void { $this->delete('/variables/' . self::pathSegment($name)); }
     public function render(string $template): string {
         $result = $this->post('/variables/resolve', ['template'=>$template]);
         if (!isset($result['rendered']) || !is_string($result['rendered'])) throw new SecretServerException('Invalid rendered response');
@@ -89,15 +183,14 @@ class SecretServerClient
         return $result['document'];
     }
 
+    /**
+     * Get a secret value by path: "name", "container/key" or "container/key/N" (N = 1..12).
+     *
+     * @throws SecretServerException
+     */
     public function secret(string $path): string
     {
-        $parts = explode('/', trim($path, '/'));
-        if (count($parts) === 1) {
-            $data = $this->get('/secrets/' . rawurlencode($parts[0]));
-            return $this->scalar($data);
-        }
-        $data = $this->get('/s/' . implode('/', array_map('rawurlencode', $parts)));
-        return $this->scalar($data);
+        return $this->scalar($this->getSecret($path));
     }
 
     /**
@@ -107,11 +200,11 @@ class SecretServerClient
      */
     public function getSecret(string $path): array
     {
-        $parts = explode('/', trim($path, '/'));
+        $parts = self::secretPath($path);
         if (count($parts) === 1) {
-            return $this->get('/secrets/' . rawurlencode($parts[0]));
+            return $this->get('/secrets/' . self::pathSegment($parts[0]));
         }
-        return $this->get('/s/' . implode('/', array_map('rawurlencode', $parts)));
+        return $this->get('/s/' . implode('/', array_map([self::class, 'pathSegment'], $parts)));
     }
 
     // -----------------------------------------------------------------------
@@ -139,13 +232,13 @@ class SecretServerClient
     /** @return array<string, mixed> */
     public function updateSecret(string $name, string $value): array
     {
-        return $this->put('/secrets/' . rawurlencode($name), [
+        return $this->put('/secrets/' . self::pathSegment($name), [
             'name' => $name,
             'data' => ['value' => $value],
         ]);
     }
 
-    public function deleteSecret(string $name): void { $this->delete('/secrets/' . rawurlencode($name)); }
+    public function deleteSecret(string $name): void { $this->delete('/secrets/' . self::pathSegment($name)); }
 
     // -----------------------------------------------------------------------
     // Containers
@@ -173,7 +266,7 @@ class SecretServerClient
     public function listCertificates(): array { return $this->getList('/certificates', 'certificates'); }
 
     /** @return array<string, mixed> */
-    public function getCertificate(string $id): array { return $this->get('/certificates/' . $id); }
+    public function getCertificate(string $id): array { return $this->get('/certificates/' . self::pathSegment($id)); }
 
     /**
      * @param string[] $sans
@@ -190,7 +283,7 @@ class SecretServerClient
     }
 
     /** @return array<string, mixed> */
-    public function renewCertificate(string $id): array { return $this->post('/certificates/' . $id . '/renew'); }
+    public function renewCertificate(string $id): array { return $this->post('/certificates/' . self::pathSegment($id) . '/renew'); }
 
     // -----------------------------------------------------------------------
     // Operation-only cryptographic backends
@@ -202,7 +295,7 @@ class SecretServerClient
     /** @return array<int, array<string, mixed>> */
     public function listSigningKeys(string $backend = 'pkcs11'): array
     {
-        return $this->get('/crypto/signing-keys?backend=' . rawurlencode($backend));
+        return $this->get('/crypto/signing-keys?backend=' . self::pathSegment($backend));
     }
 
     /** @return array<string, mixed> */
@@ -224,7 +317,7 @@ class SecretServerClient
     public function listJKSKeystores(): array { return $this->get('/jks-keystores'); }
 
     /** @return array<string, mixed> */
-    public function getJKSKeystore(string $id): array { return $this->get('/jks-keystores/' . rawurlencode($id)); }
+    public function getJKSKeystore(string $id): array { return $this->get('/jks-keystores/' . self::pathSegment($id)); }
 
     /** @param array<string, mixed> $options @return array<string, mixed> */
     public function createJKSKeystore(string $name, string $storeType = 'managed', array $options = []): array
@@ -238,32 +331,32 @@ class SecretServerClient
     /** @param array<string, mixed> $data @return array<string, mixed> */
     public function updateJKSKeystore(string $id, array $data): array
     {
-        return $this->put('/jks-keystores/' . rawurlencode($id), $data);
+        return $this->put('/jks-keystores/' . self::pathSegment($id), $data);
     }
 
-    public function deleteJKSKeystore(string $id): void { $this->delete('/jks-keystores/' . rawurlencode($id)); }
+    public function deleteJKSKeystore(string $id): void { $this->delete('/jks-keystores/' . self::pathSegment($id)); }
 
     /** @return array<string, mixed> */
     public function exportJKSKeystore(string $id): array
     {
-        return $this->get('/jks-keystores/' . rawurlencode($id) . '/export');
+        return $this->get('/jks-keystores/' . self::pathSegment($id) . '/export');
     }
 
     /** @return array<int, array<string, mixed>> */
     public function listJKSEntries(string $id): array
     {
-        return $this->get('/jks-keystores/' . rawurlencode($id) . '/entries');
+        return $this->get('/jks-keystores/' . self::pathSegment($id) . '/entries');
     }
 
     /** @param array<string, mixed> $data @return array<string, mixed> */
     public function createJKSEntry(string $id, array $data): array
     {
-        return $this->post('/jks-keystores/' . rawurlencode($id) . '/entries', $data);
+        return $this->post('/jks-keystores/' . self::pathSegment($id) . '/entries', $data);
     }
 
     public function deleteJKSEntry(string $id, string $alias): void
     {
-        $this->delete('/jks-keystores/' . rawurlencode($id) . '/entries/' . rawurlencode($alias));
+        $this->delete('/jks-keystores/' . self::pathSegment($id) . '/entries/' . self::pathSegment($alias));
     }
 
     // -----------------------------------------------------------------------
@@ -291,7 +384,7 @@ class SecretServerClient
     /** Get redacted metadata; reveal requires export:read. @return array<string, mixed> */
     public function getIntegrationCredential(string $id, bool $reveal = false): array
     {
-        return $this->get('/integrations/' . rawurlencode($id) . ($reveal ? '?reveal=true' : ''));
+        return $this->get('/integrations/' . self::pathSegment($id) . ($reveal ? '?reveal=true' : ''));
     }
 
     // -----------------------------------------------------------------------
@@ -314,7 +407,7 @@ class SecretServerClient
     }
 
     /** @return array<string, mixed> */
-    public function exportSSHKey(string $id): array { return $this->get('/ssh-keys/' . $id . '/export'); }
+    public function exportSSHKey(string $id): array { return $this->get('/ssh-keys/' . self::pathSegment($id) . '/export'); }
 
     // -----------------------------------------------------------------------
     // Passwords
@@ -351,7 +444,7 @@ class SecretServerClient
     }
 
     /** @return array<string, mixed> */
-    public function rotateAPIToken(string $id): array { return $this->post('/api-tokens/' . $id . '/rotate'); }
+    public function rotateAPIToken(string $id): array { return $this->post('/api-tokens/' . self::pathSegment($id) . '/rotate'); }
 
     // -----------------------------------------------------------------------
     // Extended credential type helper
@@ -377,14 +470,14 @@ class SecretServerClient
      */
     public function getHistory(string $secretType, string $secretId): array
     {
-        $data = $this->get('/' . $secretType . '/' . $secretId . '/history');
+        $data = $this->get('/' . self::secretType($secretType) . '/' . self::pathSegment($secretId) . '/history');
         return $data['versions'] ?? [];
     }
 
     /** @return array<string, mixed> */
     public function getVersion(string $secretType, string $secretId, int $version): array
     {
-        return $this->get('/' . $secretType . '/' . $secretId . '/history/' . $version);
+        return $this->get('/' . self::secretType($secretType) . '/' . self::pathSegment($secretId) . '/history/' . self::pathSegment($version));
     }
 
     // -----------------------------------------------------------------------
@@ -405,7 +498,7 @@ class SecretServerClient
         if ($expiresHours !== null) {
             $body['expires_at'] = (new \DateTimeImmutable('+' . $expiresHours . ' hours'))->format(\DateTimeInterface::ATOM);
         }
-        return $this->post('/' . $secretType . '/' . $secretId . '/shares', $body);
+        return $this->post('/' . self::secretType($secretType) . '/' . self::pathSegment($secretId) . '/shares', $body);
     }
 
     /**
@@ -413,7 +506,7 @@ class SecretServerClient
      */
     public function createTempAccess(string $secretType, string $secretId, int $durationSeconds = 900): array
     {
-        return $this->post('/' . $secretType . '/' . $secretId . '/temp-access', [
+        return $this->post('/' . self::secretType($secretType) . '/' . self::pathSegment($secretId) . '/temp-access', [
             'duration_seconds' => $durationSeconds,
         ]);
     }
@@ -448,7 +541,7 @@ class SecretServerClient
     public function listGPGKeys(): array { return $this->getList('/gpg-keys', 'keys'); }
 
     /** @return array<string, mixed> */
-    public function getGPGKey(string $id): array { return $this->get('/gpg-keys/' . $id); }
+    public function getGPGKey(string $id): array { return $this->get('/gpg-keys/' . self::pathSegment($id)); }
 
     /**
      * @param array<string, mixed> $opts 'key_type', 'expires_in_days'
@@ -473,9 +566,9 @@ class SecretServerClient
     }
 
     /** @return array<string, mixed> */
-    public function exportGPGKey(string $id): array { return $this->get('/gpg-keys/' . $id . '/export'); }
+    public function exportGPGKey(string $id): array { return $this->get('/gpg-keys/' . self::pathSegment($id) . '/export'); }
 
-    public function deleteGPGKey(string $id): void { $this->delete('/gpg-keys/' . $id); }
+    public function deleteGPGKey(string $id): void { $this->delete('/gpg-keys/' . self::pathSegment($id)); }
 
     // -----------------------------------------------------------------------
     // OpenSSL Keys
@@ -485,7 +578,7 @@ class SecretServerClient
     public function listOpenSSLKeys(): array { return $this->getList('/openssl-keys', 'openssl_keys', 'keys'); }
 
     /** @return array<string, mixed> */
-    public function getOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . $id); }
+    public function getOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . self::pathSegment($id)); }
 
     /** @return array<string, mixed> */
     public function generateOpenSSLKey(string $name, string $keyType = 'rsa', int $bits = 4096): array
@@ -507,9 +600,9 @@ class SecretServerClient
     }
 
     /** @return array<string, mixed> */
-    public function exportOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . $id . '/export'); }
+    public function exportOpenSSLKey(string $id): array { return $this->get('/openssl-keys/' . self::pathSegment($id) . '/export'); }
 
-    public function deleteOpenSSLKey(string $id): void { $this->delete('/openssl-keys/' . $id); }
+    public function deleteOpenSSLKey(string $id): void { $this->delete('/openssl-keys/' . self::pathSegment($id)); }
 
     // -----------------------------------------------------------------------
     // NTLM Hashes
@@ -519,7 +612,7 @@ class SecretServerClient
     public function listNTLMHashes(): array { return $this->getList('/ntlm', 'ntlm_hashes', 'hashes'); }
 
     /** @return array<string, mixed> */
-    public function getNTLMHash(string $id): array { return $this->get('/ntlm/' . $id); }
+    public function getNTLMHash(string $id): array { return $this->get('/ntlm/' . self::pathSegment($id)); }
 
     /** @return array<string, mixed> */
     public function createNTLMHash(string $name, string $username, string $hash): array
@@ -533,20 +626,20 @@ class SecretServerClient
      */
     public function updateNTLMHash(string $id, array $data): array
     {
-        return $this->put('/ntlm/' . $id, $data);
+        return $this->put('/ntlm/' . self::pathSegment($id), $data);
     }
 
-    public function deleteNTLMHash(string $id): void { $this->delete('/ntlm/' . $id); }
+    public function deleteNTLMHash(string $id): void { $this->delete('/ntlm/' . self::pathSegment($id)); }
 
     // -----------------------------------------------------------------------
     // Certificates (extended operations)
     // -----------------------------------------------------------------------
 
     /** @return array<string, mixed> */
-    public function revokeCertificate(string $id): array { return $this->post('/certificates/' . $id . '/revoke'); }
+    public function revokeCertificate(string $id): array { return $this->post('/certificates/' . self::pathSegment($id) . '/revoke'); }
 
     /** @return array<string, mixed> */
-    public function downloadCertificate(string $id): array { return $this->get('/certificates/' . $id . '/download'); }
+    public function downloadCertificate(string $id): array { return $this->get('/certificates/' . self::pathSegment($id) . '/download'); }
 
     // -----------------------------------------------------------------------
     // Webhooks
@@ -572,11 +665,11 @@ class SecretServerClient
     /** @return array<int, array<string, mixed>> */
     public function getWebhookDeliveries(string $webhookId): array
     {
-        return $this->getList('/webhooks/' . rawurlencode($webhookId) . '/deliveries', 'deliveries');
+        return $this->getList('/webhooks/' . self::pathSegment($webhookId) . '/deliveries', 'deliveries');
     }
 
     /** @return array<string, mixed> */
-    public function testWebhook(string $webhookId): array { return $this->post('/webhooks/' . $webhookId . '/test'); }
+    public function testWebhook(string $webhookId): array { return $this->post('/webhooks/' . self::pathSegment($webhookId) . '/test'); }
 
     // -----------------------------------------------------------------------
     // Export
@@ -619,8 +712,7 @@ class SecretServerClient
      */
     public function getAuditLogs(array $opts = []): array
     {
-        $query = http_build_query($opts);
-        return $this->get('/audit/logs' . ($query ? '?' . $query : ''));
+        return $this->get('/audit/logs' . self::query($opts));
     }
 
     /** @return array<string, mixed> */
@@ -638,7 +730,7 @@ class SecretServerClient
     public function listYubikeys(): array { return $this->get('/yubikeys'); }
 
     /** @return array<string, mixed> */
-    public function getYubikey(string $id): array { return $this->get('/yubikeys/' . $id); }
+    public function getYubikey(string $id): array { return $this->get('/yubikeys/' . self::pathSegment($id)); }
 
     /**
      * @param array<string, mixed> $opts 'serial_number', 'validation_server', 'notes', 'tags'
@@ -656,9 +748,9 @@ class SecretServerClient
 
     /** @param array<string, mixed> $data
      *  @return array<string, mixed> */
-    public function updateYubikey(string $id, array $data): array { return $this->put('/yubikeys/' . $id, $data); }
+    public function updateYubikey(string $id, array $data): array { return $this->put('/yubikeys/' . self::pathSegment($id), $data); }
 
-    public function deleteYubikey(string $id): void { $this->delete('/yubikeys/' . $id); }
+    public function deleteYubikey(string $id): void { $this->delete('/yubikeys/' . self::pathSegment($id)); }
 
     /**
      * Validate a Yubico OTP against the stored YubiKey configuration.
@@ -667,7 +759,7 @@ class SecretServerClient
      */
     public function validateYubikeyOTP(string $id, string $otp): array
     {
-        return $this->post('/yubikeys/' . $id . '/validate', ['otp' => $otp]);
+        return $this->post('/yubikeys/' . self::pathSegment($id) . '/validate', ['otp' => $otp]);
     }
 
     /**
@@ -682,7 +774,7 @@ class SecretServerClient
      *
      * @return array<string, mixed>
      */
-    public function getTOTPToken(string $id): array { return $this->get('/totp-tokens/' . $id); }
+    public function getTOTPToken(string $id): array { return $this->get('/totp-tokens/' . self::pathSegment($id)); }
 
     /**
      * Create a new TOTP token.
@@ -725,13 +817,13 @@ class SecretServerClient
      */
     public function updateTOTPToken(string $id, array $data): array
     {
-        return $this->put('/totp-tokens/' . $id, $data);
+        return $this->put('/totp-tokens/' . self::pathSegment($id), $data);
     }
 
     /**
      * Delete a TOTP token.
      */
-    public function deleteTOTPToken(string $id): void { $this->delete('/totp-tokens/' . $id); }
+    public function deleteTOTPToken(string $id): void { $this->delete('/totp-tokens/' . self::pathSegment($id)); }
 
     /**
      * Generate a TOTP code for the given token.
@@ -742,7 +834,7 @@ class SecretServerClient
      */
     public function generateTOTPCode(string $id): array
     {
-        return $this->post('/totp-tokens/' . $id . '/generate');
+        return $this->post('/totp-tokens/' . self::pathSegment($id) . '/generate');
     }
 
     /**
@@ -765,7 +857,7 @@ class SecretServerClient
      */
     public function exportTOTPToURI(string $id): array
     {
-        return $this->get('/totp-tokens/' . $id . '/export');
+        return $this->get('/totp-tokens/' . self::pathSegment($id) . '/export');
     }
 
     // -----------------------------------------------------------------------
@@ -817,6 +909,38 @@ class SecretServerClient
      */
     public function request(string $method, string $path, ?array $body = null, bool $preserveObjects = false): array
     {
+        $raw = $this->send($method, $path, $body, self::MAX_JSON_BYTES, 'application/json');
+        if ($raw === '') {
+            return [];
+        }
+        try {
+            $data = json_decode($raw, !$preserveObjects, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new SecretServerException('Invalid server response');
+        }
+        if ($preserveObjects && is_object($data)) $data = get_object_vars($data);
+        if (!is_array($data)) {
+            throw new SecretServerException('Invalid server response');
+        }
+        return $data;
+    }
+
+    /**
+     * Perform a request and return the raw response body (up to 16 MiB).
+     *
+     * @throws SecretServerException
+     */
+    private function requestRaw(string $method, string $path): string
+    {
+        return $this->send($method, $path, null, self::MAX_RAW_BYTES, '*/*');
+    }
+
+    /**
+     * @param array<string, mixed>|null $body
+     * @throws SecretServerException
+     */
+    private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept): string
+    {
         $path = '/' . ltrim($path, '/');
         if ($path === '/api/v1') {
             $path = '';
@@ -828,48 +952,61 @@ class SecretServerClient
 
         $headers = [
             'Authorization: Bearer ' . $this->apiKey,
-            'Accept: application/json',
+            'Accept: ' . $accept,
             'Content-Type: application/json',
             'User-Agent: ' . self::USER_AGENT,
         ];
 
+        $protocols = CURLPROTO_HTTPS | ($this->allowHttp ? CURLPROTO_HTTP : 0);
+        $buffer    = '';
+        $tooLarge  = false;
         curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER     => $headers,
-            CURLOPT_TIMEOUT        => $this->timeout,
-            CURLOPT_SSL_VERIFYPEER => $this->verifySsl,
-            CURLOPT_SSL_VERIFYHOST => $this->verifySsl ? 2 : 0,
-            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER      => $headers,
+            CURLOPT_TIMEOUT         => $this->timeout,
+            CURLOPT_CONNECTTIMEOUT  => min($this->timeout, 10),
+            CURLOPT_SSL_VERIFYPEER  => true,
+            CURLOPT_SSL_VERIFYHOST  => 2,
+            CURLOPT_SSLVERSION      => CURL_SSLVERSION_TLSv1_2,
+            CURLOPT_PROTOCOLS       => $protocols,
+            CURLOPT_REDIR_PROTOCOLS => $protocols,
+            CURLOPT_FOLLOWLOCATION  => false,
+            CURLOPT_CUSTOMREQUEST   => $method,
+            CURLOPT_MAXFILESIZE     => $maxBytes,
+            CURLOPT_WRITEFUNCTION   => static function ($handle, string $chunk) use (&$buffer, &$tooLarge, $maxBytes): int {
+                if (strlen($buffer) + strlen($chunk) > $maxBytes) {
+                    $tooLarge = true;
+                    return 0;
+                }
+                $buffer .= $chunk;
+                return strlen($chunk);
+            },
         ]);
+        if ($this->caFile !== null) {
+            curl_setopt($ch, CURLOPT_CAINFO, $this->caFile);
+        }
 
         if ($body !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_THROW_ON_ERROR));
         }
 
-        $raw    = curl_exec($ch);
-        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlErr = curl_error($ch);
+        $ok      = curl_exec($ch);
+        $status  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $errno   = curl_errno($ch);
 
-        if ($curlErr !== '') {
+        if ($tooLarge || $errno === CURLE_FILESIZE_EXCEEDED) {
+            throw new SecretServerException('SecretServer response exceeded size limit', $status);
+        }
+        if ($ok === false || $errno !== 0) {
             throw new SecretServerException('SecretServer connection failed');
         }
 
-        $data = [];
-        if (is_string($raw) && $raw !== '') {
-            try {
-                $data = json_decode($raw, !$preserveObjects, 512, JSON_THROW_ON_ERROR);
-            } catch (\JsonException $e) {
-                throw new SecretServerException('Invalid server response', $status);
-            }
-        }
+        $message = "SecretServer request failed (HTTP $status)";
+        if ($status === 401) throw new AuthException($message, $status);
+        if ($status === 403) throw new PermissionException($message, $status);
+        if ($status === 404) throw new NotFoundException($message, $status);
+        if ($status < 200 || $status >= 300) throw new SecretServerException($message, $status);
 
-        if ($status === 401) throw new AuthException('Unauthorized', $status);
-        if ($status === 403) throw new PermissionException('Forbidden', $status);
-        if ($status === 404) throw new NotFoundException('Not found', $status);
-        if ($status < 200 || $status >= 300)  throw new SecretServerException("HTTP $status", $status);
-
-        if ($preserveObjects && is_object($data)) $data = get_object_vars($data);
-        return $data ?? [];
+        return $buffer;
     }
 }
 
@@ -879,16 +1016,20 @@ class SecretServerClient
 
 class CredentialResource
 {
+    private string $resource;
+
     public function __construct(
         private SecretServerClient $client,
-        private string $resource
-    ) {}
+        string $resource
+    ) {
+        $this->resource = SecretServerClient::pathSegment($resource);
+    }
 
     /** @return array<int, array<string, mixed>> */
     public function list(): array { return $this->client->get('/' . $this->resource); }
 
     /** @return array<string, mixed> */
-    public function get(string $id): array { return $this->client->get('/' . $this->resource . '/' . $id); }
+    public function get(string $id): array { return $this->client->get('/' . $this->resource . '/' . SecretServerClient::pathSegment($id)); }
 
     /** @param array<string, mixed> $data
      *  @return array<string, mixed> */
@@ -896,9 +1037,9 @@ class CredentialResource
 
     /** @param array<string, mixed> $data
      *  @return array<string, mixed> */
-    public function update(string $id, array $data): array { return $this->client->put('/' . $this->resource . '/' . $id, $data); }
+    public function update(string $id, array $data): array { return $this->client->put('/' . $this->resource . '/' . SecretServerClient::pathSegment($id), $data); }
 
-    public function delete(string $id): void { $this->client->delete('/' . $this->resource . '/' . $id); }
+    public function delete(string $id): void { $this->client->delete('/' . $this->resource . '/' . SecretServerClient::pathSegment($id)); }
 }
 
 // -----------------------------------------------------------------------
