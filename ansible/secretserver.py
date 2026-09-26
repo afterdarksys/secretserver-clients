@@ -25,7 +25,9 @@ DOCUMENTATION = r"""
         type: list
         elements: str
       api_url:
-        description: SecretServer API base URL.
+        description: >
+          SecretServer API base URL. Must use https; plain http is accepted only
+          for localhost, 127.0.0.1 or ::1. URLs containing credentials are rejected.
         default: https://api.secretserver.io
         env:
           - name: SS_API_URL
@@ -42,6 +44,16 @@ DOCUMENTATION = r"""
           - section: secretserver
             key: api_key
         type: str
+      ca_path:
+        description: >
+          PEM CA bundle used to verify the server certificate, for deployments
+          behind a private CA. TLS verification cannot be disabled.
+        env:
+          - name: SS_CA_PATH
+        ini:
+          - section: secretserver
+            key: ca_path
+        type: path
       render:
         description: Resolve the term as a %%NAME%% template instead of a secret path.
         type: bool
@@ -86,16 +98,12 @@ from ansible.errors import AnsibleError
 from ansible.plugins.lookup import LookupBase
 from ansible.utils.display import Display
 
-try:
-    # Python 3
-    from urllib.request import Request, urlopen, build_opener, HTTPSHandler, HTTPRedirectHandler, ProxyHandler, getproxies_environment
-    from urllib.error import HTTPError, URLError
-    from urllib.parse import urljoin, quote
-except ImportError:
-    # Python 2 (legacy)
-    from urllib2 import Request, urlopen, HTTPError, URLError
-    from urlparse import urljoin
-    from urllib import quote
+from urllib.request import Request, build_opener, HTTPSHandler, HTTPRedirectHandler, ProxyHandler, getproxies_environment
+from urllib.error import HTTPError
+from urllib.parse import quote, urlsplit
+
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 display = Display()
 
@@ -106,9 +114,8 @@ class LookupModule(LookupBase):
     def run(self, terms, variables=None, **kwargs):
         self.set_options(var_options=variables, direct=kwargs)
 
-        api_url = self.get_option("api_url").rstrip("/")
-        if api_url.endswith("/api/v1"):
-            api_url = api_url[:-7]
+        api_url = validate_api_url(self.get_option("api_url") or "")
+        self._ssl_context = make_ssl_context(self.get_option("ca_path"))
         api_key = self.get_option("api_key")
         timeout = int(self.get_option("timeout"))
         version_override = self.get_option("version")
@@ -143,26 +150,38 @@ class LookupModule(LookupBase):
             "Authorization": "Bearer " + api_key, "Content-Type": "application/json",
             "Accept": "application/json",
         }, method="POST")
+        result = self._send(req, timeout, "SecretServer variable resolution failed")
+        if not isinstance(result, dict) or not isinstance(result.get("rendered"), str):
+            raise AnsibleError("SecretServer returned an invalid rendered response")
+        return result["rendered"]
+
+    def _send(self, req, timeout, failure):
+        """Send a request without following redirects and return parsed JSON.
+
+        Errors carry only the status code: never the key, URL or body.
+        """
         try:
-            opener = build_opener(ProxyHandler(getproxies_environment()), NoRedirect(), HTTPSHandler(context=ssl.create_default_context()))
+            opener = build_opener(ProxyHandler(getproxies_environment()), NoRedirect(), HTTPSHandler(context=self._ssl_context))
             with opener.open(req, timeout=timeout) as resp:
-                raw = resp.read(4 * 1024 * 1024 + 1)
-            if len(raw) > 4 * 1024 * 1024:
-                raise AnsibleError("SecretServer response exceeds size limit")
-            result = json.loads(raw.decode("utf-8"))
-            if not isinstance(result, dict) or not isinstance(result.get("rendered"), str):
-                raise AnsibleError("SecretServer returned an invalid rendered response")
-            return result["rendered"]
+                body = resp.read(MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
             exc.close()
-            raise AnsibleError("SecretServer variable resolution failed (HTTP {})".format(exc.code)) from None
-        except (URLError, ValueError, UnicodeError):
-            raise AnsibleError("SecretServer variable resolution failed") from None
+            raise AnsibleError("{} (HTTP {})".format(failure, exc.code)) from None
+        except OSError:
+            raise AnsibleError("SecretServer connection failed") from None
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise AnsibleError("SecretServer response exceeds size limit")
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise AnsibleError("SecretServer returned invalid JSON") from None
 
     def _fetch_secret(self, api_url, api_key, term, version_override, timeout):
         """Resolve the term to an API path and fetch the secret value."""
 
         parts = term.strip("/").split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise AnsibleError("Invalid SecretServer term: empty, '.' or '..' path segment")
 
         if len(parts) == 1:
             if version_override is not None and int(version_override) != 1:
@@ -189,7 +208,7 @@ class LookupModule(LookupBase):
             try:
                 version = version_override or int(ver_str)
             except ValueError:
-                raise AnsibleError("version must be an integer")
+                raise AnsibleError("version must be an integer") from None
             if not 1 <= version <= 12:
                 raise AnsibleError("version must be between 1 and 12")
             if version == 1:
@@ -215,40 +234,7 @@ class LookupModule(LookupBase):
         }
 
         req = Request(url, headers=headers)
-
-        # Allow self-signed certs in dev environments via SS_INSECURE=1
-        import os
-        ctx = None
-        if os.environ.get("SS_INSECURE") == "1":
-            msg = (
-                "SecretServer lookup: TLS verification is DISABLED (SS_INSECURE=1). "
-                "This must never be used in production."
-            )
-            try:
-                self._display.warning(msg)
-            except Exception:
-                import sys
-                print("WARNING: " + msg, file=sys.stderr)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-        try:
-            opener = build_opener(ProxyHandler(getproxies_environment()), NoRedirect(), HTTPSHandler(context=ctx or ssl.create_default_context()))
-            with opener.open(req, timeout=timeout) as resp:
-                body = resp.read(4 * 1024 * 1024 + 1)
-            if len(body) > 4 * 1024 * 1024:
-                raise AnsibleError("SecretServer response exceeds size limit")
-            data = json.loads(body.decode("utf-8"))
-        except HTTPError as exc:
-            raise AnsibleError("SecretServer API error {}".format(exc.code))
-        except URLError as exc:
-            raise AnsibleError(
-                "SecretServer connection failed"
-            )
-
-        except (ValueError, UnicodeError):
-            raise AnsibleError("SecretServer returned invalid JSON")
+        data = self._send(req, timeout, "SecretServer request failed")
 
         value = extract_value(data)
 
@@ -259,6 +245,40 @@ class LookupModule(LookupBase):
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def validate_api_url(api_url):
+    """Return the normalized base URL, enforcing https except for loopback.
+
+    Error messages never echo the URL because it may carry credentials.
+    """
+    url = api_url.strip().rstrip("/")
+    if url.endswith("/api/v1"):
+        url = url[:-7]
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        parts.port  # noqa: B018 - raises ValueError on an invalid port
+    except ValueError:
+        raise AnsibleError("SecretServer api_url is not a valid URL") from None
+    if "@" in parts.netloc:
+        raise AnsibleError("SecretServer api_url must not contain credentials")
+    if parts.query or parts.fragment or not host:
+        raise AnsibleError("SecretServer api_url must be a plain https base URL")
+    scheme = parts.scheme.lower()
+    if scheme == "https" or (scheme == "http" and host in LOOPBACK_HOSTS):
+        return url
+    raise AnsibleError("SecretServer api_url must use https (plain http is allowed only for localhost)")
+
+
+def make_ssl_context(ca_path=None):
+    """Verifying TLS context; ca_path adds trust for a private CA."""
+    try:
+        ctx = ssl.create_default_context(cafile=ca_path or None)
+    except (OSError, ssl.SSLError):
+        raise AnsibleError("SecretServer ca_path could not be loaded") from None
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
 
 
 def extract_value(response):
