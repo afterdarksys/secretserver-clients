@@ -3,6 +3,8 @@ package secretserver
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 )
 
@@ -88,18 +90,25 @@ type ExtractionResponse struct {
 	FindingsCount int           `json:"findings_count"`
 	Findings      []interface{} `json:"findings"`
 	Status        string        `json:"status"`
+	FileName      string        `json:"file_name,omitempty"`
+	FileSize      int64         `json:"file_size,omitempty"`
+	ScannedAt     string        `json:"scanned_at,omitempty"`
+	ImportStatus  string        `json:"import_status,omitempty"`
+	Message       string        `json:"message,omitempty"`
 }
 
-func (s *ExtractionService) ExtractFromDB(ctx context.Context, fileName string) (*ExtractionResponse, error) {
-	// Note: Multi-part form upload would be better, but implementing as simplified JSON for now
-	path := "/api/v1/extraction/db"
-	req, err := s.client.NewRequest(ctx, "POST", path, map[string]string{"filename": fileName})
-	if err != nil {
-		return nil, err
+// ExtractFromDB uploads a file (multipart field "file") and scans it for
+// secrets. autoImport marks findings as ready for review before import.
+func (s *ExtractionService) ExtractFromDB(ctx context.Context, filename string, r io.Reader, autoImport bool) (*ExtractionResponse, error) {
+	fields := map[string]string{}
+	if autoImport {
+		fields["auto_import"] = "true"
 	}
 	var resp ExtractionResponse
-	_, err = s.client.Do(req, &resp)
-	return &resp, err
+	if err := s.client.uploadFile(ctx, "/api/v1/extraction/db", filename, r, fields, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // LDAPService handles directory integration
@@ -107,37 +116,119 @@ type LDAPService struct {
 	client *Client
 }
 
-func (s *LDAPService) Import(ctx context.Context, ldifData string) (map[string]interface{}, error) {
-	req, err := s.client.NewRequest(ctx, "POST", "/api/v1/ldap/import", map[string]string{"data": ldifData})
-	if err != nil {
-		return nil, err
-	}
-	var resp map[string]interface{}
-	_, err = s.client.Do(req, &resp)
-	return resp, err
+// LDAPImportOptions controls an LDIF import.
+type LDAPImportOptions struct {
+	CreatePasswords bool // create passwords from userPassword attributes
+	DryRun          bool // validate only
 }
 
-func (s *LDAPService) Search(ctx context.Context, connectionID string, query string) (interface{}, error) {
-	path := fmt.Sprintf("/api/v1/ldap/connections/%s/search", url.PathEscape(connectionID))
-	req, err := s.client.NewRequest(ctx, "POST", path, map[string]string{"query": query})
-	if err != nil {
-		return nil, err
-	}
-	var resp interface{}
-	_, err = s.client.Do(req, &resp)
-	return resp, err
+// LDAPImportResult summarizes an LDIF import.
+type LDAPImportResult struct {
+	TotalEntries     int      `json:"total_entries"`
+	ProcessedEntries int      `json:"processed_entries"`
+	CreatedPasswords int      `json:"created_passwords"`
+	SkippedEntries   int      `json:"skipped_entries"`
+	Errors           []string `json:"errors,omitempty"`
+	DryRun           bool     `json:"dry_run"`
 }
 
-func (s *LDAPService) Export(ctx context.Context) (string, error) {
-	req, err := s.client.NewRequest(ctx, "GET", "/api/v1/ldap/export", nil)
-	if err != nil {
-		return "", err
+// Import uploads LDIF data (multipart field "file").
+func (s *LDAPService) Import(ctx context.Context, filename string, r io.Reader, opts *LDAPImportOptions) (*LDAPImportResult, error) {
+	fields := map[string]string{}
+	if opts != nil {
+		if opts.CreatePasswords {
+			fields["create_passwords"] = "true"
+		}
+		if opts.DryRun {
+			fields["dry_run"] = "true"
+		}
 	}
 	var resp struct {
-		Data string `json:"data"`
+		Result *LDAPImportResult `json:"result"`
 	}
-	_, err = s.client.Do(req, &resp)
-	return resp.Data, err
+	if err := s.client.uploadFile(ctx, "/api/v1/ldap/import", filename, r, fields, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Result == nil {
+		return nil, fmt.Errorf("invalid LDAP import response")
+	}
+	return resp.Result, nil
+}
+
+// LDAPSearchRequest searches a stored LDAP connection. Filter and BaseDN are
+// required; SizeLimit 0 uses the server default (100).
+type LDAPSearchRequest struct {
+	Filter     string   `json:"filter"`
+	BaseDN     string   `json:"base_dn"`
+	Attributes []string `json:"attributes,omitempty"`
+	SizeLimit  int      `json:"size_limit,omitempty"`
+}
+
+// LDAPSearchEntry is one search result.
+type LDAPSearchEntry struct {
+	DN         string              `json:"dn"`
+	Attributes map[string][]string `json:"attributes"`
+}
+
+// LDAPSearchResponse is the search result envelope.
+type LDAPSearchResponse struct {
+	Results     []LDAPSearchEntry `json:"results"`
+	ResultCount int               `json:"result_count"`
+	BaseDN      string            `json:"base_dn"`
+	Filter      string            `json:"filter"`
+	SearchedAt  string            `json:"searched_at"`
+}
+
+func (s *LDAPService) Search(ctx context.Context, connectionID string, input *LDAPSearchRequest) (*LDAPSearchResponse, error) {
+	if connectionID == "" {
+		return nil, fmt.Errorf("connection ID is required")
+	}
+	if input == nil || input.Filter == "" || input.BaseDN == "" {
+		return nil, fmt.Errorf("LDAP search requires filter and base_dn")
+	}
+	if input.SizeLimit < 0 {
+		return nil, fmt.Errorf("size_limit must not be negative")
+	}
+	var resp LDAPSearchResponse
+	_, err := s.client.Call(ctx, http.MethodPost, "/ldap/connections/"+url.PathEscape(connectionID)+"/search", input, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// LDAPExportOptions controls an LDIF export. Passwords includes password
+// values (userPassword); BaseDN overrides the server's default base DN.
+type LDAPExportOptions struct {
+	Passwords bool
+	BaseDN    string
+}
+
+// Export streams LDIF text (at most 16 MiB) into w.
+func (s *LDAPService) Export(ctx context.Context, opts *LDAPExportOptions, w io.Writer) error {
+	if w == nil {
+		return fmt.Errorf("export writer is required")
+	}
+	path := "/ldap/export"
+	params := url.Values{}
+	if opts != nil {
+		if opts.Passwords {
+			params.Set("passwords", "true")
+		}
+		if opts.BaseDN != "" {
+			params.Set("base_dn", opts.BaseDN)
+		}
+	}
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	req, err := s.client.NewRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "*/*")
+	_, err = s.client.Do(req, w)
+	return err
 }
 
 // MockService handles mocking framework integration

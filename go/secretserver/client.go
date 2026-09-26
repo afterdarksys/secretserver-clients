@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -263,6 +265,41 @@ func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 	return response, nil
 }
 
+// uploadFile POSTs a multipart/form-data body with r as the "file" part plus
+// the given form fields, decoding the JSON response into v.
+func (c *Client) uploadFile(ctx context.Context, path, filename string, r io.Reader, fields map[string]string, v interface{}) error {
+	if r == nil {
+		return fmt.Errorf("file reader is required")
+	}
+	filename = filepath.Base(filename)
+	if filename == "" || filename == "." || filename == string(filepath.Separator) {
+		return fmt.Errorf("file name is required")
+	}
+	body := new(bytes.Buffer)
+	mw := multipart.NewWriter(body)
+	part, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, r); err != nil {
+		return err
+	}
+	for k, val := range fields {
+		if err := mw.WriteField(k, val); err != nil {
+			return err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, path, body, mw.FormDataContentType())
+	if err != nil {
+		return err
+	}
+	_, err = c.Do(req, v)
+	return err
+}
+
 // Call invokes any REST endpoint. Path may be relative to /api/v1 or include
 // that prefix, providing forward-compatible access before a typed helper exists.
 func (c *Client) Call(ctx context.Context, method, path string, body, output interface{}) (*Response, error) {
@@ -324,22 +361,27 @@ type Secret struct {
 	UpdatedAt   string            `json:"updated_at"`
 }
 
-// Certificate represents a TLS certificate
+// Certificate represents TLS certificate metadata. CertificatePEM is only
+// populated by CertificatesService.GetWithPEM; private keys are never part of
+// this type (use CertificatesService.Download with format "key").
 type Certificate struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	CommonName     string   `json:"common_name"`
-	DNSNames       []string `json:"dns_names,omitempty"`
-	IssuerType     string   `json:"issuer_type"`
-	SerialNumber   string   `json:"serial_number,omitempty"`
-	Status         string   `json:"status"`
-	NotBefore      string   `json:"not_before,omitempty"`
-	NotAfter       string   `json:"not_after,omitempty"`
-	AutoRenew      bool     `json:"auto_renew"`
-	CertificatePEM string   `json:"certificate_pem,omitempty"`
-	ChainPEM       string   `json:"chain_pem,omitempty"`
-	PrivateKeyPEM  string   `json:"private_key_pem,omitempty"`
-	CreatedAt      string   `json:"created_at"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	CommonName      string   `json:"common_name"`
+	DNSNames        []string `json:"dns_names,omitempty"`
+	IssuerType      string   `json:"issuer_type"`
+	IssuerName      string   `json:"issuer_name,omitempty"`
+	SerialNumber    string   `json:"serial_number,omitempty"`
+	Status          string   `json:"status"`
+	NotBefore       string   `json:"not_before,omitempty"`
+	NotAfter        string   `json:"not_after,omitempty"`
+	DaysUntilExpiry int      `json:"days_until_expiry,omitempty"`
+	AutoRenew       bool     `json:"auto_renew"`
+	RenewBefore     int      `json:"renew_before"`
+	Fingerprint     string   `json:"fingerprint,omitempty"`
+	CertificatePEM  string   `json:"certificate_pem,omitempty"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at,omitempty"`
 }
 
 // GPGKey represents a GPG keypair

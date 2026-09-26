@@ -24,6 +24,8 @@ func TestClientMatchesBackendContract(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/proxy/api/v1/secrets":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"secrets":[{"id":"1","name":"prod/db"}],"total":1}`))
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/proxy/api/v1/secrets/prod%2Fdb":
+			_, _ = w.Write([]byte(`{"id":"1","name":"prod/db","data":{"value":"old"}}`))
 		case r.Method == http.MethodPut && r.URL.EscapedPath() == "/proxy/api/v1/secrets/prod%2Fdb":
 			if err := json.NewDecoder(r.Body).Decode(&updateBody); err != nil {
 				t.Fatal(err)
@@ -290,7 +292,7 @@ func TestPathSegmentsAreEscaped(t *testing.T) {
 		got = r.URL.EscapedPath()
 		_, _ = w.Write([]byte(`{}`))
 	})
-	_, _ = c.LDAP.Search(context.Background(), "../x/y?z", "(cn=*)")
+	_, _ = c.LDAP.Search(context.Background(), "../x/y?z", &LDAPSearchRequest{Filter: "(cn=*)", BaseDN: "dc=x"})
 	if want := "/api/v1/ldap/connections/..%2Fx%2Fy%3Fz/search"; got != want {
 		t.Fatalf("path = %q, want %q", got, want)
 	}

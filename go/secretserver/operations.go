@@ -48,7 +48,10 @@ func (s *CryptoService) Backends(ctx context.Context) ([]CryptoBackend, error) {
 }
 
 func (s *CryptoService) SigningKeys(ctx context.Context, backend string) ([]SigningKey, error) {
-	path := "/crypto/signing-keys?" + url.Values{"backend": []string{backend}}.Encode()
+	path := "/crypto/signing-keys"
+	if backend != "" {
+		path += "?" + url.Values{"backend": []string{backend}}.Encode()
+	}
 	var result []SigningKey
 	_, err := s.client.Call(ctx, http.MethodGet, path, nil, &result)
 	return result, err
@@ -163,7 +166,11 @@ func (s *JKSService) CreateEntry(ctx context.Context, id string, input *CreateJK
 	}
 	var result JKSEntry
 	_, err := s.client.Call(ctx, http.MethodPost, "/jks-keystores/"+url.PathEscape(id)+"/entries", input, &result)
-	return &result, err
+	if err != nil {
+		return nil, err
+	}
+	result.KeystoreID = id
+	return &result, nil
 }
 
 func (s *JKSService) DeleteEntry(ctx context.Context, id, alias string) error {
