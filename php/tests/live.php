@@ -13,17 +13,19 @@ function ok(bool $condition, string $what): void
 }
 
 /**
- * Run $fn; an HTTP 500 is tolerated only for a documented server-side defect.
- * The request already passed server binding/validation (a contract mismatch
- * returns HTTP 400), so the client side of the contract is still exercised.
+ * Run only a create call. HTTP 500 is tolerated for a documented server-side
+ * defect: the request already passed server binding/validation (a contract
+ * mismatch returns HTTP 400). The item is reported as NOT VERIFIED and null
+ * is returned so dependent checks are skipped. Any other error fails the run.
  */
-function knownServerDefect(callable $fn, string $what, string $defect): void
+function createOrServerDefect(callable $create, string $what, string $defect): mixed
 {
     try {
-        $fn();
+        return $create();
     } catch (SecretServer\SecretServerException $e) {
         if ($e->getCode() !== 500) throw $e;
-        echo "ok - $what accepted by server validation; KNOWN SERVER DEFECT (HTTP 500): $defect\n";
+        echo "NOT VERIFIED (server HTTP 500): $what; $defect\n";
+        return null;
     }
 }
 
@@ -88,12 +90,13 @@ try {
     ok(($rot['value'] ?? null) === $newValue, 'rotateAPIToken with new value');
 
     // GPG.
-    knownServerDefect(function () use ($c, $sfx, &$cleanup) {
-        $gpg = $c->generateGPGKey("php-gpg-$sfx", "php-$sfx@example.test", 'ED25519');
+    $gpg = createOrServerDefect(fn () => $c->generateGPGKey("php-gpg-$sfx", "php-$sfx@example.test", 'ED25519'),
+        'generateGPGKey/exportGPGKey', 'CreateGPGKey inserts gpg_keys.user_id but 024_add_user_id_to_keys.sql is not in the core migration set');
+    if ($gpg !== null) {
         $cleanup[] = fn () => $c->deleteGPGKey($gpg['id']);
         $export = $c->exportGPGKey($gpg['id'], 'public');
         ok(($export['format'] ?? null) === 'public' && str_contains($export['key'] ?? '', 'PGP PUBLIC KEY') && ($export['fingerprint'] ?? '') !== '', 'generateGPGKey + exportGPGKey(public)');
-    }, 'generateGPGKey', 'CreateGPGKey inserts gpg_keys.user_id but 024_add_user_id_to_keys.sql is not in the core migration set');
+    }
 
     // OpenSSL.
     $ossl = $c->generateOpenSSLKey("php-ossl-$sfx", 'ecdsa', 0, 'P-256');
@@ -101,12 +104,13 @@ try {
     ok(($ossl['algorithm'] ?? null) === 'ecdsa' && str_contains($ossl['public_key'] ?? '', 'PUBLIC KEY'), 'generateOpenSSLKey ecdsa');
 
     // TOTP.
-    knownServerDefect(function () use ($c, $sfx, &$cleanup) {
-        $totp = $c->createTOTPToken("php-totp-$sfx", 'Example', "php-$sfx@example.test", 'JBSWY3DPEHPK3PXP');
+    $totp = createOrServerDefect(fn () => $c->createTOTPToken("php-totp-$sfx", 'Example', "php-$sfx@example.test", 'JBSWY3DPEHPK3PXP'),
+        'createTOTPToken/listTOTPTokens/exportTOTPToURI', 'totp_tokens is created by 027_totp_authenticators.sql, which is not in the core migration set');
+    if ($totp !== null) {
         $cleanup[] = fn () => $c->deleteTOTPToken($totp['id']);
         ok(in_array($totp['id'], array_column($c->listTOTPTokens(), 'id'), true), 'listTOTPTokens unwraps envelope');
         ok(str_starts_with($c->exportTOTPToURI($totp['id'])['uri'] ?? '', 'otpauth://'), 'exportTOTPToURI');
-    }, 'createTOTPToken', 'totp_tokens is created by 027_totp_authenticators.sql, which is not in the core migration set');
+    }
 
     // Export with include flags (the server skips items whose Vault read fails,
     // so assert on types rather than on exact membership).
@@ -117,11 +121,12 @@ try {
     ok(array_diff(array_column($passwordItems, 'type'), ['password']) === [] && in_array("php-pw-$sfx", array_column($passwordItems, 'name'), true), 'exportToJSON(passwords only) returns the created password and nothing else');
 
     // Certificates: local self-signed enroll, raw PEM download, revoke.
-    knownServerDefect(function () use ($c, $sfx, &$cleanup) {
-        $cert = $c->enrollCertificate("php-cert-$sfx", "php-$sfx.example.test", ["www.php-$sfx.example.test"]);
+    $cert = createOrServerDefect(fn () => $c->enrollCertificate("php-cert-$sfx", "php-$sfx.example.test", ["www.php-$sfx.example.test"]),
+        'enrollCertificate/downloadCertificate', 'CreateCertificate binds dns_names with pq.Array into a JSONB column and leaves the UNIQUE secret_name empty');
+    if ($cert !== null) {
         $cleanup[] = fn () => $c->revokeCertificate($cert['id']);
         ok(str_starts_with($c->downloadCertificate($cert['id']), '-----BEGIN CERTIFICATE-----'), 'downloadCertificate returns raw PEM');
-    }, 'enrollCertificate', 'CreateCertificate binds dns_names with pq.Array into a JSONB column and leaves the UNIQUE secret_name empty');
+    }
 
     // Audit export as JSON.
     $audit = $c->exportAuditLogs(['action' => 'secret.update']);
