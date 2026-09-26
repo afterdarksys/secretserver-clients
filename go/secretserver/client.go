@@ -268,9 +268,10 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 }
 
 // Do executes an API request. When v is an io.Writer the raw body (at most
-// 16 MiB) is streamed into it; otherwise the body (at most 4 MiB) is decoded
-// as JSON into v. Oversized or malformed responses return an error that never
-// includes the response body.
+// 16 MiB) is read completely into memory and only then written to v, so an
+// oversized or interrupted download writes nothing; otherwise the body (at
+// most 4 MiB) is decoded as JSON into v. Oversized or malformed responses
+// return an error that never includes the response body.
 func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -297,12 +298,15 @@ func (c *Client) Do(req *http.Request, v interface{}) (*Response, error) {
 		return response, nil
 	}
 	if w, ok := v.(io.Writer); ok {
-		if _, err := io.Copy(w, io.LimitReader(resp.Body, maxDownloadBytes)); err != nil {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
+		if err != nil {
 			return response, err
 		}
-		var probe [1]byte
-		if n, _ := resp.Body.Read(probe[:]); n > 0 {
+		if len(body) > maxDownloadBytes {
 			return response, ErrResponseTooLarge
+		}
+		if _, err := w.Write(body); err != nil {
+			return response, err
 		}
 		return response, nil
 	}

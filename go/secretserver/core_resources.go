@@ -96,7 +96,8 @@ type CertificateDownloadOptions struct {
 	Password string
 }
 
-// Download streams the raw certificate material (at most 16 MiB) into w.
+// Download writes the raw certificate material (at most 16 MiB) to w. The
+// response is buffered and checked first, so nothing is written on error.
 func (s *CertificatesService) Download(ctx context.Context, id string, opts *CertificateDownloadOptions, w io.Writer) error {
 	if w == nil {
 		return fmt.Errorf("download writer is required")

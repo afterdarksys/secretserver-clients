@@ -205,7 +205,8 @@ type LDAPExportOptions struct {
 	BaseDN    string
 }
 
-// Export streams LDIF text (at most 16 MiB) into w.
+// Export writes LDIF text (at most 16 MiB) to w. The response is buffered
+// and checked first, so nothing is written on error.
 func (s *LDAPService) Export(ctx context.Context, opts *LDAPExportOptions, w io.Writer) error {
 	if w == nil {
 		return fmt.Errorf("export writer is required")

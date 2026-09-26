@@ -251,8 +251,8 @@ func TestOversizeDownloadIsRejected(t *testing.T) {
 	if !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatalf("oversize download: got %v", err)
 	}
-	if sink.n > maxDownloadBytes {
-		t.Fatalf("wrote %d bytes past the cap", sink.n)
+	if sink.n != 0 {
+		t.Fatalf("wrote %d bytes of an oversize download", sink.n)
 	}
 }
 
