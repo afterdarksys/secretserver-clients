@@ -2,7 +2,9 @@
 
 import io
 import json
+import os
 import ssl
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -10,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
 from secretserver.client import SecretServerClient, SecretServerError
+from tls_fixture import CertUnavailable, TlsServer, make_cert
 
 KEY = "sk_security_test_key_do_not_leak"
 OPEN = "urllib.request.OpenerDirector.open"
@@ -83,19 +86,6 @@ class TlsPolicyTests(unittest.TestCase):
         self.assertEqual(client._ssl_ctx.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(client._ssl_ctx.check_hostname)
         self.assertGreaterEqual(client._ssl_ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
-
-    def test_ca_file_is_loaded_into_a_verifying_context(self):
-        real = ssl.create_default_context
-        seen = {}
-
-        def spy(*args, **kwargs):
-            seen.update(kwargs)
-            return real()
-
-        with patch("ssl.create_default_context", side_effect=spy):
-            client = SecretServerClient(KEY, "https://example.test", ca_file="/path/ca.pem")
-        self.assertEqual(seen.get("cafile"), "/path/ca.pem")
-        self.assertEqual(client._ssl_ctx.verify_mode, ssl.CERT_REQUIRED)
 
     def test_missing_ca_file_fails_closed(self):
         with self.assertRaises(OSError):
@@ -188,6 +178,60 @@ class PathEncodingTests(unittest.TestCase):
         url = self.url_for(lambda: self.client.get_audit_logs(action="x&limit=999999"))
         self.assertIn("action=x%26limit%3D999999", url)
         self.assertEqual(url.count("limit="), 1)
+
+
+class RealTlsHandshakeTests(unittest.TestCase):
+    """Handshakes against a local HTTPS server with a throwaway self-signed certificate."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        try:
+            self.cert, self.key = make_cert(tmp.name, "private-ca")
+            self.other_cert, self.other_key = make_cert(tmp.name, "system-ca")
+        except CertUnavailable as exc:
+            self.skipTest(str(exc))
+        env = patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_untrusted_certificate_fails_before_any_request(self):
+        with TlsServer(self.cert, self.key, {"secrets": []}) as server:
+            client = SecretServerClient(KEY, server.url, timeout=5)
+            with self.assertRaises(SecretServerError) as ctx:
+                client.list_secrets()
+        self.assertEqual(str(ctx.exception), "SecretServer connection failed")
+        self.assertNotIn(KEY, str(ctx.exception))
+        self.assertEqual(server.requests, [])
+
+    def test_ca_file_trusts_the_private_ca(self):
+        with TlsServer(self.cert, self.key, {"secrets": [{"name": "db"}]}) as server:
+            client = SecretServerClient(KEY, server.url, timeout=5, ca_file=self.cert)
+            self.assertEqual(client.list_secrets(), [{"name": "db"}])
+        self.assertEqual(server.requests, [f"Bearer {KEY}"])
+
+    def test_wrong_ca_file_still_rejects(self):
+        with TlsServer(self.cert, self.key, {"secrets": []}) as server:
+            client = SecretServerClient(KEY, server.url, timeout=5, ca_file=self.other_cert)
+            with self.assertRaises(SecretServerError):
+                client.list_secrets()
+        self.assertEqual(server.requests, [])
+
+    def test_ca_file_is_added_to_the_system_trust_store(self):
+        default = ssl.create_default_context().cert_store_stats()["x509"]
+        client = SecretServerClient(KEY, "https://example.test", ca_file=self.cert)
+        self.assertEqual(client._ssl_ctx.cert_store_stats()["x509"], default + 1)
+        # A server trusted only through the default store (SSL_CERT_FILE) still
+        # verifies. Apple's system LibreSSL ignores SSL_CERT_FILE; there the
+        # store count above is the evidence that the defaults were kept.
+        with patch.dict(os.environ, {"SSL_CERT_FILE": self.other_cert}):
+            if ssl.create_default_context().cert_store_stats()["x509"] != 1:
+                return
+            client = SecretServerClient(KEY, "https://example.test", timeout=5, ca_file=self.cert)
+        with TlsServer(self.other_cert, self.other_key, {"secrets": []}) as server:
+            client.api_url = server.url
+            self.assertEqual(client.list_secrets(), [])
+        self.assertEqual(server.requests, [f"Bearer {KEY}"])
 
 
 class _Redirector(BaseHTTPRequestHandler):

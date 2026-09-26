@@ -47,7 +47,8 @@ DOCUMENTATION = r"""
       ca_path:
         description: >
           PEM CA bundle used to verify the server certificate, for deployments
-          behind a private CA. TLS verification cannot be disabled.
+          behind a private CA. It is added to the system trust store, so public
+          CAs remain trusted. TLS verification cannot be disabled.
         env:
           - name: SS_CA_PATH
         ini:
@@ -272,11 +273,13 @@ def validate_api_url(api_url):
 
 
 def make_ssl_context(ca_path=None):
-    """Verifying TLS context; ca_path adds trust for a private CA."""
-    try:
-        ctx = ssl.create_default_context(cafile=ca_path or None)
-    except (OSError, ssl.SSLError):
-        raise AnsibleError("SecretServer ca_path could not be loaded") from None
+    """Verifying TLS context; ca_path is added to the system trust store."""
+    ctx = ssl.create_default_context()
+    if ca_path:
+        try:
+            ctx.load_verify_locations(cafile=ca_path)
+        except (OSError, ssl.SSLError):
+            raise AnsibleError("SecretServer ca_path could not be loaded") from None
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 

@@ -7,6 +7,8 @@ import io
 import json
 import os
 import ssl
+import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -18,6 +20,8 @@ from ansible.plugins.loader import lookup_loader
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 lookup_loader.add_directory(PLUGIN_DIR)
+sys.path.insert(0, os.path.join(os.path.dirname(PLUGIN_DIR), "python", "tests"))
+from tls_fixture import CertUnavailable, TlsServer, make_cert  # noqa: E402
 
 KEY = "sk_ansible_test_key_do_not_leak"
 OPEN = "urllib.request.OpenerDirector.open"
@@ -112,22 +116,71 @@ class TlsPolicyTests(unittest.TestCase):
         self.assertTrue(seen["ctx"].check_hostname)
         self.assertGreaterEqual(seen["ctx"].minimum_version, ssl.TLSVersion.TLSv1_2)
 
-    def test_ca_path_option_is_used(self):
-        seen = self.capture_context(ca_path="/etc/ss/ca.pem")
-        self.assertEqual(seen["cafile"], "/etc/ss/ca.pem")
-        self.assertEqual(seen["ctx"].verify_mode, ssl.CERT_REQUIRED)
-
-    def test_ca_path_env_is_used(self):
-        with patch.dict(os.environ, {"SS_CA_PATH": "/etc/ss/env-ca.pem"}):
-            seen = self.capture_context()
-        self.assertEqual(seen["cafile"], "/etc/ss/env-ca.pem")
-
     def test_missing_ca_path_fails_closed(self):
         with patch(OPEN) as opener:
             with self.assertRaises(AnsibleError) as ctx:
                 lookup("prod/db", ca_path="/nonexistent/ca.pem")
         opener.assert_not_called()
         self.assertIn("ca_path", str(ctx.exception))
+
+
+class RealTlsHandshakeTests(unittest.TestCase):
+    """Handshakes against a local HTTPS server with a throwaway self-signed certificate."""
+
+    BODY = {"data": {"value": "tls-ok"}}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        try:
+            self.cert, self.key = make_cert(tmp.name, "private-ca")
+            self.other_cert, self.other_key = make_cert(tmp.name, "system-ca")
+        except CertUnavailable as exc:
+            self.skipTest(str(exc))
+        env = patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("SS_CA_PATH", None)
+
+    def test_untrusted_certificate_fails_before_any_request(self):
+        with TlsServer(self.cert, self.key, self.BODY) as server:
+            with self.assertRaises(AnsibleError) as ctx:
+                lookup("prod/db", api_url=server.url, timeout=5)
+        self.assertEqual(str(ctx.exception), "SecretServer connection failed")
+        self.assertNotIn(KEY, str(ctx.exception))
+        self.assertEqual(server.requests, [])
+
+    def test_wrong_ca_path_still_rejects(self):
+        with TlsServer(self.cert, self.key, self.BODY) as server:
+            with self.assertRaises(AnsibleError):
+                lookup("prod/db", api_url=server.url, timeout=5, ca_path=self.other_cert)
+        self.assertEqual(server.requests, [])
+
+    def test_ca_path_option_trusts_the_private_ca(self):
+        with TlsServer(self.cert, self.key, self.BODY) as server:
+            self.assertEqual(lookup("prod/db", api_url=server.url, timeout=5, ca_path=self.cert), ["tls-ok"])
+        self.assertEqual(server.requests, ["Bearer " + KEY])
+
+    def test_ca_path_env_trusts_the_private_ca(self):
+        with TlsServer(self.cert, self.key, self.BODY) as server:
+            with patch.dict(os.environ, {"SS_CA_PATH": self.cert}):
+                self.assertEqual(lookup("prod/db", api_url=server.url, timeout=5), ["tls-ok"])
+        self.assertEqual(server.requests, ["Bearer " + KEY])
+
+    def test_ca_path_is_added_to_the_system_trust_store(self):
+        plugin = lookup_loader.get("secretserver")
+        make_ssl_context = sys.modules[type(plugin).__module__].make_ssl_context
+        default = ssl.create_default_context().cert_store_stats()["x509"]
+        self.assertEqual(make_ssl_context(self.cert).cert_store_stats()["x509"], default + 1)
+        # A server trusted only through the default store (SSL_CERT_FILE) still
+        # verifies. Apple's system LibreSSL ignores SSL_CERT_FILE; there the
+        # store count above is the evidence that the defaults were kept.
+        with patch.dict(os.environ, {"SSL_CERT_FILE": self.other_cert}):
+            if ssl.create_default_context().cert_store_stats()["x509"] != 1:
+                return
+            with TlsServer(self.other_cert, self.other_key, self.BODY) as server:
+                self.assertEqual(lookup("prod/db", api_url=server.url, timeout=5, ca_path=self.cert), ["tls-ok"])
+        self.assertEqual(server.requests, ["Bearer " + KEY])
 
 
 class ResponsePolicyTests(unittest.TestCase):

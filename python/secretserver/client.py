@@ -167,8 +167,10 @@ class SecretServerClient:
         api_key — API key (or set SS_API_KEY env var)
         api_url — Base URL (or set SS_API_URL env var, default https://api.secretserver.io).
                   Must be https; plain http is accepted only for localhost.
-        ca_file — PEM bundle used to trust a private CA. TLS verification
-                  cannot be disabled; ``verify_ssl=False`` raises ValueError.
+        ca_file — PEM bundle used to trust a private CA. It is added to the
+                  system trust store (public CAs remain trusted). TLS
+                  verification cannot be disabled; ``verify_ssl=False`` raises
+                  ValueError.
     """
 
     DEFAULT_URL = "https://api.secretserver.io"
@@ -189,7 +191,9 @@ class SecretServerClient:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self.timeout = timeout
-        self._ssl_ctx = ssl.create_default_context(cafile=ca_file)
+        self._ssl_ctx = ssl.create_default_context()
+        if ca_file:
+            self._ssl_ctx.load_verify_locations(cafile=ca_file)
         self._ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
         if not self.api_key:
