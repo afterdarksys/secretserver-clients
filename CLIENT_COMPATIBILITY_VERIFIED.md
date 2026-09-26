@@ -18,6 +18,12 @@
 | PHP 1.3.0 (`php/`) | `php -l` on all files | `composer test`: 103 checks pass | Pass (`php/tests/live.php`) |
 | Cache service | n/a: design documents only, no code | n/a | n/a |
 
+The harness shows `NOT VERIFIED` instead of `PASS` for a client that passed every
+check it ran but printed `SKIP`/`NOT VERIFIED` lines (checks blocked by the
+server defects below or needing external services). Latest run: mcp and ansible
+PASS; go, python, node and php NOT VERIFIED for the items listed under
+"Not verified live"; exit 0, no failures.
+
 The live flows cover:
 
 - Authentication, and rejection of a wrong key without the key appearing in the error.
@@ -110,7 +116,10 @@ The harness needs `initdb`, `pg_ctl`, `vault`, `go`, `node`, `php`, `python3` an
 
 **Request paths**
 
-- Every path segment is percent-encoded. Empty, `.` and `..` segments are rejected.
+- Every path segment is percent-encoded. Empty, `.` and `..` segments are rejected (Go uses a shared `seg()` helper, like the other clients).
+- Raw downloads (Go) are fully buffered and size-checked before anything is written to the caller's writer; on overflow nothing is written.
+- Go refuses caller HTTP clients whose transport is not an inspectable `*http.Transport` (wrapping RoundTrippers, custom TLS dialers) or that disable verification, and checks `http.DefaultTransport` when no transport is set.
+- Real TLS handshake tests (untrusted self-signed server must fail before any request) exist for Go, Python, Ansible and PHP. Python `ca_file` and Ansible `ca_path` add the CA to the system trust store rather than replacing it.
 
 **Go GUI**
 
