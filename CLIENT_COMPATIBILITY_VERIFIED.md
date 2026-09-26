@@ -1,55 +1,144 @@
 # Client compatibility verification
 
-**Verified:** 2026-08-03
-
-**Backend:** `secretserver.io` commit `e83233c`
-
+**Verified:** 2026-09-26
+**Backend:** `secretserver.io` origin/main `086b727` (clean worktree, built from source)
 **REST contract:** `/api/v1`
+**Method:** static contract audit of every client method against the server's registered gin routes and handler bind structs, plus live runs against a disposable server.
 
 ## Result
 
-The maintained clients now match the overhauled REST backend in the areas where
-they provide typed helpers, and the general SDKs provide a generic authenticated
-request method for the rest of the live REST surface.
+| Client | Build / lint | Unit tests | Live (disposable server) |
+|---|---|---|---|
+| Go SDK (`go/`) | gofmt clean, `go vet` clean, staticcheck v0.8.1 clean | `go test -race` pass | Pass (`go/cmd/platform-smoke`) |
+| Go GUI (`go-gui/`) | gofmt, vet, staticcheck clean | `go test -race` pass (keychain, extractor naming) | Not run: desktop GUI; its API calls go through the Go SDK, which was verified live |
+| MCP bridge (`mcp/`) | gofmt, vet, staticcheck clean | `go test -race` pass | Pass (`TestLive`, resolves an allowlisted variable through the MCP tool layer) |
+| Python 1.3.0 (`python/`) | ruff `E9,F,B` clean | pytest: 41 pass | Pass (`python/tests/live.py`) |
+| Ansible lookup (`ansible/`) | ruff `E9,F,B` clean | pytest: 15 pass | Pass (`ansible/tests/live.yml`) |
+| Node.js 1.3.0 (`node/`) | `tsc --strict` build (lockfile, `npm ci`) | contract and security tests pass | Pass (`node/tests/live.mjs`) |
+| PHP 1.3.0 (`php/`) | `php -l` on all files | `composer test`: 103 checks pass | Pass (`php/tests/live.php`) |
+| Cache service | n/a: design documents only, no code | n/a | n/a |
 
-| Client | Result | Notes |
-|---|---|---|
-| Python 1.3.0 | Pass | Contract tests, generic request, JKS, secure signing |
-| Node.js 1.3.0 | Pass | Strict TypeScript build, generic request, JKS, secure signing |
-| PHP 1.3.0 | Pass | PHP lint, generic request, JKS, secure signing |
-| Go | Pass | Contract tests, typed core/JKS/signing services, generic `Call` |
-| Ansible lookup | Pass | Path access, version access, normalized API base URL |
-| MCP bridge | Pass | Operation-only signing tests; no private-key export |
-| Go GUI | Pass through Go SDK | Fetches secret data before edit; list data remains redacted |
+The live flows cover:
 
-## Contract corrections
+- Authentication, and rejection of a wrong key without the key appearing in the error.
+- Creating and listing secrets, and reading them by name.
+- Path reads (`/s/prod/<name>`, including historical versions) after an update, with the container preserved.
+- Named variables: assign, get, list, render, resolve a document, delete.
+- Passwords (create, generate), API token create and rotate, OpenSSL generate, SSH generate, export and import.
+- Audit query and export, export with include flags, history and temp access.
+- Extraction and LDAP import (dry run) and export.
 
-- List endpoints with backend envelopes (`secrets`, `certificates`, `ssh_keys`,
-  `passwords`, `tokens`, `keys`, `openssl_keys`, `ntlm_hashes`, `webhooks`, and
-  `deliveries`) are unwrapped by convenience methods.
-- Secret updates include the backend-required `name` and `data` fields.
-- Certificate enrollment sends `dns_names`, matching the live handler.
-- Base URLs work with or without a trailing `/api/v1`, including proxy prefixes.
-- Newly added resource IDs and aliases, core secret names, and query values are
-  URL-escaped.
-- Empty successful responses such as HTTP 204 do not cause Go JSON decode errors.
-- JKS raw/managed keystore and entry operations are exposed in all general SDKs.
-- HSM/smart-card signing remains operation-only and requires `keys:sign`; private
-  key material is never returned by the signing APIs or MCP bridge.
+Each run also checks that the API key never appears in the server log.
 
-## Scope
-
-GraphQL and gRPC schemas are not treated as operational client transports because
-the backend documents them as design artifacts. The Ansible plugin intentionally
-supports lookup only, and the MCP bridge intentionally exposes only bounded key
-metadata and signing operations.
-
-## Verification commands
+## How to reproduce
 
 ```bash
-PYTHONPATH=python python3 -m unittest discover -s python/tests -v
-(cd node && npm test)
-php -l php/src/SecretServerClient.php
-(cd go && go test ./...)
-(cd mcp && go test ./...)
+git -C ../secretserver.io worktree add --detach /tmp/ss-main origin/main
+SECRETSERVER_SRC=/tmp/ss-main scripts/live-integration.sh     # prints a per-client PASS/FAIL table
+
+(cd go && go vet ./... && go test -race ./...)
+(cd go-gui && go vet ./... && go test -race ./...)
+(cd mcp && go vet ./... && go test -race ./...)
+(cd node && npm ci && npm test)
+PYTHONPATH=python python3 -m pytest python/tests ansible/tests
+(cd php && composer test)
 ```
+
+The harness needs `initdb`, `pg_ctl`, `vault`, `go`, `node`, `php`, `python3` and `ansible-playbook`. PostgreSQL and Vault listen on loopback. The API binary binds its port on all interfaces, because the server offers no way to set the bind address. Every run uses fresh CSPRNG credentials and deletes all state on exit.
+
+## Contract corrections in this pass
+
+**Secrets**
+
+- `PUT /secrets/:name` is a full replace. Every client's update now reads the secret, merges in the caller's changes, then writes it back. Before this, updates wiped description and tags, and detached the secret from its container, which broke `/s/<container>/<key>` reads.
+- JKS keystore and YubiKey updates got the same read-merge-write treatment.
+- Go SDK: `Get` rejects the ignored `version` parameter, and tags are filtered client-side because the server ignores the tags query. `ContainerID` survives edits in both the SDK and the GUI.
+
+**Passwords and tokens**
+
+- `create_password` sends `value`.
+- `generate_password` sends `name` and the four `use_*` flags, and returns the stored record with the secret in `value`.
+- API token create sends `value` and `environment`. Rotate sends `{value}`.
+
+**Sharing, history and temp access**
+
+- Sharing uses `shared_with_user_id` or `shared_with_group_id` (exactly one). The server has no email field.
+- History is a bare array, not a `versions` envelope. It previously crashed in Python and returned empty in Node and PHP.
+- `:type` is validated against the server's 18 singular type keys. Temp-access duration is bounded to 60 to 86400 seconds.
+
+**Keys, TOTP and certificates**
+
+- GPG generate sends `algorithm`, import sends `armored_key`, and export takes `?format=public|private`.
+- OpenSSL generate and import send `algorithm`, `key_size` and `curve`.
+- The TOTP list is unwrapped from its `tokens` envelope.
+- Certificate download returns raw PEM or PKCS#12 bytes, not JSON.
+- Go SDK:
+  - SSH generate always sends `key_type`, and import requires `private_key`.
+  - SSH export decodes the numeric `bits` field.
+  - Certificate struct fields now match the server, and `GetWithPEM` was added.
+
+**Audit and export**
+
+- Audit export requests `format=json`, because the server defaults to CSV.
+- Audit query parameters are URL-encoded, and empty values are dropped.
+- The export endpoints take `include_*` flags and `tags`. The `items` parameter they used before was ignored, and the server exported the whole tenant.
+
+**Other endpoints**
+
+- Webhook create sends `secret`. The server has no `auth_type` field.
+- Go SDK:
+  - Extraction and LDAP import use multipart uploads.
+  - LDAP search sends `filter` and `base_dn`.
+  - LDAP export streams LDIF.
+  - The signing-keys backend parameter is sent only when it is set.
+- MCP: a reverse-proxy path prefix in `SECRETSERVER_URL` is preserved.
+
+## Security posture (all clients)
+
+**Transport**
+
+- Base URLs must be HTTPS. HTTP is allowed only for loopback hosts. Userinfo, query and fragment are rejected.
+- TLS verification cannot be disabled. The legacy switches now fail closed: Python `verify_ssl=False`, PHP `$verifySsl=false`, the Ansible `SS_INSECURE=1`, and a Go `HTTPClient` with `InsecureSkipVerify`.
+- For a private CA, use Python `ca_file`, PHP `caFile`, Ansible `ca_path`, or Node `NODE_EXTRA_CA_CERTS`. TLS 1.2 is the minimum version.
+- Redirects are never followed.
+
+**Responses and errors**
+
+- Responses are capped at 4 MiB for JSON and 16 MiB for raw downloads.
+- A successful response that is not valid JSON is an error.
+- Errors never contain the API key or the response body.
+
+**Request paths**
+
+- Every path segment is percent-encoded. Empty, `.` and `..` segments are rejected.
+
+**Go GUI**
+
+- The API key is stored in the OS keychain. Any existing plaintext key in preferences is migrated to the keychain and deleted.
+
+**MCP bridge**
+
+- By default the bridge exposes only the signing-key tools, which cannot return secret material.
+- `resolve_secret_template` requires both `SECRETSERVER_ENABLE_SECRET_RESOLUTION=1` and an explicit `SECRETSERVER_RESOLVE_ALLOW` allowlist. Templates that reference unlisted or malformed variables are refused before any request is sent.
+
+**Tooling**
+
+- `scripts/sync.sh` no longer copies the server's SDK and plugin over the clients, which would have reintroduced the `SS_INSECURE` TLS bypass. It now reports drift only.
+
+## Not verified live
+
+These are covered offline only. Each reason was confirmed against the disposable server.
+
+| Area | Reason |
+|---|---|
+| GPG generate/export | Server returns HTTP 500: migration `024_add_user_id_to_keys.sql` is not in the core migration set, so `gpg_keys.user_id` is missing |
+| TOTP create/list/code/export | Server returns HTTP 500: `027_totp_authenticators.sql` is not in the core migration set |
+| Certificate enroll/download | Server returns HTTP 500: `dns_names` is bound with `pq.Array` into a JSON column, and the unique `secret_name` is left empty |
+| JKS keystores and entries | Server returns HTTP 500: the Vault write path falls outside the KV mount |
+| `/export/json` secret contents | Server silently skips secrets whose Vault read fails, because `ListSecrets` does not select `vault_path` |
+| Audit `resource_id`/`user_id` filters | Server returns HTTP 400: gin cannot bind `*uuid.UUID` from a query string |
+| Secret version history contents | Server does not write `secret_version_history` for plain secret updates. Only the list shape was verified |
+| Crypto signing (PKCS#11/eHSM), LDAP search, sharing, webhooks | Need an HSM, an LDAP server, a tenant user or group, or outbound network |
+| GraphQL / gRPC | Documented by the backend as design artifacts, not operational transports |
+
+Server-side observation, not a client issue: `hasExportPermission` in `handlers/ssh.go` always returns true, and the SSH export and certificate download routes are not wrapped in `RequirePermissions(PermExportRead)`.
