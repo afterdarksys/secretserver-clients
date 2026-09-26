@@ -1,0 +1,74 @@
+# Live contract test for the secretserver lookup plugin.
+# Run through scripts/live-integration.sh, which provides a disposable server.
+- name: Exercise the secretserver lookup plugin against a disposable server
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ss_url: "{{ lookup('env', 'SS_LIVE_URL') }}"
+    ss_key: "{{ lookup('env', 'SS_LIVE_KEY') }}"
+    ss_api: "{{ ss_url }}/api/v1"
+  tasks:
+    - name: Create a secret to read back
+      ansible.builtin.uri:
+        url: "{{ ss_api }}/secrets"
+        method: POST
+        headers: {Authorization: "Bearer {{ ss_key }}"}
+        body_format: json
+        body: {name: ansible-live, data: {value: first}, container_id: "{{ lookup('env', 'SS_LIVE_CONTAINER') }}"}
+        status_code: 201
+      register: created
+      no_log: true
+
+    - name: Update it so version history exists
+      ansible.builtin.uri:
+        url: "{{ ss_api }}/secrets/ansible-live"
+        method: PUT
+        headers: {Authorization: "Bearer {{ ss_key }}"}
+        body_format: json
+        body: {name: ansible-live, data: {value: second}, container_id: "{{ lookup('env', 'SS_LIVE_CONTAINER') }}"}
+      no_log: true
+
+    - name: Assign a named variable
+      ansible.builtin.uri:
+        url: "{{ ss_api }}/variables/ANSIBLE_LIVE"
+        method: PUT
+        headers: {Authorization: "Bearer {{ ss_key }}"}
+        body_format: json
+        body: {secret_type: secret, secret_id: "{{ created.json.id }}", field: value}
+      no_log: true
+
+    - name: Lookups by name, path, version and variable template
+      ansible.builtin.assert:
+        that:
+          - lookup('secretserver', 'ansible-live', api_url=ss_url, api_key=ss_key) == 'second'
+          - lookup('secretserver', 'prod/ansible-live', api_url=ss_url, api_key=ss_key) == 'second'
+          - lookup('secretserver', 'prod/ansible-live/2', api_url=ss_url, api_key=ss_key) == 'first'
+          - lookup('secretserver', 'prod/ansible-live', version=2, api_url=ss_url, api_key=ss_key) == 'first'
+          - lookup('secretserver', 'pw=%%ANSIBLE_LIVE%%', api_url=ss_url, api_key=ss_key) == 'pw=second'
+          - lookup('secretserver', '%%ANSIBLE_LIVE%%', render=true, api_url=ss_url, api_key=ss_key) == 'second'
+      no_log: true
+
+    - name: A wrong API key fails closed
+      block:
+        - name: Look up with a wrong key
+          ansible.builtin.set_fact:
+            denied: "{{ lookup('secretserver', 'prod/ansible-live', api_url=ss_url, api_key='sk_wrong_key_for_test') }}"
+        - name: Wrong key must not return a value
+          ansible.builtin.fail:
+            msg: wrong API key was accepted
+      rescue:
+        - name: The failure is an authentication error without the key
+          ansible.builtin.assert:
+            that:
+              - "'401' in ansible_failed_result.msg"
+              - "'sk_wrong_key_for_test' not in ansible_failed_result.msg"
+
+    - name: Remove the variable and secret
+      ansible.builtin.uri:
+        url: "{{ ss_api }}/{{ item }}"
+        method: DELETE
+        headers: {Authorization: "Bearer {{ ss_key }}"}
+        status_code: [200, 204]
+      loop: [variables/ANSIBLE_LIVE, secrets/ansible-live]
+      no_log: true
