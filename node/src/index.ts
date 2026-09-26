@@ -26,7 +26,12 @@ export class NotFoundError extends SecretServerError { constructor(m: string) { 
 export interface ClientConfig {
   /** API key — also reads SS_API_KEY from process.env */
   apiKey?: string;
-  /** Base URL — defaults to https://api.secretserver.io */
+  /**
+   * Base URL — defaults to https://api.secretserver.io. Must be https; plain
+   * http is accepted only for loopback hosts (localhost, 127.0.0.1, ::1).
+   * TLS verification is always on. To trust a private CA, start Node with
+   * NODE_EXTRA_CA_CERTS=/path/to/ca.pem (Node's default TLS minimum is 1.2).
+   */
   apiUrl?: string;
   /** Custom fetch implementation (default: global fetch) */
   fetchFn?: typeof fetch;
@@ -240,6 +245,70 @@ export interface JKSExport {
 }
 
 const DEFAULT_URL = "https://api.secretserver.io";
+const MAX_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_RAW_BYTES = 16 * 1024 * 1024;
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function validateBaseUrl(raw: string): string {
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { throw new SecretServerError("Invalid apiUrl"); }
+  if (parsed.username || parsed.password) throw new SecretServerError("apiUrl must not contain credentials");
+  if (parsed.protocol === "http:" && !LOOPBACK_HOSTS.has(parsed.hostname)) {
+    throw new SecretServerError("apiUrl must use https (plain http is allowed only for loopback hosts)");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new SecretServerError("apiUrl must use https");
+  if (parsed.search || parsed.hash) throw new SecretServerError("apiUrl must not contain a query or fragment");
+  return raw;
+}
+
+/**
+ * Percent-encode one caller-supplied path segment. Empty and dot segments are
+ * rejected because URL normalisation would collapse them into a different route.
+ */
+function seg(value: string | number): string {
+  const s = String(value);
+  if (s === "" || s === "." || s === "..") throw new SecretServerError("Invalid path segment");
+  return encodeURIComponent(s);
+}
+
+async function discardBody(res: Response): Promise<void> {
+  // Best-effort release of the connection; the caller is already failing with a real error.
+  if (res.body && typeof res.body.cancel === "function") await res.body.cancel().catch(() => undefined);
+}
+
+/** Read a response body, failing closed once more than `cap` bytes arrive. */
+async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
+  const tooLarge = () => new SecretServerError("SecretServer response exceeds size limit", res.status);
+  const declared = Number(res.headers?.get?.("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > cap) { await discardBody(res); throw tooLarge(); }
+  const body = res.body;
+  if (body && typeof body.getReader === "function") {
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) { await reader.cancel().catch(() => undefined); throw tooLarge(); }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+    return out;
+  }
+  if (typeof res.arrayBuffer === "function") {
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (buf.byteLength > cap) throw tooLarge();
+    return buf;
+  }
+  const text = await res.text();
+  if (text.length > cap) throw tooLarge();
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength > cap) throw tooLarge();
+  return bytes;
+}
 const USER_AGENT = "secretserver-node/1.3.0";
 
 export class SecretServerClient {
@@ -250,7 +319,7 @@ export class SecretServerClient {
 
   constructor(config: ClientConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.SS_API_KEY ?? "";
-    this.apiUrl = (config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL)
+    this.apiUrl = validateBaseUrl(config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL)
       .replace(/\/$/, "")
       .replace(/\/api\/v1$/, "");
     this.fetchFn = config.fetchFn ?? fetch;
@@ -277,6 +346,22 @@ export class SecretServerClient {
 
   /** Call any REST endpoint using a path relative to `/api/v1`. */
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.send(method, path, body);
+    const text = new TextDecoder().decode(await readCapped(res, MAX_JSON_BYTES));
+    if (text.trim() === "") return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new SecretServerError("SecretServer returned an invalid JSON response", res.status);
+    }
+  }
+
+  /** GET a raw (non-JSON) download, capped at 16 MiB. */
+  private async download(path: string): Promise<Uint8Array> {
+    return readCapped(await this.send("GET", path), MAX_RAW_BYTES);
+  }
+
+  private async send(method: string, path: string, body?: unknown): Promise<Response> {
     const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
     const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
     const res = await this.fetchFn(url, {
@@ -287,19 +372,15 @@ export class SecretServerClient {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
-    const text = await res.text();
-    let data: unknown;
-    try { data = JSON.parse(text); } catch { data = text; }
-
     if (!res.ok) {
+      await discardBody(res);
       const msg = `SecretServer request failed (HTTP ${res.status})`;
       if (res.status === 401) throw new AuthError(msg);
       if (res.status === 403) throw new PermissionError(msg);
       if (res.status === 404) throw new NotFoundError(msg);
       throw new SecretServerError(msg, res.status);
     }
-
-    return data as T;
+    return res;
   }
 
   private get = <T>(path: string) => this.request<T>("GET", path);
@@ -308,8 +389,9 @@ export class SecretServerClient {
   private delete = <T>(path: string) => this.request<T>("DELETE", path);
 
   private async getList<T>(path: string, ...envelopeKeys: string[]): Promise<T[]> {
-    const data = await this.get<T[] | Record<string, unknown>>(path);
+    const data = await this.get<T[] | Record<string, unknown> | null | undefined>(path);
     if (Array.isArray(data)) return data;
+    if (data === null || typeof data !== "object") return [];
     for (const key of envelopeKeys) {
       const value = data[key];
       if (Array.isArray(value)) return value as T[];
@@ -323,11 +405,11 @@ export class SecretServerClient {
 
   /** Get a secret value by path: "container/key" or "container/key/2" */
   async assignVariable(name: string, assignment: VariableAssignment): Promise<Variable> {
-    return this.put<Variable>(`/variables/${encodeURIComponent(name)}`, assignment);
+    return this.put<Variable>(`/variables/${seg(name)}`, assignment);
   }
-  async getVariable(name: string): Promise<Variable> { return this.get<Variable>(`/variables/${encodeURIComponent(name)}`); }
+  async getVariable(name: string): Promise<Variable> { return this.get<Variable>(`/variables/${seg(name)}`); }
   async listVariables(): Promise<Variable[]> { return (await this.get<{variables: Variable[]}>("/variables")).variables; }
-  async deleteVariable(name: string): Promise<void> { await this.delete(`/variables/${encodeURIComponent(name)}`); }
+  async deleteVariable(name: string): Promise<void> { await this.delete(`/variables/${seg(name)}`); }
   async render(template: string): Promise<string> {
     const result = await this.post<{rendered: string}>("/variables/resolve", {template});
     if (typeof result?.rendered !== "string") throw new SecretServerError("Invalid rendered response");
@@ -342,18 +424,18 @@ export class SecretServerClient {
   async secret(path: string): Promise<string> {
     const parts = path.replace(/^\/|\/$/g, "").split("/");
     if (parts.length === 1) {
-      const d = await this.get<{ value?: string; data?: { value?: string } }>(`/secrets/${encodeURIComponent(parts[0])}`);
+      const d = await this.get<{ value?: string; data?: { value?: string } }>(`/secrets/${seg(parts[0])}`);
       return scalar(d);
     }
-    const d = await this.get<{ value?: string; data?: Record<string, unknown> }>(`/s/${parts.map(encodeURIComponent).join("/")}`);
+    const d = await this.get<{ value?: string; data?: Record<string, unknown> }>(`/s/${parts.map(seg).join("/")}`);
     return scalar(d);
   }
 
   /** Get full secret object by path */
-  getSecret(path: string): Promise<Secret> {
+  async getSecret(path: string): Promise<Secret> {
     const parts = path.replace(/^\/|\/$/g, "").split("/");
-    if (parts.length === 1) return this.get(`/secrets/${encodeURIComponent(parts[0])}`);
-    return this.get(`/s/${parts.map(encodeURIComponent).join("/")}`);
+    if (parts.length === 1) return this.get(`/secrets/${seg(parts[0])}`);
+    return this.get(`/s/${parts.map(seg).join("/")}`);
   }
 
   // -----------------------------------------------------------------------
@@ -364,7 +446,7 @@ export class SecretServerClient {
     return this.getList<Secret>("/secrets", "secrets");
   }
 
-  createSecret(name: string, value: string, opts: { description?: string; containerID?: string } = {}): Promise<Secret> {
+  async createSecret(name: string, value: string, opts: { description?: string; containerID?: string } = {}): Promise<Secret> {
     return this.post("/secrets", {
       name,
       data: { value },
@@ -373,19 +455,19 @@ export class SecretServerClient {
     });
   }
 
-  updateSecret(name: string, value: string): Promise<Secret> {
-    return this.put(`/secrets/${encodeURIComponent(name)}`, { name, data: { value } });
+  async updateSecret(name: string, value: string): Promise<Secret> {
+    return this.put(`/secrets/${seg(name)}`, { name, data: { value } });
   }
 
-  deleteSecret(name: string): Promise<void> { return this.delete(`/secrets/${encodeURIComponent(name)}`); }
+  async deleteSecret(name: string): Promise<void> { return this.delete(`/secrets/${seg(name)}`); }
 
   // -----------------------------------------------------------------------
   // Containers
   // -----------------------------------------------------------------------
 
-  listContainers(): Promise<Container[]> { return this.get("/containers"); }
+  async listContainers(): Promise<Container[]> { return this.get("/containers"); }
 
-  createContainer(name: string, slug?: string, description?: string): Promise<Container> {
+  async createContainer(name: string, slug?: string, description?: string): Promise<Container> {
     return this.post("/containers", { name, slug, description });
   }
 
@@ -393,27 +475,27 @@ export class SecretServerClient {
   // Certificates
   // -----------------------------------------------------------------------
 
-  listCertificates(): Promise<Certificate[]> { return this.getList("/certificates", "certificates"); }
-  getCertificate(id: string): Promise<Certificate> { return this.get(`/certificates/${id}`); }
+  async listCertificates(): Promise<Certificate[]> { return this.getList("/certificates", "certificates"); }
+  async getCertificate(id: string): Promise<Certificate> { return this.get(`/certificates/${seg(id)}`); }
 
-  enrollCertificate(name: string, commonName: string, sans: string[] = [], autoRenew = true): Promise<Certificate> {
+  async enrollCertificate(name: string, commonName: string, sans: string[] = [], autoRenew = true): Promise<Certificate> {
     return this.post("/certificates/enroll", { name, common_name: commonName, dns_names: sans, auto_renew: autoRenew });
   }
 
-  renewCertificate(id: string): Promise<Certificate> { return this.post(`/certificates/${id}/renew`); }
-  downloadCertificate(id: string): Promise<{ pem: string }> { return this.get(`/certificates/${id}/download`); }
+  async renewCertificate(id: string): Promise<Certificate> { return this.post(`/certificates/${seg(id)}/renew`); }
+  async downloadCertificate(id: string): Promise<{ pem: string }> { return this.get(`/certificates/${seg(id)}/download`); }
 
   // -----------------------------------------------------------------------
   // Operation-only cryptographic backends
   // -----------------------------------------------------------------------
 
-  listCryptoBackends(): Promise<CryptoBackend[]> { return this.get("/crypto/backends"); }
+  async listCryptoBackends(): Promise<CryptoBackend[]> { return this.get("/crypto/backends"); }
 
-  listSigningKeys(backend = "pkcs11"): Promise<SigningKey[]> {
+  async listSigningKeys(backend = "pkcs11"): Promise<SigningKey[]> {
     return this.get(`/crypto/signing-keys?backend=${encodeURIComponent(backend)}`);
   }
 
-  sign(backend: string, keyId: string, message: string, purpose: string): Promise<SignResult> {
+  async sign(backend: string, keyId: string, message: string, purpose: string): Promise<SignResult> {
     return this.post("/crypto/sign", { backend, key_id: keyId, message, purpose });
   }
 
@@ -421,65 +503,65 @@ export class SecretServerClient {
   // JKS keystores
   // -----------------------------------------------------------------------
 
-  listJKSKeystores(): Promise<JKSKeystore[]> { return this.get("/jks-keystores"); }
-  getJKSKeystore(id: string): Promise<JKSKeystore> { return this.get(`/jks-keystores/${encodeURIComponent(id)}`); }
-  createJKSKeystore(input: CreateJKSKeystoreInput): Promise<JKSKeystore> {
+  async listJKSKeystores(): Promise<JKSKeystore[]> { return this.get("/jks-keystores"); }
+  async getJKSKeystore(id: string): Promise<JKSKeystore> { return this.get(`/jks-keystores/${seg(id)}`); }
+  async createJKSKeystore(input: CreateJKSKeystoreInput): Promise<JKSKeystore> {
     return this.post("/jks-keystores", input);
   }
-  updateJKSKeystore(id: string, input: Partial<CreateJKSKeystoreInput>): Promise<{ message: string }> {
-    return this.put(`/jks-keystores/${encodeURIComponent(id)}`, input);
+  async updateJKSKeystore(id: string, input: Partial<CreateJKSKeystoreInput>): Promise<{ message: string }> {
+    return this.put(`/jks-keystores/${seg(id)}`, input);
   }
-  deleteJKSKeystore(id: string): Promise<void> { return this.delete(`/jks-keystores/${encodeURIComponent(id)}`); }
-  exportJKSKeystore(id: string): Promise<JKSExport> { return this.get(`/jks-keystores/${encodeURIComponent(id)}/export`); }
-  listJKSEntries(id: string): Promise<JKSEntry[]> { return this.get(`/jks-keystores/${encodeURIComponent(id)}/entries`); }
-  createJKSEntry(id: string, input: CreateJKSEntryInput): Promise<JKSEntry> {
-    return this.post(`/jks-keystores/${encodeURIComponent(id)}/entries`, input);
+  async deleteJKSKeystore(id: string): Promise<void> { return this.delete(`/jks-keystores/${seg(id)}`); }
+  async exportJKSKeystore(id: string): Promise<JKSExport> { return this.get(`/jks-keystores/${seg(id)}/export`); }
+  async listJKSEntries(id: string): Promise<JKSEntry[]> { return this.get(`/jks-keystores/${seg(id)}/entries`); }
+  async createJKSEntry(id: string, input: CreateJKSEntryInput): Promise<JKSEntry> {
+    return this.post(`/jks-keystores/${seg(id)}/entries`, input);
   }
-  deleteJKSEntry(id: string, alias: string): Promise<void> {
-    return this.delete(`/jks-keystores/${encodeURIComponent(id)}/entries/${encodeURIComponent(alias)}`);
+  async deleteJKSEntry(id: string, alias: string): Promise<void> {
+    return this.delete(`/jks-keystores/${seg(id)}/entries/${seg(alias)}`);
   }
 
   // Provider credentials are redacted unless reveal=true and the identity has export:read.
-  listIntegrationProviders(): Promise<IntegrationProvider[]> { return this.get("/integration-providers"); }
-  listKeyCatalog(): Promise<KeyCatalogItem[]> { return this.get("/key-catalog"); }
+  async listIntegrationProviders(): Promise<IntegrationProvider[]> { return this.get("/integration-providers"); }
+  async listKeyCatalog(): Promise<KeyCatalogItem[]> { return this.get("/key-catalog"); }
   createIntegrationCredential(input: {
     name: string; provider: string; credentials: Record<string, string>;
     auth_type?: string; endpoint?: string; tags?: string[];
   }): Promise<{ id: string; created_at: string }> { return this.post("/integrations", input); }
-  getIntegrationCredential(id: string, reveal = false): Promise<IntegrationCredential> {
+  async getIntegrationCredential(id: string, reveal = false): Promise<IntegrationCredential> {
     const query = reveal ? "?reveal=true" : "";
-    return this.get(`/integrations/${encodeURIComponent(id)}${query}`);
+    return this.get(`/integrations/${seg(id)}${query}`);
   }
 
   // -----------------------------------------------------------------------
   // SSH Keys
   // -----------------------------------------------------------------------
 
-  listSSHKeys(): Promise<SSHKey[]> { return this.getList("/ssh-keys", "ssh_keys", "keys"); }
+  async listSSHKeys(): Promise<SSHKey[]> { return this.getList("/ssh-keys", "ssh_keys", "keys"); }
 
-  generateSSHKey(name: string, keyType: "rsa" | "ed25519" | "ecdsa" = "ed25519", comment?: string): Promise<SSHKey> {
+  async generateSSHKey(name: string, keyType: "rsa" | "ed25519" | "ecdsa" = "ed25519", comment?: string): Promise<SSHKey> {
     return this.post("/ssh-keys/generate", { name, key_type: keyType, comment });
   }
 
-  importSSHKey(name: string, privateKey: string): Promise<SSHKey> {
+  async importSSHKey(name: string, privateKey: string): Promise<SSHKey> {
     return this.post("/ssh-keys/import", { name, private_key: privateKey });
   }
 
-  exportSSHKey(id: string): Promise<{ public_key: string; private_key: string }> {
-    return this.get(`/ssh-keys/${id}/export`);
+  async exportSSHKey(id: string): Promise<{ public_key: string; private_key: string }> {
+    return this.get(`/ssh-keys/${seg(id)}/export`);
   }
 
   // -----------------------------------------------------------------------
   // Passwords
   // -----------------------------------------------------------------------
 
-  listPasswords(): Promise<Password[]> { return this.getList("/passwords", "passwords"); }
+  async listPasswords(): Promise<Password[]> { return this.getList("/passwords", "passwords"); }
 
-  createPassword(name: string, username: string, password: string, url?: string): Promise<Password> {
+  async createPassword(name: string, username: string, password: string, url?: string): Promise<Password> {
     return this.post("/passwords", { name, username, password, url });
   }
 
-  generatePassword(length = 32, includeSymbols = true): Promise<{ password: string }> {
+  async generatePassword(length = 32, includeSymbols = true): Promise<{ password: string }> {
     return this.post("/passwords/generate", { length, include_symbols: includeSymbols });
   }
 
@@ -487,25 +569,25 @@ export class SecretServerClient {
   // API Tokens
   // -----------------------------------------------------------------------
 
-  listAPITokens(): Promise<unknown[]> { return this.getList("/api-tokens", "tokens"); }
-  createAPIToken(name: string, service: string, token: string): Promise<unknown> {
+  async listAPITokens(): Promise<unknown[]> { return this.getList("/api-tokens", "tokens"); }
+  async createAPIToken(name: string, service: string, token: string): Promise<unknown> {
     return this.post("/api-tokens", { name, service, token });
   }
-  rotateAPIToken(id: string): Promise<unknown> { return this.post(`/api-tokens/${id}/rotate`); }
+  async rotateAPIToken(id: string): Promise<unknown> { return this.post(`/api-tokens/${seg(id)}/rotate`); }
 
   // -----------------------------------------------------------------------
   // GPG Keys
   // -----------------------------------------------------------------------
 
-  listGPGKeys(): Promise<unknown[]> { return this.getList("/gpg-keys", "keys"); }
-  generateGPGKey(name: string, email: string, opts: { keyType?: string; expiresInDays?: number } = {}): Promise<unknown> {
+  async listGPGKeys(): Promise<unknown[]> { return this.getList("/gpg-keys", "keys"); }
+  async generateGPGKey(name: string, email: string, opts: { keyType?: string; expiresInDays?: number } = {}): Promise<unknown> {
     return this.post("/gpg-keys/generate", { name, email, key_type: opts.keyType, expires_in_days: opts.expiresInDays });
   }
-  exportGPGKey(id: string): Promise<{ public_key: string; private_key: string }> {
-    return this.get(`/gpg-keys/${id}/export`);
+  async exportGPGKey(id: string): Promise<{ public_key: string; private_key: string }> {
+    return this.get(`/gpg-keys/${seg(id)}/export`);
   }
 
-  deleteGPGKey(id: string): Promise<void> { return this.delete(`/gpg-keys/${id}`); }
+  async deleteGPGKey(id: string): Promise<void> { return this.delete(`/gpg-keys/${seg(id)}`); }
 
   // -----------------------------------------------------------------------
   // Extended credential types (read + write)
@@ -513,11 +595,11 @@ export class SecretServerClient {
 
   private credAPI(resource: string) {
     return {
-      list: () => this.get<unknown[]>(`/${resource}`),
-      get: (id: string) => this.get<unknown>(`/${resource}/${id}`),
-      create: (data: unknown) => this.post<unknown>(`/${resource}`, data),
-      update: (id: string, data: unknown) => this.put<unknown>(`/${resource}/${id}`, data),
-      delete: (id: string) => this.delete<void>(`/${resource}/${id}`),
+      list: async () => this.get<unknown[]>(`/${resource}`),
+      get: async (id: string) => this.get<unknown>(`/${resource}/${seg(id)}`),
+      create: async (data: unknown) => this.post<unknown>(`/${resource}`, data),
+      update: async (id: string, data: unknown) => this.put<unknown>(`/${resource}/${seg(id)}`, data),
+      delete: async (id: string) => this.delete<void>(`/${resource}/${seg(id)}`),
     };
   }
 
@@ -537,57 +619,57 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
 
   async getHistory(secretType: string, secretId: string): Promise<VersionEntry[]> {
-    const d = await this.get<{ versions?: VersionEntry[] }>(`/${secretType}/${secretId}/history`);
+    const d = await this.get<{ versions?: VersionEntry[] }>(`/${seg(secretType)}/${seg(secretId)}/history`);
     return d.versions ?? [];
   }
 
-  getVersion(secretType: string, secretId: string, version: number): Promise<unknown> {
-    return this.get(`/${secretType}/${secretId}/history/${version}`);
+  async getVersion(secretType: string, secretId: string, version: number): Promise<unknown> {
+    return this.get(`/${seg(secretType)}/${seg(secretId)}/history/${seg(version)}`);
   }
 
-  getHistorySettings(secretType: string, secretId: string): Promise<{ history_enabled: boolean; max_versions: number }> {
-    return this.get(`/${secretType}/${secretId}/history-settings`);
+  async getHistorySettings(secretType: string, secretId: string): Promise<{ history_enabled: boolean; max_versions: number }> {
+    return this.get(`/${seg(secretType)}/${seg(secretId)}/history-settings`);
   }
 
-  updateHistorySettings(secretType: string, secretId: string, enabled: boolean, maxVersions: number): Promise<unknown> {
-    return this.put(`/${secretType}/${secretId}/history-settings`, { history_enabled: enabled, max_versions: maxVersions });
+  async updateHistorySettings(secretType: string, secretId: string, enabled: boolean, maxVersions: number): Promise<unknown> {
+    return this.put(`/${seg(secretType)}/${seg(secretId)}/history-settings`, { history_enabled: enabled, max_versions: maxVersions });
   }
 
   // -----------------------------------------------------------------------
   // Sharing & temp access
   // -----------------------------------------------------------------------
 
-  share(
+  async share(
     secretType: string,
     secretId: string,
     email: string,
     permission: "read" | "manage" = "read",
     expiresAt?: Date,
   ): Promise<ShareResult> {
-    return this.post(`/${secretType}/${secretId}/shares`, {
+    return this.post(`/${seg(secretType)}/${seg(secretId)}/shares`, {
       shared_with_email: email,
       permission,
       expires_at: expiresAt?.toISOString(),
     });
   }
 
-  createTempAccess(secretType: string, secretId: string, durationSeconds = 900): Promise<TempAccessResult> {
-    return this.post(`/${secretType}/${secretId}/temp-access`, { duration_seconds: durationSeconds });
+  async createTempAccess(secretType: string, secretId: string, durationSeconds = 900): Promise<TempAccessResult> {
+    return this.post(`/${seg(secretType)}/${seg(secretId)}/temp-access`, { duration_seconds: durationSeconds });
   }
 
   // -----------------------------------------------------------------------
   // Intelligence & transform
   // -----------------------------------------------------------------------
 
-  checkBreach(value: string): Promise<{ leaked: boolean; exposure_count: number; risk_level: string }> {
+  async checkBreach(value: string): Promise<{ leaked: boolean; exposure_count: number; risk_level: string }> {
     return this.post("/intelligence/check-breach", { password: value });
   }
 
-  encode(data: string, format = "base64"): Promise<{ result: string }> {
+  async encode(data: string, format = "base64"): Promise<{ result: string }> {
     return this.post("/transform/encode", { input: data, target_type: format });
   }
 
-  decode(data: string, format = "base64"): Promise<{ result: string }> {
+  async decode(data: string, format = "base64"): Promise<{ result: string }> {
     return this.post("/transform/decode", { input: data, source_type: format });
   }
 
@@ -595,88 +677,88 @@ export class SecretServerClient {
   // Audit
   // -----------------------------------------------------------------------
 
-  getAuditLogs(opts: { limit?: number; offset?: number; action?: string } = {}): Promise<{ logs: unknown[]; total: number }> {
+  async getAuditLogs(opts: { limit?: number; offset?: number; action?: string } = {}): Promise<{ logs: unknown[]; total: number }> {
     const q = new URLSearchParams(opts as Record<string, string>).toString();
     return this.get(`/audit/logs${q ? `?${q}` : ""}`);
   }
 
-  exportAuditLogs(): Promise<unknown> { return this.get("/audit/logs/export"); }
+  async exportAuditLogs(): Promise<unknown> { return this.get("/audit/logs/export"); }
 
   // -----------------------------------------------------------------------
   // OpenSSL Keys
   // -----------------------------------------------------------------------
 
-  listOpenSSLKeys(): Promise<unknown[]> { return this.getList("/openssl-keys", "openssl_keys", "keys"); }
-  getOpenSSLKey(id: string): Promise<unknown> { return this.get(`/openssl-keys/${id}`); }
+  async listOpenSSLKeys(): Promise<unknown[]> { return this.getList("/openssl-keys", "openssl_keys", "keys"); }
+  async getOpenSSLKey(id: string): Promise<unknown> { return this.get(`/openssl-keys/${seg(id)}`); }
 
-  generateOpenSSLKey(name: string, keyType = "rsa", bits = 4096): Promise<unknown> {
+  async generateOpenSSLKey(name: string, keyType = "rsa", bits = 4096): Promise<unknown> {
     return this.post("/openssl-keys/generate", { name, key_type: keyType, bits });
   }
 
-  importOpenSSLKey(name: string, privateKey: string): Promise<unknown> {
+  async importOpenSSLKey(name: string, privateKey: string): Promise<unknown> {
     return this.post("/openssl-keys/import", { name, private_key: privateKey });
   }
 
-  exportOpenSSLKey(id: string): Promise<{ public_key: string; private_key: string }> {
-    return this.get(`/openssl-keys/${id}/export`);
+  async exportOpenSSLKey(id: string): Promise<{ public_key: string; private_key: string }> {
+    return this.get(`/openssl-keys/${seg(id)}/export`);
   }
 
-  deleteOpenSSLKey(id: string): Promise<void> { return this.delete(`/openssl-keys/${id}`); }
+  async deleteOpenSSLKey(id: string): Promise<void> { return this.delete(`/openssl-keys/${seg(id)}`); }
 
   // -----------------------------------------------------------------------
   // NTLM Hashes
   // -----------------------------------------------------------------------
 
-  listNTLMHashes(): Promise<unknown[]> { return this.getList("/ntlm", "ntlm_hashes", "hashes"); }
-  getNTLMHash(id: string): Promise<unknown> { return this.get(`/ntlm/${id}`); }
+  async listNTLMHashes(): Promise<unknown[]> { return this.getList("/ntlm", "ntlm_hashes", "hashes"); }
+  async getNTLMHash(id: string): Promise<unknown> { return this.get(`/ntlm/${seg(id)}`); }
 
-  createNTLMHash(name: string, username: string, hash: string): Promise<unknown> {
+  async createNTLMHash(name: string, username: string, hash: string): Promise<unknown> {
     return this.post("/ntlm", { name, username, hash });
   }
 
-  updateNTLMHash(id: string, data: unknown): Promise<unknown> {
-    return this.put(`/ntlm/${id}`, data);
+  async updateNTLMHash(id: string, data: unknown): Promise<unknown> {
+    return this.put(`/ntlm/${seg(id)}`, data);
   }
 
-  deleteNTLMHash(id: string): Promise<void> { return this.delete(`/ntlm/${id}`); }
+  async deleteNTLMHash(id: string): Promise<void> { return this.delete(`/ntlm/${seg(id)}`); }
 
   // -----------------------------------------------------------------------
   // Certificates (extended operations)
   // -----------------------------------------------------------------------
 
-  revokeCertificate(id: string): Promise<unknown> { return this.post(`/certificates/${id}/revoke`); }
+  async revokeCertificate(id: string): Promise<unknown> { return this.post(`/certificates/${seg(id)}/revoke`); }
 
   // -----------------------------------------------------------------------
   // Webhooks
   // -----------------------------------------------------------------------
 
-  listWebhooks(): Promise<unknown[]> { return this.getList("/webhooks", "webhooks"); }
+  async listWebhooks(): Promise<unknown[]> { return this.getList("/webhooks", "webhooks"); }
 
-  createWebhook(name: string, url: string, events: string[], authType = "none"): Promise<unknown> {
+  async createWebhook(name: string, url: string, events: string[], authType = "none"): Promise<unknown> {
     return this.post("/webhooks", { name, url, events, auth_type: authType });
   }
 
-  listWebhookDeliveries(webhookId: string): Promise<unknown[]> {
-    return this.getList(`/webhooks/${encodeURIComponent(webhookId)}/deliveries`, "deliveries");
+  async listWebhookDeliveries(webhookId: string): Promise<unknown[]> {
+    return this.getList(`/webhooks/${seg(webhookId)}/deliveries`, "deliveries");
   }
 
-  testWebhook(webhookId: string): Promise<unknown> {
-    return this.post(`/webhooks/${webhookId}/test`);
+  async testWebhook(webhookId: string): Promise<unknown> {
+    return this.post(`/webhooks/${seg(webhookId)}/test`);
   }
 
   // -----------------------------------------------------------------------
   // Export
   // -----------------------------------------------------------------------
 
-  exportToKeychain(items: unknown[]): Promise<unknown> {
+  async exportToKeychain(items: unknown[]): Promise<unknown> {
     return this.post("/export/keychain", { items });
   }
 
-  exportToCredentialManager(items: unknown[]): Promise<unknown> {
+  async exportToCredentialManager(items: unknown[]): Promise<unknown> {
     return this.post("/export/credential-manager", { items });
   }
 
-  exportToJSON(items: unknown[]): Promise<unknown> {
+  async exportToJSON(items: unknown[]): Promise<unknown> {
     return this.post("/export/json", { items });
   }
 
@@ -688,10 +770,10 @@ export class SecretServerClient {
   // YubiKey OTP Credentials
   // -----------------------------------------------------------------------
 
-  listYubikeys(): Promise<YubikeyCredential[]> { return this.get("/yubikeys"); }
-  getYubikey(id: string): Promise<YubikeyCredential> { return this.get(`/yubikeys/${id}`); }
+  async listYubikeys(): Promise<YubikeyCredential[]> { return this.get("/yubikeys"); }
+  async getYubikey(id: string): Promise<YubikeyCredential> { return this.get(`/yubikeys/${seg(id)}`); }
 
-  createYubikey(
+  async createYubikey(
     name: string, publicId: string, clientId: string, apiKey: string,
     opts: { serialNumber?: string; validationServer?: string; notes?: string } = {}
   ): Promise<YubikeyCredential> {
@@ -701,22 +783,22 @@ export class SecretServerClient {
     });
   }
 
-  updateYubikey(id: string, data: Partial<YubikeyCredential & { api_key: string }>): Promise<unknown> {
-    return this.put(`/yubikeys/${id}`, data);
+  async updateYubikey(id: string, data: Partial<YubikeyCredential & { api_key: string }>): Promise<unknown> {
+    return this.put(`/yubikeys/${seg(id)}`, data);
   }
 
-  deleteYubikey(id: string): Promise<void> { return this.delete(`/yubikeys/${id}`); }
+  async deleteYubikey(id: string): Promise<void> { return this.delete(`/yubikeys/${seg(id)}`); }
 
   /** Validate a Yubico OTP against the stored YubiKey configuration */
-  validateYubikeyOTP(id: string, otp: string): Promise<YubikeyValidateResult> {
-    return this.post(`/yubikeys/${id}/validate`, { otp });
+  async validateYubikeyOTP(id: string, otp: string): Promise<YubikeyValidateResult> {
+    return this.post(`/yubikeys/${seg(id)}/validate`, { otp });
   }
 
   /** List all TOTP authenticator tokens */
-  listTOTPTokens(): Promise<TOTPToken[]> { return this.get("/totp-tokens"); }
+  async listTOTPTokens(): Promise<TOTPToken[]> { return this.get("/totp-tokens"); }
 
   /** Get a specific TOTP token by ID */
-  getTOTPToken(id: string): Promise<TOTPToken> { return this.get(`/totp-tokens/${id}`); }
+  async getTOTPToken(id: string): Promise<TOTPToken> { return this.get(`/totp-tokens/${seg(id)}`); }
 
   /**
    * Create a new TOTP token
@@ -727,7 +809,7 @@ export class SecretServerClient {
    * @param secretKey Base32-encoded secret key
    * @param opts Optional parameters (algorithm, digits, period)
    */
-  createTOTPToken(
+  async createTOTPToken(
     name: string,
     issuer: string,
     accountName: string,
@@ -746,20 +828,20 @@ export class SecretServerClient {
   }
 
   /** Update a TOTP token */
-  updateTOTPToken(id: string, data: Partial<Omit<TOTPToken, "id" | "created_at" | "updated_at">>): Promise<TOTPToken> {
-    return this.put(`/totp-tokens/${id}`, data);
+  async updateTOTPToken(id: string, data: Partial<Omit<TOTPToken, "id" | "created_at" | "updated_at">>): Promise<TOTPToken> {
+    return this.put(`/totp-tokens/${seg(id)}`, data);
   }
 
   /** Delete a TOTP token */
-  deleteTOTPToken(id: string): Promise<void> { return this.delete(`/totp-tokens/${id}`); }
+  async deleteTOTPToken(id: string): Promise<void> { return this.delete(`/totp-tokens/${seg(id)}`); }
 
   /**
    * Generate a TOTP code for the given token
    *
    * Returns an object with 'code' and 'expires_in' (seconds remaining)
    */
-  generateTOTPCode(id: string): Promise<TOTPCode> {
-    return this.post(`/totp-tokens/${id}/generate`);
+  async generateTOTPCode(id: string): Promise<TOTPCode> {
+    return this.post(`/totp-tokens/${seg(id)}/generate`);
   }
 
   /**
@@ -768,7 +850,7 @@ export class SecretServerClient {
    * @param uri otpauth://totp/... URI string
    * @returns The created TOTP token
    */
-  importTOTPFromURI(uri: string): Promise<TOTPToken> {
+  async importTOTPFromURI(uri: string): Promise<TOTPToken> {
     return this.post("/totp-tokens/import", { uri });
   }
 
@@ -777,8 +859,8 @@ export class SecretServerClient {
    *
    * Returns an object with 'uri' and 'qr_code' (base64-encoded PNG)
    */
-  exportTOTPToURI(id: string): Promise<TOTPExport> {
-    return this.get(`/totp-tokens/${id}/export`);
+  async exportTOTPToURI(id: string): Promise<TOTPExport> {
+    return this.get(`/totp-tokens/${seg(id)}/export`);
   }
 }
 
