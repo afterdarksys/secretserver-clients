@@ -103,7 +103,7 @@ run() {
 }
 
 run go go go run ./cmd/platform-smoke
-run mcp mcp go test -count=1 -run TestLive ./...
+run mcp mcp go test -count=1 -v -run '^TestLive$' .
 run python python env PYTHONPATH="$ROOT/python" python3 tests/live.py
 run node node sh -c 'npm run --silent build && node tests/live.mjs'
 run php php php tests/live.php
