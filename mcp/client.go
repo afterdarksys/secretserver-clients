@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,7 +16,13 @@ import (
 	"github.com/afterdarksys/secretserver-clients/mcp/internal/securemem"
 )
 
-const maxResponseBytes = 4 << 20
+const (
+	maxResponseBytes = 4 << 20
+	// base64 of the server's 1 MiB signing limit.
+	maxSignMessageChars = 1398104
+	maxTemplateBytes    = 1 << 20
+	maxShortField       = 256
+)
 
 type Client struct {
 	baseURL *url.URL
@@ -47,7 +54,19 @@ func NewClient(rawURL, tokenFile string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{baseURL: baseURL, token: token, http: &http.Client{Timeout: 30 * time.Second}}, nil
+	return &Client{baseURL: baseURL, token: token, http: newHTTPClient()}, nil
+}
+
+// newHTTPClient never follows redirects, so the bearer token cannot be replayed
+// to another scheme or host, and it refuses TLS below 1.2.
+func newHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return &http.Client{
+		Timeout:       30 * time.Second,
+		Transport:     transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func (c *Client) Close() error {
@@ -75,6 +94,15 @@ func (c *Client) Sign(ctx context.Context, backend, keyID, message, purpose stri
 	if backend != "pkcs11" && backend != "ehsm" {
 		return nil, fmt.Errorf("unsupported signing backend %q", backend)
 	}
+	if keyID == "" || len(keyID) > maxShortField {
+		return nil, fmt.Errorf("key_id must be 1-%d characters", maxShortField)
+	}
+	if strings.TrimSpace(purpose) == "" || len(purpose) > maxShortField {
+		return nil, fmt.Errorf("purpose must be 1-%d characters", maxShortField)
+	}
+	if message == "" || len(message) > maxSignMessageChars {
+		return nil, fmt.Errorf("message must be base64 of 1 byte to 1 MiB")
+	}
 	body := map[string]string{"backend": backend, "key_id": keyID, "message": message, "purpose": purpose}
 	var result SignResult
 	if err := c.call(ctx, http.MethodPost, "/api/v1/crypto/sign", body, &result); err != nil {
@@ -93,9 +121,10 @@ func (c *Client) call(ctx context.Context, method, path string, body, output any
 		defer wipe(encoded)
 		reader = bytes.NewReader(encoded)
 	}
-	endpoint := c.baseURL.ResolveReference(&url.URL{Path: path})
+	endpoint := *c.baseURL
+	endpoint.Path = c.baseURL.Path + path
 	if queryAt := strings.IndexByte(path, '?'); queryAt >= 0 {
-		endpoint.Path = path[:queryAt]
+		endpoint.Path = c.baseURL.Path + path[:queryAt]
 		endpoint.RawQuery = path[queryAt+1:]
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), reader)
@@ -145,7 +174,9 @@ func validateBaseURL(raw string) (*url.URL, error) {
 	if u.Scheme != "https" && !(u.Scheme == "http" && local) {
 		return nil, fmt.Errorf("SECRETSERVER_URL must use HTTPS (HTTP is allowed only for loopback)")
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/"
+	// Keep any reverse-proxy prefix; request paths carry /api/v1 themselves.
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/api/v1")
+	u.RawPath = ""
 	return u, nil
 }
 
@@ -191,6 +222,9 @@ func wipe(data []byte) {
 }
 
 func (c *Client) Render(ctx context.Context, template string) (string, error) {
+	if len(template) > maxTemplateBytes {
+		return "", fmt.Errorf("template exceeds 1 MiB")
+	}
 	var out struct {
 		Rendered *string `json:"rendered"`
 	}

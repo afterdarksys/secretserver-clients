@@ -32,9 +32,23 @@ Do not place the API key itself in MCP configuration or environment variables.
 
 ## Optional variable resolution
 
-Set `SECRETSERVER_ENABLE_SECRET_RESOLUTION=1` to register
+Set `SECRETSERVER_ENABLE_SECRET_RESOLUTION=1` together with
+`SECRETSERVER_RESOLVE_ALLOW=NAME[,NAME...]` to register
 `resolve_secret_template` with input `{"template":"%%LOG_SERVER_TX1_S%%"}`.
-This tool intentionally returns resolved plaintext into the calling model's
-context. Its API identity must have read/export permission on the underlying
-credential. The default signing-only configuration does not register this tool.
-Variable syntax and permissions match the REST `/api/v1/variables/resolve` API.
+The bridge refuses to start if resolution is enabled without an allowlist, and
+the tool refuses (without contacting the server) any template that references a
+variable outside the allowlist or is malformed. This bounds what a
+prompt-injected model can pull into its context to the variables the operator
+chose. The tool intentionally returns resolved plaintext into the calling
+model's context. Its API identity must have read/export permission on the
+underlying credential. The default signing-only configuration does not register
+this tool. Variable syntax and permissions match the REST
+`/api/v1/variables/resolve` API.
+
+## Transport safety
+
+The bridge never follows HTTP redirects (so the bearer token cannot be replayed
+to another origin), requires TLS 1.2 or newer, bounds responses to 4 MiB, and
+validates signing inputs (key id and purpose 1-256 characters, message at most
+1 MiB decoded) before any request is sent. A reverse-proxy path prefix in
+`SECRETSERVER_URL` is preserved.

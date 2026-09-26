@@ -17,6 +17,7 @@
       "name": "resolve_secret_template",
       "returns_secret_material": true,
       "enable_env": "SECRETSERVER_ENABLE_SECRET_RESOLUTION=1",
+      "allowlist_env": "SECRETSERVER_RESOLVE_ALLOW",
       "permission": "underlying credential read/export permissions"
     }
   ]
