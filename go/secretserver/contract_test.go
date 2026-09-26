@@ -36,8 +36,8 @@ func TestUpdateReadMergeWritePreservesMetadata(t *testing.T) {
 		t.Fatalf("data not replaced: %#v", put["data"])
 	}
 
-	other := "c-2"
-	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Data: map[string]string{"v": "x"}, ContainerID: &other, Description: "d2", Tags: []string{}}); err != nil {
+	other, d2 := "c-2", "d2"
+	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Data: map[string]string{"v": "x"}, ContainerID: &other, Description: &d2, Tags: []string{}}); err != nil {
 		t.Fatal(err)
 	}
 	if put["container_id"] != "c-2" || put["description"] != "d2" {
@@ -45,6 +45,18 @@ func TestUpdateReadMergeWritePreservesMetadata(t *testing.T) {
 	}
 	if tags, ok := put["tags"].([]interface{}); !ok || len(tags) != 0 {
 		t.Fatalf("explicit empty tags not sent: %#v", put["tags"])
+	}
+
+	empty := ""
+	put = nil
+	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Data: map[string]string{"v": "x"}, Description: &empty}); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := put["description"]; !ok || d != "" {
+		t.Fatalf("explicit empty description not sent: %#v", put)
+	}
+	if put["container_id"] != "c-1" {
+		t.Fatalf("clearing description dropped container: %#v", put)
 	}
 }
 

@@ -233,10 +233,12 @@ func (s *SecretsUI) showEditForm(sec *secretserver.Secret) {
 		}
 
 		// The server replaces the whole record on update; carry the loaded
-		// container and tags so the secret stays in its container.
+		// container and tags so the secret stays in its container. The
+		// description is always sent so clearing the field clears it.
+		desc := descEntry.Text
 		req := &secretserver.SecretUpdateRequest{
 			ContainerID: sec.ContainerID,
-			Description: descEntry.Text,
+			Description: &desc,
 			Data:        dataMap,
 			Tags:        sec.Tags,
 		}

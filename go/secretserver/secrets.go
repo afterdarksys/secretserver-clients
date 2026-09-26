@@ -25,11 +25,12 @@ type SecretCreateRequest struct {
 // The server's PUT is a full replace of data, description, tags and
 // container. SecretsService.Update therefore reads the current secret and
 // keeps its ContainerID, Description and Tags when the caller leaves them
-// nil/empty. Data is required and replaces all existing fields.
+// nil. A non-nil Description replaces the stored one; a pointer to "" clears
+// it. Data is required and replaces all existing fields.
 type SecretUpdateRequest struct {
 	ContainerID *string           `json:"container_id"`
 	Name        string            `json:"name"`
-	Description string            `json:"description"`
+	Description *string           `json:"description"`
 	Data        map[string]string `json:"data"`
 	Tags        []string          `json:"tags"`
 }
@@ -157,9 +158,9 @@ func (s *SecretsService) Create(ctx context.Context, createReq *SecretCreateRequ
 
 // Update replaces a secret's data using read-merge-write: the current
 // secret is fetched first and its ContainerID, Description and Tags are kept
-// unless the request sets them (non-nil ContainerID/Tags, non-empty
-// Description). Pass an empty non-nil Tags slice to clear tags. The request is
-// not modified.
+// unless the request sets them (non-nil ContainerID, Description or Tags).
+// Pass a pointer to "" to clear the description and an empty non-nil Tags
+// slice to clear tags. The request is not modified.
 func (s *SecretsService) Update(ctx context.Context, name string, updateReq *SecretUpdateRequest) (*Secret, error) {
 	if updateReq == nil {
 		return nil, fmt.Errorf("update request is required")
@@ -184,8 +185,8 @@ func (s *SecretsService) Update(ctx context.Context, name string, updateReq *Sec
 	if merged.ContainerID == nil {
 		merged.ContainerID = current.ContainerID
 	}
-	if merged.Description == "" {
-		merged.Description = current.Description
+	if merged.Description == nil {
+		merged.Description = &current.Description
 	}
 	if merged.Tags == nil {
 		merged.Tags = current.Tags
