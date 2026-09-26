@@ -58,9 +58,17 @@ type Client struct {
 // Config holds client configuration.
 //
 // APIURL must use https; plain http is accepted only for loopback hosts
-// (localhost, 127.0.0.1, ::1). To trust a private CA, pass an HTTPClient whose
-// transport sets TLSClientConfig.RootCAs. TLS verification cannot be disabled
-// and redirects are never followed, even with a caller-supplied HTTPClient.
+// (localhost, 127.0.0.1, ::1).
+//
+// HTTPClient is optional. When set, its Transport must be nil (meaning
+// http.DefaultTransport) or an *http.Transport; any other RoundTripper,
+// including wrappers, is refused because its TLS behaviour cannot be
+// inspected. The transport is refused if TLSClientConfig.InsecureSkipVerify
+// is set or if DialTLS/DialTLSContext is set. NewClient clones the transport,
+// so later changes to it (or to http.DefaultTransport) do not affect the
+// client, and raises TLS MinVersion to 1.2. To trust a private CA, pass an
+// *http.Transport whose TLSClientConfig.RootCAs contains it. Redirects are
+// never followed.
 type Config struct {
 	APIURL     string
 	APIKey     string
@@ -88,14 +96,25 @@ func NewClient(cfg *Config) (*Client, error) {
 
 	var httpClient *http.Client
 	if cfg.HTTPClient == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport, err := safeTransport(http.DefaultTransport)
+		if err != nil {
+			return nil, err
+		}
+		// The default client never inherits TLS settings from the shared
+		// transport; only the minimum version is set.
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		httpClient = &http.Client{Timeout: defaultTimeout, Transport: transport}
 	} else {
-		if t, ok := cfg.HTTPClient.Transport.(*http.Transport); ok && t.TLSClientConfig != nil && t.TLSClientConfig.InsecureSkipVerify {
-			return nil, fmt.Errorf("TLS certificate verification cannot be disabled")
+		rt := cfg.HTTPClient.Transport
+		if rt == nil {
+			rt = http.DefaultTransport
+		}
+		transport, err := safeTransport(rt)
+		if err != nil {
+			return nil, err
 		}
 		copied := *cfg.HTTPClient
+		copied.Transport = transport
 		httpClient = &copied
 	}
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -126,6 +145,31 @@ func NewClient(cfg *Config) (*Client, error) {
 	c.JKS = &JKSService{client: c}
 
 	return c, nil
+}
+
+// safeTransport returns a private clone of rt with TLS MinVersion of at least
+// 1.2. It refuses any RoundTripper that is not an *http.Transport (a wrapper
+// could disable verification out of sight), a transport that skips
+// certificate verification, and one with a custom TLS dialer.
+func safeTransport(rt http.RoundTripper) (*http.Transport, error) {
+	t, ok := rt.(*http.Transport)
+	if !ok || t == nil {
+		return nil, fmt.Errorf("unsupported HTTP transport: HTTPClient.Transport must be nil or an *http.Transport")
+	}
+	if t.TLSClientConfig != nil && t.TLSClientConfig.InsecureSkipVerify {
+		return nil, fmt.Errorf("TLS certificate verification cannot be disabled")
+	}
+	//lint:ignore SA1019 the deprecated DialTLS hook still bypasses TLSClientConfig and must be refused
+	if t.DialTLS != nil || t.DialTLSContext != nil {
+		return nil, fmt.Errorf("unsupported HTTP transport: custom TLS dialers are not allowed")
+	}
+	clone := t.Clone()
+	if clone.TLSClientConfig == nil {
+		clone.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else if clone.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		clone.TLSClientConfig.MinVersion = tls.VersionTLS12
+	}
+	return clone, nil
 }
 
 // ValidateAPIURL parses and checks a SecretServer base URL: https is required
