@@ -3,12 +3,12 @@ package ui
 import (
 	"errors"
 	"log"
-	"net/url"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
+	"github.com/afterdarksys/secretserver-go/secretserver"
 )
 
 // SettingsUI manages the configuration view
@@ -17,37 +17,57 @@ type SettingsUI struct {
 	Content fyne.CanvasObject
 }
 
-// NewSettingsUI creates the settings UI
+// NewSettingsUI creates the settings UI. The API key is kept in the OS
+// keychain, never in preferences; the field starts empty and leaving it empty
+// keeps the stored key.
 func NewSettingsUI(app *App) *SettingsUI {
 	s := &SettingsUI{
 		app: app,
 	}
 
 	apiURL := widget.NewEntry()
-	apiURL.SetText(app.FyneApp.Preferences().StringWithFallback("api_url", "https://api.secretserver.io"))
-	
+	apiURL.SetText(app.FyneApp.Preferences().StringWithFallback(prefAPIURL, defaultAPIURL))
+
 	apiKey := widget.NewPasswordEntry()
-	apiKey.SetText(app.FyneApp.Preferences().String("api_key"))
+	apiKey.SetPlaceHolder("Stored in the OS keychain")
 
 	form := &widget.Form{
 		Items: []*widget.FormItem{
-			{Text: "API URL", Widget: apiURL, HintText: "The Secret Server HTTP API Endpoint"},
-			{Text: "API Key", Widget: apiKey, HintText: "Your Secret Server JWT or API token"},
+			{Text: "API URL", Widget: apiURL, HintText: "https:// (http only for localhost)"},
+			{Text: "API Key", Widget: apiKey, HintText: "Your Secret Server API key (leave empty to keep the stored key)"},
 		},
 		OnSubmit: func() {
-			if apiURL.Text == "" || apiKey.Text == "" {
-				dialog.ShowError(errors.New("Please fill in both URL and Key"), app.MainWindow)
+			prefs := app.FyneApp.Preferences()
+			key := apiKey.Text
+			if key == "" && apiURL.Text == prefs.StringWithFallback(prefAPIURL, defaultAPIURL) {
+				stored, err := loadAPIKey(prefs, apiURL.Text)
+				if err != nil {
+					dialog.ShowError(err, app.MainWindow)
+					return
+				}
+				key = stored
+			}
+			if apiURL.Text == "" || key == "" {
+				dialog.ShowError(errors.New("please fill in both URL and key"), app.MainWindow)
 				return
 			}
 
-			if _, err := url.Parse(apiURL.Text); err != nil {
-				dialog.ShowError(errors.New("Invalid API URL format"), app.MainWindow)
+			// Same validation the SDK applies: https unless loopback, no
+			// credentials in the URL.
+			if _, err := secretserver.NewClient(&secretserver.Config{APIURL: apiURL.Text, APIKey: key}); err != nil {
+				dialog.ShowError(err, app.MainWindow)
 				return
 			}
 
-			app.FyneApp.Preferences().SetString("api_url", apiURL.Text)
-			app.FyneApp.Preferences().SetString("api_key", apiKey.Text)
-			app.ReloadClient()
+			if err := saveAPIKey(prefs, apiURL.Text, key); err != nil {
+				dialog.ShowError(err, app.MainWindow)
+				return
+			}
+			apiKey.SetText("")
+			if err := app.ReloadClient(); err != nil {
+				dialog.ShowError(err, app.MainWindow)
+				return
+			}
 
 			log.Println("Settings saved successfully")
 			dialog.ShowInformation("Success", "Settings have been saved and client initialized.", app.MainWindow)

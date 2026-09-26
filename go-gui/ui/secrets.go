@@ -81,7 +81,11 @@ func (s *SecretsUI) Refresh() {
 	if s.app.Client == nil {
 		s.secrets = nil
 		s.list.Refresh()
-		s.details.Objects = []fyne.CanvasObject{widget.NewLabel("Client not configured. Please set API credentials in Settings.")}
+		msg := "Client not configured. Please set API credentials in Settings."
+		if s.app.clientErr != nil {
+			msg = "Client unavailable: " + s.app.clientErr.Error()
+		}
+		s.details.Objects = []fyne.CanvasObject{widget.NewLabel(msg)}
 		s.details.Refresh()
 		return
 	}

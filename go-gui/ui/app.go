@@ -12,6 +12,8 @@ type App struct {
 	MainWindow fyne.Window
 	Client     *secretserver.Client
 	Tabs       *container.AppTabs
+	// clientErr explains why Client is nil (keychain or URL problem).
+	clientErr error
 
 	// UI Components
 	settingsUI  *SettingsUI
@@ -35,32 +37,38 @@ func NewApp(fyneApp fyne.App, window fyne.Window) *App {
 	return app
 }
 
-// initClient initializes the secretserver client based on stored preferences
+// initClient builds the client from the stored URL and the keychain API key.
+// On failure Client is nil and clientErr says why; plaintext is never used.
 func (a *App) initClient() {
-	apiURL := a.FyneApp.Preferences().StringWithFallback("api_url", "https://api.secretserver.io")
-	apiKey := a.FyneApp.Preferences().String("api_key")
-
+	a.Client, a.clientErr = nil, nil
+	prefs := a.FyneApp.Preferences()
+	apiURL := prefs.StringWithFallback(prefAPIURL, defaultAPIURL)
+	apiKey, err := loadAPIKey(prefs, apiURL)
+	if err != nil {
+		a.clientErr = err
+		return
+	}
 	if apiKey == "" {
-		a.Client = nil
 		return
 	}
 
-	cfg := &secretserver.Config{
+	client, err := secretserver.NewClient(&secretserver.Config{
 		APIURL:    apiURL,
 		APIKey:    apiKey,
 		UserAgent: "SecretServer-GUI/1.0",
+	})
+	if err != nil {
+		a.clientErr = err
+		return
 	}
-
-	client, err := secretserver.NewClient(cfg)
-	if err == nil {
-		a.Client = client
-	}
+	a.Client = client
 }
 
 // ReloadClient is called when settings change
-func (a *App) ReloadClient() {
+func (a *App) ReloadClient() error {
 	a.initClient()
 	a.secretsUI.Refresh()
+	return a.clientErr
 }
 
 // BuildUI constructs the main tabbed interface
