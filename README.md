@@ -167,6 +167,12 @@ $ss = new SecretServerClient(getenv('SS_API_KEY'));
 // Get a secret
 $dbPassword = $ss->secret('production/db-password');
 
+// Partial update: a key absent from $opts is kept, a key set to null is cleared.
+// Pass the ETag from getSecret() as $ifMatch; a stale one throws ConflictException
+// whose getETag() is the current ETag.
+$record = $ss->getSecret('db-password');
+$ss->updateSecret('db-password', 'new-value', ['description' => null], $record[SecretServerClient::ETAG_KEY]);
+
 // Enroll a certificate
 $cert = $ss->enrollCertificate('wildcard-prod', '*.example.com', ['example.com'], true);
 

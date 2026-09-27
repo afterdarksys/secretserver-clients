@@ -28,6 +28,11 @@ class SecretServerClient
     private const MAX_JSON_BYTES = 4 * 1024 * 1024;
     /** Maximum body size for raw download responses. */
     private const MAX_RAW_BYTES = 16 * 1024 * 1024;
+    /**
+     * Key under which getSecret/getJKSKeystore/getYubikey and the update methods
+     * return the response ETag (pass it back as $ifMatch).
+     */
+    public const ETAG_KEY = '_etag';
     private const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]'];
     /** Values accepted by the server for the :type path parameter. */
     public const SECRET_TYPES = [
@@ -194,7 +199,8 @@ class SecretServerClient
     }
 
     /**
-     * Get full secret metadata + value.
+     * Get full secret metadata + value. A lookup by name also returns the
+     * ETag under self::ETAG_KEY for use as updateSecret()'s $ifMatch.
      *
      * @return array<string, mixed>
      */
@@ -202,7 +208,7 @@ class SecretServerClient
     {
         $parts = self::secretPath($path);
         if (count($parts) === 1) {
-            return $this->get('/secrets/' . self::pathSegment($parts[0]));
+            return $this->requestWithETag('GET', '/secrets/' . self::pathSegment($parts[0]));
         }
         return $this->get('/s/' . implode('/', array_map([self::class, 'pathSegment'], $parts)));
     }
@@ -230,26 +236,30 @@ class SecretServerClient
     }
 
     /**
-     * Replace a secret's value. The server PUT is a full replace, so the current
-     * description, tags and container_id are read first and preserved unless
-     * overridden in $opts.
+     * Partially update a secret. Only what the caller supplies is sent:
+     * a null $value keeps the stored value; a key absent from $opts keeps
+     * that field; a key present with null clears it (description, tags,
+     * container_id). Needs only secrets:write and does not read the value.
      *
-     * @param array<string, mixed> $opts 'description', 'tags', 'container_id'
+     * $ifMatch is an ETag (from getSecret()/updateSecret() under
+     * self::ETAG_KEY) or a version number; $opts['expected_version'] is also
+     * accepted. On mismatch ConflictException carries the current ETag.
+     * The result includes the new ETag under self::ETAG_KEY.
+     *
+     * @param array<string, mixed> $opts 'description', 'tags', 'container_id', 'expected_version'
      * @return array<string, mixed>
+     * @throws ConflictException|SecretServerException
      */
-    public function updateSecret(string $name, string $value, array $opts = []): array
+    public function updateSecret(string $name, ?string $value = null, array $opts = [], string|int|null $ifMatch = null): array
     {
-        $path    = '/secrets/' . self::pathSegment($name);
-        $current = $this->get($path);
-        $body    = ['name' => $name, 'data' => ['value' => $value]];
-        foreach (['description', 'tags', 'container_id'] as $field) {
-            if (array_key_exists($field, $opts)) {
-                $body[$field] = $opts[$field];
-            } elseif (array_key_exists($field, $current)) {
-                $body[$field] = $current[$field];
-            }
+        $body = self::patchFields($opts, ['description', 'tags', 'container_id', 'expected_version']);
+        if (array_key_exists('expected_version', $body) && !is_int($body['expected_version'])) {
+            throw new SecretServerException('expected_version must be an integer');
         }
-        return $this->put($path, $body);
+        if ($value !== null) {
+            $body['data'] = ['value' => $value];
+        }
+        return $this->requestWithETag('PUT', '/secrets/' . self::pathSegment($name), $body, $ifMatch);
     }
 
     public function deleteSecret(string $name): void { $this->delete('/secrets/' . self::pathSegment($name)); }
@@ -330,8 +340,8 @@ class SecretServerClient
     /** @return array<int, array<string, mixed>> */
     public function listJKSKeystores(): array { return $this->get('/jks-keystores'); }
 
-    /** @return array<string, mixed> */
-    public function getJKSKeystore(string $id): array { return $this->get('/jks-keystores/' . self::pathSegment($id)); }
+    /** Includes the ETag under self::ETAG_KEY. @return array<string, mixed> */
+    public function getJKSKeystore(string $id): array { return $this->requestWithETag('GET', '/jks-keystores/' . self::pathSegment($id)); }
 
     /** @param array<string, mixed> $options @return array<string, mixed> */
     public function createJKSKeystore(string $name, string $storeType = 'managed', array $options = []): array
@@ -343,15 +353,23 @@ class SecretServerClient
     }
 
     /**
-     * Update keystore metadata. The server PUT is a full replace, so the current
-     * container_id, name, notes and tags are read first and $data is overlaid.
+     * Partially update a keystore. A key absent from $data keeps that field; a
+     * key present with null clears it (notes, tags, container_id). 'password'
+     * alone rotates the stored password; 'jks' (raw keystores) requires 'password'.
+     * $ifMatch is an ETag; on mismatch ConflictException carries the current one.
+     * The result includes the new ETag under self::ETAG_KEY.
      *
-     * @param array<string, mixed> $data @return array<string, mixed>
+     * @param array<string, mixed> $data 'name', 'notes', 'tags', 'container_id', 'password', 'jks'
+     * @return array<string, mixed>
+     * @throws ConflictException|SecretServerException
      */
-    public function updateJKSKeystore(string $id, array $data): array
+    public function updateJKSKeystore(string $id, array $data, ?string $ifMatch = null): array
     {
-        $path = '/jks-keystores/' . self::pathSegment($id);
-        return $this->put($path, $this->mergeCurrent($path, ['container_id', 'name', 'notes', 'tags'], $data));
+        $body = self::patchFields($data, ['name', 'notes', 'tags', 'container_id', 'password', 'jks']);
+        if (array_key_exists('jks', $body) && !array_key_exists('password', $body)) {
+            throw new SecretServerException('jks requires password');
+        }
+        return $this->requestWithETag('PUT', '/jks-keystores/' . self::pathSegment($id), $body, $ifMatch);
     }
 
     public function deleteJKSKeystore(string $id): void { $this->delete('/jks-keystores/' . self::pathSegment($id)); }
@@ -894,8 +912,8 @@ class SecretServerClient
     /** @return array<int, array<string, mixed>> */
     public function listYubikeys(): array { return $this->get('/yubikeys'); }
 
-    /** @return array<string, mixed> */
-    public function getYubikey(string $id): array { return $this->get('/yubikeys/' . self::pathSegment($id)); }
+    /** Includes the ETag under self::ETAG_KEY. @return array<string, mixed> */
+    public function getYubikey(string $id): array { return $this->requestWithETag('GET', '/yubikeys/' . self::pathSegment($id)); }
 
     /**
      * @param array<string, mixed> $opts 'serial_number', 'validation_server', 'notes', 'tags'
@@ -912,18 +930,26 @@ class SecretServerClient
     }
 
     /**
-     * Update a YubiKey. The server PUT is a full replace, so current metadata is
-     * read first and $data is overlaid.
+     * Partially update a YubiKey. A key absent from $data keeps that field; a
+     * key present with null clears it (notes, tags, container_id,
+     * serial_number). 'api_key' replaces the stored key; 'public_id' must be
+     * 12 characters. $ifMatch is an ETag; on mismatch ConflictException
+     * carries the current one. The result includes the new ETag under self::ETAG_KEY.
      *
-     * @param array<string, mixed> $data
+     * @param array<string, mixed> $data 'name', 'notes', 'tags', 'container_id', 'serial_number',
+     *                                   'public_id', 'client_id', 'api_key', 'validation_server'
      * @return array<string, mixed>
+     * @throws ConflictException|SecretServerException
      */
-    public function updateYubikey(string $id, array $data): array
+    public function updateYubikey(string $id, array $data, ?string $ifMatch = null): array
     {
-        $path = '/yubikeys/' . self::pathSegment($id);
-        return $this->put($path, $this->mergeCurrent($path, [
-            'container_id', 'name', 'serial_number', 'public_id', 'client_id', 'validation_server', 'notes', 'tags',
-        ], $data));
+        $body = self::patchFields($data, [
+            'name', 'notes', 'tags', 'container_id', 'serial_number', 'public_id', 'client_id', 'api_key', 'validation_server',
+        ]);
+        if (array_key_exists('public_id', $body) && (!is_string($body['public_id']) || strlen($body['public_id']) !== 12)) {
+            throw new SecretServerException('public_id must be exactly 12 characters');
+        }
+        return $this->requestWithETag('PUT', '/yubikeys/' . self::pathSegment($id), $body, $ifMatch);
     }
 
     public function deleteYubikey(string $id): void { $this->delete('/yubikeys/' . self::pathSegment($id)); }
@@ -1062,22 +1088,21 @@ class SecretServerClient
     public function delete(string $path): void { $this->request('DELETE', $path); }
 
     /**
-     * GET $path and return the listed fields of the current record, overlaid with $data.
+     * Build a partial-update body: keys absent from $fields are omitted, keys
+     * present (including with null, which clears) are sent as given.
      *
-     * @param string[] $fields
-     * @param array<string, mixed> $data
+     * @param array<string, mixed> $fields
+     * @param string[] $allowed
      * @return array<string, mixed>
+     * @throws SecretServerException on an unsupported field
      */
-    private function mergeCurrent(string $path, array $fields, array $data): array
+    private static function patchFields(array $fields, array $allowed): array
     {
-        $current = $this->get($path);
-        $body    = [];
-        foreach ($fields as $field) {
-            if (array_key_exists($field, $current)) {
-                $body[$field] = $current[$field];
-            }
+        $unknown = array_diff(array_keys($fields), $allowed);
+        if ($unknown !== []) {
+            throw new SecretServerException('Unsupported update field: ' . implode(', ', $unknown));
         }
-        return array_merge($body, $data);
+        return $fields;
     }
 
     /** @return array<int, mixed> */
@@ -1102,7 +1127,41 @@ class SecretServerClient
      */
     public function request(string $method, string $path, ?array $body = null, bool $preserveObjects = false): array
     {
-        $raw = $this->send($method, $path, $body, self::MAX_JSON_BYTES, 'application/json');
+        return $this->decodeJson($this->send($method, $path, $body, self::MAX_JSON_BYTES, 'application/json'), $preserveObjects);
+    }
+
+    /**
+     * Perform a JSON request and add the response ETag under the ETAG_KEY key
+     * (when the server sent one). $ifMatch is sent as the If-Match header.
+     *
+     * @param array<string, mixed>|null $body
+     * @return array<string, mixed>
+     * @throws SecretServerException|ConflictException
+     */
+    private function requestWithETag(string $method, string $path, ?array $body = null, string|int|null $ifMatch = null): array
+    {
+        $headers = [];
+        if ($ifMatch !== null) {
+            $ifMatch = (string) $ifMatch;
+            if ($ifMatch === '' || strlen($ifMatch) > 1024 || preg_match('/[^\x20-\x7e]/', $ifMatch)) {
+                throw new SecretServerException('Invalid If-Match value');
+            }
+            $headers[] = 'If-Match: ' . $ifMatch;
+        }
+        $etag = null;
+        $data = $this->decodeJson($this->send($method, $path, $body, self::MAX_JSON_BYTES, 'application/json', $headers, $etag), false);
+        if ($etag !== null) {
+            $data[self::ETAG_KEY] = $etag;
+        }
+        return $data;
+    }
+
+    /**
+     * @return array<string, mixed>
+     * @throws SecretServerException
+     */
+    private function decodeJson(string $raw, bool $preserveObjects): array
+    {
         if ($raw === '') {
             return [];
         }
@@ -1132,7 +1191,7 @@ class SecretServerClient
      * @param array<string, mixed>|null $body
      * @throws SecretServerException
      */
-    private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept): string
+    private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept, array $extraHeaders = [], ?string &$etag = null): string
     {
         $path = '/' . ltrim($path, '/');
         if ($path === '/api/v1') {
@@ -1148,6 +1207,7 @@ class SecretServerClient
             'Accept: ' . $accept,
             'Content-Type: application/json',
             'User-Agent: ' . self::USER_AGENT,
+            ...$extraHeaders,
         ];
 
         $protocols = CURLPROTO_HTTPS | ($this->allowHttp ? CURLPROTO_HTTP : 0);
@@ -1173,13 +1233,21 @@ class SecretServerClient
                 $buffer .= $chunk;
                 return strlen($chunk);
             },
+            CURLOPT_HEADERFUNCTION  => static function ($handle, string $line) use (&$etag): int {
+                if (str_starts_with($line, 'HTTP/')) {
+                    $etag = null;
+                } elseif (stripos($line, 'etag:') === 0) {
+                    $etag = trim(substr($line, 5));
+                }
+                return strlen($line);
+            },
         ]);
         if ($this->caFile !== null) {
             curl_setopt($ch, CURLOPT_CAINFO, $this->caFile);
         }
 
         if ($body !== null) {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_THROW_ON_ERROR));
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $body === [] ? '{}' : json_encode($body, JSON_THROW_ON_ERROR));
         }
 
         $ok      = curl_exec($ch);
@@ -1197,6 +1265,7 @@ class SecretServerClient
         if ($status === 401) throw new AuthException($message, $status);
         if ($status === 403) throw new PermissionException($message, $status);
         if ($status === 404) throw new NotFoundException($message, $status);
+        if ($status === 409) throw new ConflictException($message, $status, $etag);
         if ($status < 200 || $status >= 300) throw new SecretServerException($message, $status);
 
         return $buffer;
@@ -1250,3 +1319,21 @@ class SecretServerException extends \RuntimeException
 class AuthException extends SecretServerException {}
 class PermissionException extends SecretServerException {}
 class NotFoundException extends SecretServerException {}
+
+/**
+ * HTTP 409: the resource changed since the caller read it (If-Match or
+ * expected_version mismatch). getETag() is the current ETag from the
+ * response header; re-read the resource and retry with it.
+ */
+class ConflictException extends SecretServerException
+{
+    private ?string $etag;
+
+    public function __construct(string $message, int $code = 409, ?string $etag = null, ?\Throwable $previous = null)
+    {
+        parent::__construct($message, $code, $previous);
+        $this->etag = $etag;
+    }
+
+    public function getETag(): ?string { return $this->etag; }
+}

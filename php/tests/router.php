@@ -60,6 +60,7 @@ $records = [
         'id' => 'id-db', 'name' => 'prod/db', 'description' => 'keep-desc', 'tags' => ['t1'],
         'container_id' => 'c-1', 'data' => ['value' => 'old'], 'version' => 3,
     ],
+    '/api/v1/secrets/db1' => ['id' => 'id-db1', 'name' => 'db1', 'data' => ['value' => 'v1'], 'version' => 3],
     '/api/v1/jks-keystores/j1' => [
         'id' => 'j1', 'name' => 'jks-name', 'container_id' => 'c-1', 'notes' => 'n1', 'tags' => ['t1'],
         'store_type' => 'managed', 'created_at' => '2026-01-01T00:00:00Z',
@@ -71,8 +72,27 @@ $records = [
     '/api/v1/secret/s1/history' => [['version_num' => 1, 'secret_type' => 'secret']],
     '/api/v1/totp-tokens' => ['tokens' => [['id' => 't1']], 'total' => 1],
 ];
+$versioned = ['/api/v1/secrets/prod%2Fdb', '/api/v1/secrets/db1', '/api/v1/jks-keystores/j1', '/api/v1/yubikeys/y1'];
 if ($method === 'GET' && isset($records[$uri])) {
+    if (in_array($uri, $versioned, true)) {
+        header('ETag: "2026-01-01T00:00:00Z"');
+    }
     echo json_encode($records[$uri]);
+    return;
+}
+// Partial updates: If-Match must be the current ETag, W/ form, *, or (secrets) version 3.
+if ($method === 'PUT' && in_array($uri, $versioned, true)) {
+    $ifMatch = $_SERVER['HTTP_IF_MATCH'] ?? null;
+    $accepted = ['"2026-01-01T00:00:00Z"', 'W/"2026-01-01T00:00:00Z"', '*', '3'];
+    if ($ifMatch !== null && !in_array($ifMatch, $accepted, true)) {
+        http_response_code(409);
+        header('ETag: "2026-02-02T00:00:00Z"');
+        echo json_encode(['error' => 'modified BODY_LEAK_MARKER']);
+        return;
+    }
+    header('ETag: "2026-03-03T00:00:00Z"');
+    $raw = file_get_contents('php://input');
+    echo json_encode(['method' => $method, 'path' => $uri, 'raw' => $raw, 'if_match' => $ifMatch]);
     return;
 }
 if ($method === 'POST' && $uri === '/api/v1/transform/decode') {
