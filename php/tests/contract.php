@@ -295,7 +295,9 @@ expectFailure(fn () => $client->generateOpenSSLKey('o', 'dsa'), 'invalid OpenSSL
 check($client->importOpenSSLKey('o', 'rsa', 'PEM')['body'] === ['name' => 'o', 'algorithm' => 'rsa', 'private_key' => 'PEM'], 'importOpenSSLKey body');
 
 check($client->downloadCertificate('c1') === 'RAW-PEM:format=pem', 'certificate download returns raw body');
-check($client->downloadCertificate('c1', 'pfx', 'p w&x') === 'RAW-PEM:format=pfx&password=p%20w%26x', 'certificate pfx password encoded');
+check($client->downloadCertificate('c1', 'pfx', 'p w&x') === 'RAW-P12:|{"format":"pfx","password":"p w&x"}', 'certificate pfx is POSTed with the password only in the body');
+expectFailure(fn () => $client->downloadCertificate('c1', 'p12', str_repeat('x', 1025)), 'pfx/p12 password over 1024 bytes rejected');
+expectFailure(fn () => $client->downloadCertificate('c1', 'pem', 'secret'), 'password with a PEM format rejected');
 expectFailure(fn () => $client->downloadCertificate('c1', 'p12'), 'pfx/p12 without password rejected');
 expectFailure(fn () => $client->downloadCertificate('c1', 'der'), 'invalid certificate format rejected');
 check(strlen($client->downloadCertificate('mid')) === 5 * 1024 * 1024, 'raw download allows up to 16 MiB');

@@ -221,6 +221,14 @@ try {
     ok(($c->getCertificate($cert['id'])['id'] ?? null) === $cert['id'], 'enrollCertificate + getCertificate');
     ok(in_array($cert['id'], array_column($c->listCertificates(), 'id'), true), 'listCertificates includes enrolled certificate');
     ok(str_starts_with($c->downloadCertificate($cert['id']), '-----BEGIN CERTIFICATE-----'), 'downloadCertificate returns raw PEM');
+    $p12 = $c->downloadCertificate($cert['id'], 'p12', 'Php-Live-Export-1');
+    ok($p12 !== '' && $p12[0] === "\x30", 'downloadCertificate(p12) via POST returns DER');
+    try {
+        $c->request('GET', '/certificates/' . $cert['id'] . '/download?format=pfx&password=Php-Live-Export-1');
+        ok(false, 'GET pfx with a password in the URL must be rejected');
+    } catch (SecretServer\SecretServerException $e) {
+        ok($e->getCode() === 400, 'server rejects a password in the download URL (400)');
+    }
 
     // Audit export as JSON.
     $audit = $c->exportAuditLogs(['action' => 'secret.update']);

@@ -817,11 +817,18 @@ class SecretServerClient
         if (!in_array($format, ['pem', 'pem-bundle', 'key', 'pfx', 'p12'], true)) {
             throw new SecretServerException('Certificate format must be pem, pem-bundle, key, pfx or p12');
         }
-        if (in_array($format, ['pfx', 'p12'], true) && ($password === null || $password === '')) {
-            throw new SecretServerException('A password is required for pfx/p12 downloads');
+        $path = '/certificates/' . self::pathSegment($id) . '/download';
+        if (in_array($format, ['pfx', 'p12'], true)) {
+            if ($password === null || $password === '' || strlen($password) > 1024) {
+                throw new SecretServerException('A 1-1024 byte password is required for pfx/p12 downloads');
+            }
+            // POST keeps the export password out of URLs and access logs.
+            return $this->send('POST', $path, ['format' => $format, 'password' => $password], self::MAX_RAW_BYTES, '*/*');
         }
-        return $this->requestRaw('GET', '/certificates/' . self::pathSegment($id) . '/download'
-            . self::query(['format' => $format, 'password' => $password]));
+        if ($password !== null) {
+            throw new SecretServerException('A password is only used with pfx/p12 downloads');
+        }
+        return $this->requestRaw('GET', $path . self::query(['format' => $format]));
     }
 
     // -----------------------------------------------------------------------

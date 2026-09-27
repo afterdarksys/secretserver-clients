@@ -46,6 +46,11 @@ switch ($uri) {
 }
 
 $route = parse_url($uri, PHP_URL_PATH);
+if ($method === 'POST' && preg_match('#^/api/v1/certificates/(\w+)/download$#', $route, $m)) {
+    header('Content-Type: application/x-pkcs12');
+    echo 'RAW-P12:' . (string) parse_url($uri, PHP_URL_QUERY) . '|' . file_get_contents('php://input');
+    return;
+}
 if ($method === 'GET' && preg_match('#^/api/v1/certificates/(\w+)/download$#', $route, $m)) {
     header('Content-Type: text/plain');
     $sizes = ['mid' => 5 * 1024 * 1024, 'big' => 17 * 1024 * 1024];
