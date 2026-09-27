@@ -182,6 +182,15 @@ try:
     assert c.get_certificate(cert["id"])["common_name"] == "python-live.example.test"
     pem = c.download_certificate(cert["id"])
     assert isinstance(pem, bytes) and pem.startswith(b"-----BEGIN CERTIFICATE-----")
+    # PKCS#12 goes over POST with the password in the body.
+    p12 = c.download_certificate(cert["id"], "p12", "Python-Live-Export-1")
+    assert isinstance(p12, bytes) and p12[:1] == b"\x30", "p12 download is not DER"
+    # The server refuses a password in the URL.
+    try:
+        c.request("GET", f"/certificates/{cert['id']}/download?format=pfx&password=Python-Live-Export-1")
+        raise AssertionError("GET pfx with a password in the URL was accepted")
+    except SecretServerError as err:
+        assert err.status_code == 400, err.status_code
 
     # JKS: create, partial update (null clears notes, password rotation),
     # ETag conflict, export, delete.

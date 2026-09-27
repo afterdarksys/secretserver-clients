@@ -158,9 +158,16 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(body, pem)
         self.assertTrue(calls[0][1].endswith("/certificates/c1/download?format=pem"))
         _, calls = self.run_with(lambda: self.client.download_certificate("c1", "p12", "pw&x"), b"\x30\x82")
-        self.assertEqual(parse_qs(urlsplit(calls[0][1]).query), {"format": ["p12"], "password": ["pw&x"]})
+        method, url, body = calls[0]
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/certificates/c1/download"))
+        self.assertNotIn("pw", url)
+        self.assertEqual(body, {"format": "p12", "password": "pw&x"})
+        for bad in ((), ("x" * 1025,)):
+            with self.assertRaises(ValueError):
+                self.client.download_certificate("c1", "pfx", *bad)
         with self.assertRaises(ValueError):
-            self.client.download_certificate("c1", "pfx")
+            self.client.download_certificate("c1", "pem", "secret")
         with self.assertRaises(ValueError):
             self.client.download_certificate("c1", "der")
 

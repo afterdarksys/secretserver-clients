@@ -946,16 +946,20 @@ class SecretServerClient:
     def download_certificate(self, cert_id: str, format: str = "pem", password: Optional[str] = None) -> bytes:
         """Download raw certificate material (PEM text or PKCS#12 bytes).
 
-        ``format`` is pem, pem-bundle, key, pfx or p12; pfx/p12 require ``password``.
+        ``format`` is pem, pem-bundle, key, pfx or p12. PEM formats use GET.
+        pfx/p12 require a 1-1024 character ``password`` and are sent as POST
+        with the password in the JSON body, so it never appears in a URL.
         """
         if format not in self.CERT_DOWNLOAD_FORMATS:
             raise ValueError("format must be pem, pem-bundle, key, pfx or p12")
-        params = {"format": format}
+        path = f"/certificates/{_seg(cert_id)}/download"
         if format in ("pfx", "p12"):
-            if not password:
-                raise ValueError("password is required for pfx/p12 downloads")
-            params["password"] = password
-        return self._send("GET", f"/certificates/{_seg(cert_id)}/download?" + urlencode(params), raw=True)
+            if not password or len(password) > 1024:
+                raise ValueError("a 1-1024 character password is required for pfx/p12 downloads")
+            return self._send("POST", path, {"format": format, "password": password}, raw=True)
+        if password is not None:
+            raise ValueError("password is only used with pfx/p12 downloads")
+        return self._send("GET", path + "?" + urlencode({"format": format}), raw=True)
 
     # ------------------------------------------------------------------
     # Webhooks
