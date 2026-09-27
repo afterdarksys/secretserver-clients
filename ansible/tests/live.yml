@@ -9,6 +9,19 @@
     ss_key: "{{ lookup('env', 'SS_LIVE_KEY') }}"
     ss_api: "{{ ss_url }}/api/v1"
   tasks:
+    # Only the SS_LIVE_* variables are used, never SS_API_URL/SS_API_KEY or a
+    # production default, and the target must be a loopback server.
+    - name: Refuse to run unless SS_LIVE_URL is loopback and SS_LIVE_KEY is set
+      ansible.builtin.assert:
+        that:
+          - ss_url | length > 0
+          - "'@' not in (ss_url | urlsplit('netloc'))"
+          - (ss_url | urlsplit('hostname') | default('', true) | lower) in ['localhost', '127.0.0.1', '::1']
+          - ss_key | length > 0
+          - lookup('env', 'SS_LIVE_CONTAINER') | length > 0
+        fail_msg: "refusing to run: SS_LIVE_URL must be a loopback URL (localhost, 127.0.0.1 or ::1) and SS_LIVE_KEY, SS_LIVE_CONTAINER must be set"
+        quiet: true
+
     - name: Create a secret to read back
       ansible.builtin.uri:
         url: "{{ ss_api }}/secrets"
