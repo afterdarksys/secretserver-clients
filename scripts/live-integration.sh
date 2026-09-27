@@ -104,6 +104,8 @@ export SS_LIVE_WRITE_KEY="$WRITE_KEY"
 export SS_LIVE_URL="$API" SS_LIVE_KEY="$RAW_KEY" SS_LIVE_CONTAINER="$CONTAINER" SS_LIVE_TOKEN_FILE="$WORK/token"
 
 declare -a NAMES STATUS
+# Every client output path goes through red() so neither live key is echoed.
+red() { sed -e "s/$RAW_KEY/<redacted>/g" -e "s/$WRITE_KEY/<redacted>/g" "$1"; }
 run() {
   local name=$1 dir=$2; shift 2
   echo "==> $name"
@@ -116,11 +118,11 @@ run() {
       STATUS+=(PASS)
     fi
   else
-    STATUS+=(FAIL); sed -e "s/$RAW_KEY/<redacted>/g" -e "s/$WRITE_KEY/<redacted>/g" "$WORK/$name.out" | tail -30 >&2
+    STATUS+=(FAIL); red "$WORK/$name.out" | tail -30 >&2
   fi
   NAMES+=("$name")
-  sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | grep -E '^(NOT VERIFIED|SKIP)' || true
-  sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | tail -3
+  red "$WORK/$name.out" | grep -E '^(NOT VERIFIED|SKIP)' || true
+  red "$WORK/$name.out" | grep -vE '^(NOT VERIFIED|SKIP)' | tail -3
 }
 
 run go go go run ./cmd/platform-smoke
