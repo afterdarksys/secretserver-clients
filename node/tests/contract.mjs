@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { SecretServerClient, SecretServerError, ConflictError } from "../dist/index.js";
 
+// The partial-update gate must not be satisfied by the developer's environment.
+delete process.env.SS_PARTIAL_UPDATES;
+
 const calls = [];
 const fetchFn = async (url, init) => {
   calls.push({ url, init });
@@ -14,6 +17,7 @@ const client = new SecretServerClient({
   apiKey: "sk_test",
   apiUrl: "https://example.test/api/v1",
   fetchFn,
+  partialUpdates: true,
 });
 
 const secrets = await client.listSecrets();
@@ -100,9 +104,9 @@ assert.equal(seen.at(-1).init.redirect, 'error');
 
 
 // --- Contract fixes against the server handlers ---
-function stub(routes) {
+function stub(routes, config = {}) {
   const log = [];
-  const client = new SecretServerClient({ apiKey: KEY, apiUrl: 'https://example.test', fetchFn: async (url, init) => {
+  const client = new SecretServerClient({ ...config, apiKey: KEY, apiUrl: 'https://example.test', fetchFn: async (url, init) => {
     const path = url.replace('https://example.test/api/v1', '');
     // headers is non-enumerable so deepEqual on log entries compares path/method/body only.
     log.push(Object.defineProperty({ path, method: init.method, body: init.body ? JSON.parse(init.body) : undefined }, 'headers', { value: init.headers }));
@@ -119,7 +123,7 @@ function stub(routes) {
 {
   const cid = '11111111-1111-1111-1111-111111111111';
   const etagged = () => new Response(JSON.stringify({ id: 'x', name: 'db', version: 3 }), { status: 200, headers: { etag: '"2026-01-02T03:04:05.123456Z"' } });
-  const { client, log, last } = stub({ 'PUT /secrets/db': etagged, 'GET /secrets/db': etagged });
+  const { client, log, last } = stub({ 'PUT /secrets/db': etagged, 'GET /secrets/db': etagged }, { partialUpdates: true });
   const updated = await client.updateSecret('db', 'v2');
   assert.equal(log.length, 1);
   assert.deepEqual(last(), { path: '/secrets/db', method: 'PUT', body: { data: { value: 'v2' } } });
@@ -163,7 +167,7 @@ function stub(routes) {
       && e.etag === '"2026-02-02T00:00:00.5Z"' && e.message === 'SecretServer request failed (HTTP 409)'
       && !e.message.includes(KEY) && !e.message.includes('conflict-body-marker'));
   }
-  const bare = new SecretServerClient({ apiKey: KEY, fetchFn: async () => ({ ok: false, status: 409, text: async () => '' }) });
+  const bare = new SecretServerClient({ apiKey: KEY, partialUpdates: true, fetchFn: async () => ({ ok: false, status: 409, text: async () => '' }) });
   await assert.rejects(bare.updateSecret('db', 'v'), e => e instanceof ConflictError && e.etag === undefined);
 }
 
@@ -274,7 +278,7 @@ function stub(routes) {
     'PUT /jks-keystores/j1': () => tagged({ message: 'updated' }, '"j-etag-2"'),
     'GET /yubikeys/y1': () => tagged({ id: 'y1', name: 'yk' }, '"y-etag"'),
     'PUT /yubikeys/y1': () => tagged({ message: 'updated' }, '"y-etag-2"'),
-  });
+  }, { partialUpdates: true });
   assert.equal((await client.getJKSKeystore('j1')).etag, '"j-etag"');
   assert.deepEqual(await client.updateJKSKeystore('j1', { notes: null, tags: undefined, password: 'rotated' }, { ifMatch: '"j-etag"' }), { message: 'updated', etag: '"j-etag-2"' });
   assert.deepEqual(last().body, { notes: null, password: 'rotated' });
@@ -293,6 +297,56 @@ function stub(routes) {
   await assert.rejects(client.updateYubikey('y1', { public_id: 'short' }), /12 modhex/);
   await assert.rejects(client.updateYubikey('y1', { public_id: null }), /12 modhex/);
   assert.equal(log.length, n);
+}
+
+// Partial updates are refused (no request sent) unless the client opted in or
+// ifMatch is a server ETag: an older server would silently blank omitted fields.
+{
+  const routes = { 'PUT /secrets/db': {}, 'PUT /jks-keystores/j1': {}, 'PUT /yubikeys/y1': {} };
+  const updates = (client, ifMatch) => [
+    () => client.updateSecret('db', 'v', ifMatch === undefined ? {} : { ifMatch }),
+    () => client.updateJKSKeystore('j1', { notes: 'n' }, ifMatch === undefined ? {} : { ifMatch }),
+    () => client.updateYubikey('y1', { notes: 'n' }, ifMatch === undefined ? {} : { ifMatch }),
+  ];
+  const refused = e => e instanceof SecretServerError && e.message ===
+    'partial updates require secretserver.io 3075630 or newer; pass an ETag from get() as if_match or enable partial_updates';
+
+  // Refused: no opt-in and no ETag, a version number, "*", or an unquoted/half-quoted value.
+  const gated = stub(routes);
+  for (const ifMatch of [undefined, 3, '3', '*', 'abc', '"abc', 'abc"', 'W/abc', 'w/"abc"', ' "abc"', '"a"b"']) {
+    for (const call of updates(gated.client, ifMatch)) await assert.rejects(call(), refused, String(ifMatch));
+  }
+  // expectedVersion alone does not prove a partial-capable server either.
+  await assert.rejects(gated.client.updateSecret('db', 'v', { expectedVersion: 3 }), refused);
+  await assert.rejects(gated.client.updateSecret('db', 'v', { ifMatch: 3, expectedVersion: 3 }), refused);
+  // Explicit false wins over the environment.
+  process.env.SS_PARTIAL_UPDATES = '1';
+  const optedOut = stub(routes, { partialUpdates: false });
+  delete process.env.SS_PARTIAL_UPDATES;
+  for (const call of updates(optedOut.client)) await assert.rejects(call(), refused);
+  assert.equal(gated.log.length + optedOut.log.length, 0);
+
+  // Allowed: strong and weak ETags, each sent as If-Match.
+  for (const etag of ['"2026-01-02T03:04:05.123456Z"', 'W/"weak-1"', '""']) {
+    const { client, log } = stub(routes);
+    for (const call of updates(client, etag)) await call();
+    assert.deepEqual(log.map(e => [e.method, e.headers['If-Match']]), [['PUT', etag], ['PUT', etag], ['PUT', etag]]);
+  }
+  // Allowed: explicit opt-in, and SS_PARTIAL_UPDATES=1 read at construction.
+  const optedIn = stub(routes, { partialUpdates: true });
+  for (const call of updates(optedIn.client)) await call();
+  assert.equal(optedIn.log.length, 3);
+  process.env.SS_PARTIAL_UPDATES = '1';
+  const fromEnv = stub(routes);
+  delete process.env.SS_PARTIAL_UPDATES;
+  for (const call of updates(fromEnv.client)) await call();
+  assert.equal(fromEnv.log.length, 3);
+  // Any other env value is not an opt-in.
+  process.env.SS_PARTIAL_UPDATES = 'true';
+  const notOne = stub(routes);
+  delete process.env.SS_PARTIAL_UPDATES;
+  for (const call of updates(notOne.client)) await assert.rejects(call(), refused);
+  assert.equal(notOne.log.length, 0);
 }
 
 console.log('contract + security tests PASS');

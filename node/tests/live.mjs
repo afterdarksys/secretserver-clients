@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {SecretServerClient, AuthError, PermissionError, ConflictError, NotFoundError} from '../dist/index.js';
-const c=new SecretServerClient({apiKey:process.env.SS_LIVE_KEY,apiUrl:process.env.SS_LIVE_URL});
+// This stack runs a partial-update server (3075630+), so both clients opt in.
+const c=new SecretServerClient({apiKey:process.env.SS_LIVE_KEY,apiUrl:process.env.SS_LIVE_URL,partialUpdates:true});
 // Key holding ONLY secrets:write.
-const writer=new SecretServerClient({apiKey:process.env.SS_LIVE_WRITE_KEY,apiUrl:process.env.SS_LIVE_URL});
+const writer=new SecretServerClient({apiKey:process.env.SS_LIVE_WRITE_KEY,apiUrl:process.env.SS_LIVE_URL,partialUpdates:true});
 const container=process.env.SS_LIVE_CONTAINER;
 const cleanup=[];
 // Register an undo step; call the returned function after an explicit delete to drop it.
@@ -68,6 +69,19 @@ try {
   await conflictEtag(()=>c.updateSecret('node-live','stale-write',{expectedVersion:third.version+100}));
   await c.updateSecret('node-live','fourth',{ifMatch:third.etag});
   assert.equal(await c.secret('prod/node-live'),'fourth');
+
+  // Without the opt-in, a partial update is refused client-side unless ifMatch is an ETag from get().
+  const plain=new SecretServerClient({apiKey:process.env.SS_LIVE_KEY,apiUrl:process.env.SS_LIVE_URL,partialUpdates:false});
+  await assert.rejects(plain.updateSecret('node-live','refused'),/require secretserver\.io 3075630/);
+  await assert.rejects(plain.updateSecret('node-live','refused',{ifMatch:third.version+1}),/require secretserver\.io 3075630/);
+  const beforePlain=await plain.getSecret('node-live');
+  assert.equal(beforePlain.data.value,'fourth');
+  await plain.updateSecret('node-live','fifth',{ifMatch:beforePlain.etag});
+  const afterPlain=await c.getSecret('node-live');
+  assert.equal(afterPlain.data.value,'fifth');
+  assert.equal(afterPlain.container_id,container);
+  assert.deepEqual(afterPlain.tags,['node','live']);
+  assert.equal(await c.secret('prod/node-live'),'fifth');
   const history=await c.getHistory('secret',record.id);
   assert.ok(Array.isArray(history)&&history.length>=1);
 
@@ -79,8 +93,8 @@ try {
   // Variables (admin:all).
   await c.assignVariable('NODE_LIVE',{secret_type:'secret',secret_id:record.id,field:'value'});
   onCleanup(()=>c.deleteVariable('NODE_LIVE'));
-  assert.equal(await c.render('x=%%NODE_LIVE%%'),'x=fourth');
-  assert.deepEqual(await c.resolveDocument({password:'%%NODE_LIVE%%',count:2}),{password:'fourth',count:2});
+  assert.equal(await c.render('x=%%NODE_LIVE%%'),'x=fifth');
+  assert.deepEqual(await c.resolveDocument({password:'%%NODE_LIVE%%',count:2}),{password:'fifth',count:2});
   assert.equal((await c.getVariable('NODE_LIVE')).secret_id,record.id);
   assert.ok((await c.listVariables()).some(v=>v.name==='NODE_LIVE'));
 
@@ -145,7 +159,7 @@ try {
   assert.ok(items.every(i=>i.type==='secret'));
   const exported=items.find(i=>i.name==='node-live');
   assert.ok(exported,'export json must include node-live');
-  assert.equal(JSON.parse(exported.value).value,'fourth');
+  assert.equal(JSON.parse(exported.value).value,'fifth');
 
   // Certificates: self-signed enroll works locally; download PEM as raw text and PKCS#12 as bytes.
   const cert=await c.enrollCertificate('node-live-cert','node-live.example.test',['www.node-live.example.test'],false);

@@ -40,6 +40,15 @@ export interface ClientConfig {
   /** Custom fetch implementation (default: global fetch) */
   fetchFn?: typeof fetch;
   timeoutMs?: number;
+  /**
+   * Allow updateSecret/updateJKSKeystore/updateYubikey to send partial
+   * bodies without an ETag. Minimum server: secretserver.io 3075630 (partial,
+   * conditional updates); older servers treat these PUTs as a full replace
+   * and silently blank omitted fields. Defaults to SS_PARTIAL_UPDATES=1 in
+   * process.env; without it, those methods refuse to send unless `ifMatch`
+   * is an ETag received from the server ("..." or W/"...").
+   */
+  partialUpdates?: boolean;
 }
 
 export interface VariableAssignment { secret_type: string; secret_id: string; field: string; }
@@ -67,7 +76,11 @@ export interface UpdateSecretOptions {
   description?: string | null;
   tags?: string[] | null;
   containerID?: string | null;
-  /** Conditional update: an ETag from getSecret/updateSecret, or the secret's version number. */
+  /**
+   * Conditional update: an ETag from getSecret/updateSecret, or the secret's
+   * version number. Only an ETag ("..." or W/"...") also proves the server
+   * supports partial updates; see ClientConfig.partialUpdates.
+   */
   ifMatch?: string | number;
   /** Conditional update on the secret's version number (sent as body field expected_version). */
   expectedVersion?: number;
@@ -486,6 +499,14 @@ function ifMatchHeader(ifMatch: string | number | undefined): Record<string, str
   return { "If-Match": ifMatch };
 }
 
+const PARTIAL_UPDATES_REQUIRED =
+  "partial updates require secretserver.io 3075630 or newer; pass an ETag from get() as if_match or enable partial_updates";
+
+/** A server entity tag: "..." or W/"..." (RFC 9110 etagc). Versions, "*" and bare values are not. */
+function isEntityTag(ifMatch: unknown): boolean {
+  return typeof ifMatch === "string" && /^(?:W\/)?"[\x21\x23-\x7e\x80-\xff]*"$/.test(ifMatch);
+}
+
 /** Keep only the keys the caller set: undefined = omit, null = sent as JSON null. */
 function providedFields(input: object): Record<string, unknown> {
   return Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
@@ -547,6 +568,7 @@ export class SecretServerClient {
   private readonly apiUrl: string;
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly partialUpdates: boolean;
 
   constructor(config: ClientConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.SS_API_KEY ?? "";
@@ -555,6 +577,7 @@ export class SecretServerClient {
       .replace(/\/api\/v1$/, "");
     this.fetchFn = config.fetchFn ?? fetch;
     this.timeoutMs = config.timeoutMs ?? 10000;
+    this.partialUpdates = config.partialUpdates ?? process.env.SS_PARTIAL_UPDATES === "1";
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) throw new SecretServerError("timeoutMs must be positive");
 
     if (!this.apiKey) {
@@ -565,6 +588,11 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
   // HTTP core
   // -----------------------------------------------------------------------
+
+  /** Refuse a partial PUT unless opted in or `ifMatch` is a server ETag (proof of a 3075630+ server). */
+  private requirePartialUpdates(ifMatch: unknown): void {
+    if (!this.partialUpdates && !isEntityTag(ifMatch)) throw new SecretServerError(PARTIAL_UPDATES_REQUIRED);
+  }
 
   private headers(extra?: Record<string, string>): Record<string, string> {
     return {
@@ -713,8 +741,14 @@ export class SecretServerClient {
    * secrets:write and never reads the secret. With `ifMatch`/`expectedVersion`
    * a stale precondition throws ConflictError carrying the current ETag. The
    * result carries the new `etag`.
+   *
+   * Minimum server: secretserver.io 3075630 (partial, conditional updates).
+   * Throws without sending unless the client has `partialUpdates: true` (or
+   * SS_PARTIAL_UPDATES=1) or `ifMatch` is an ETag from getSecret()/updateSecret();
+   * a version number, "*" or `expectedVersion` alone does not qualify.
    */
   async updateSecret(name: string, value?: string, opts: UpdateSecretOptions = {}): Promise<Secret> {
+    this.requirePartialUpdates(opts.ifMatch);
     if (value === null) throw new SecretServerError("value cannot be null; omit it to keep the current value");
     const body = providedFields({
       data: value === undefined ? undefined : { value },
@@ -811,8 +845,13 @@ export class SecretServerClient {
    * keeps, null clears container_id/notes/tags, "" is a literal value). `jks`
    * requires `password`; `password` alone rotates the stored password. A stale
    * `ifMatch` ETag throws ConflictError carrying the current ETag.
+   *
+   * Minimum server: secretserver.io 3075630 (partial, conditional updates).
+   * Throws without sending unless the client has `partialUpdates: true` (or
+   * SS_PARTIAL_UPDATES=1) or `ifMatch` is an ETag from getJKSKeystore().
    */
   async updateJKSKeystore(id: string, input: UpdateJKSKeystoreInput, opts: { ifMatch?: string } = {}): Promise<UpdateResult> {
+    this.requirePartialUpdates(opts.ifMatch);
     if (input.jks !== undefined && input.password === undefined) throw new SecretServerError("password is required with jks");
     const { data, etag } = await this.requestWithETag<UpdateResult>(
       "PUT", `/jks-keystores/${seg(id)}`, providedFields(input), ifMatchHeader(opts.ifMatch));
@@ -1171,8 +1210,13 @@ export class SecretServerClient {
    * (undefined keeps, null clears container_id/serial_number/notes/tags, "" is
    * a literal value). A stale `ifMatch` ETag throws ConflictError carrying the
    * current ETag.
+   *
+   * Minimum server: secretserver.io 3075630 (partial, conditional updates).
+   * Throws without sending unless the client has `partialUpdates: true` (or
+   * SS_PARTIAL_UPDATES=1) or `ifMatch` is an ETag from getYubikey().
    */
   async updateYubikey(id: string, data: UpdateYubikeyInput, opts: { ifMatch?: string } = {}): Promise<UpdateResult> {
+    this.requirePartialUpdates(opts.ifMatch);
     if (data.public_id !== undefined && (typeof data.public_id !== "string" || data.public_id.length !== 12)) {
       throw new SecretServerError("public_id must be exactly 12 modhex characters");
     }
