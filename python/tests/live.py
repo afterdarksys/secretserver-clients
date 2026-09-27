@@ -1,42 +1,84 @@
 """Live contract test; run through scripts/live-integration.sh."""
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
-from secretserver import AuthError, SecretServerClient
+from secretserver import AuthError, ConflictError, PermissionError, SecretServerClient
 
 URL, KEY, CONTAINER = os.environ["SS_LIVE_URL"], os.environ["SS_LIVE_KEY"], os.environ["SS_LIVE_CONTAINER"]
+WRITE_KEY = os.environ["SS_LIVE_WRITE_KEY"]
 c = SecretServerClient(KEY, URL)
+writer = SecretServerClient(WRITE_KEY, URL)
 cleanup = []
 
-# Flows deliberately not exercised live; their request shapes are pinned by
-# tests/test_contract.py instead. Printed so the harness marks the run honestly.
+# Flows that need something outside the disposable stack. Printed so the
+# harness marks the run honestly; request shapes are pinned by
+# tests/test_contract.py instead.
 for flow, reason in (
-    ("gpg", "server build returns HTTP 500 'failed to store key metadata' on generate/import"),
-    ("totp", "server build returns HTTP 500 'failed to store secret key' on create"),
-    ("jks", "server build returns HTTP 500 'failed to store keystore' on create"),
-    ("yubikey", "OTP validation needs the external Yubico service; create/update covered offline only"),
-    ("certificate download", "server build returns HTTP 500 'failed to create certificate metadata' on enroll"),
-    ("share", "needs a second user or group UUID the harness does not provision"),
-    ("webhook create", "server validates the webhook URL; needs an externally resolvable receiver"),
+    ("yubikey otp validation", "validates against the external Yubico API (yubikeys.go ValidateYubikeyOTP)"),
+    ("share", "recipient must be an active user or group of the tenant (sharing.go); the harness provisions none"),
+    ("webhook create", "netsafe.ValidateOutboundURL rejects loopback/private receivers; needs a public one"),
 ):
     print(f"SKIP {flow}: {reason}")
 
+
+def secret_reads(name):
+    logs = c.get_audit_logs(limit=1000, action="secret.read", resource=name)["logs"] or []
+    return len(logs)
+
+
+def expect_conflict(call):
+    try:
+        call()
+    except ConflictError as exc:
+        assert exc.status_code == 409 and exc.etag, exc
+        assert KEY not in str(exc)
+        return exc.etag
+    raise AssertionError("stale precondition was accepted")
+
+
 try:
-    # Secrets, path access and read-merge-write update.
+    # Secrets and path access.
     c.create_secret("python-live", "first", description="live description", container_id=CONTAINER)
     cleanup.append(lambda: c.delete_secret("python-live"))
+    c.update_secret("python-live", tags=["live"])
     assert any(s["name"] == "python-live" for s in c.list_secrets())
     assert c.secret("prod/python-live") == "first"
-    c.update_secret("python-live", "second")
+
+    # Partial update with a secrets:write-only key: no read permission is
+    # needed and no secret.read audit event is produced.
+    reads_before = secret_reads("python-live")
+    updated = writer.update_secret("python-live", "second")
+    assert updated.etag and updated["name"] == "python-live"
+    assert secret_reads("python-live") == reads_before, "update produced a secret.read audit event"
+    try:
+        writer.secret("python-live")
+        raise AssertionError("secrets:write key could read a secret")
+    except PermissionError as exc:
+        assert exc.status_code == 403 and WRITE_KEY not in str(exc)
     assert c.secret("python-live") == "second"
+    assert secret_reads("python-live") > reads_before, "audit filter does not see secret.read events"
     assert c.secret("prod/python-live") == "second", "container lost on update"
     assert c.secret("prod/python-live/2") == "first"
     record = c.get_secret("python-live")
-    assert record["container_id"] == CONTAINER and record["description"] == "live description"
+    assert (record["container_id"], record["description"], record["tags"]) == (CONTAINER, "live description", ["live"])
 
-    # The server records history rows only for some write paths; the contract
-    # checked here is that the endpoint answers with a bare array.
+    # Explicit null clears; omitted fields are preserved.
+    c.update_secret("python-live", description=None)
+    record = c.get_secret("python-live")
+    assert not record.get("description"), record.get("description")
+    assert (record["container_id"], record["tags"]) == (CONTAINER, ["live"])
+    assert c.secret("prod/python-live") == "second"
+
+    # ETag round trip: the current ETag succeeds, the stale one conflicts.
+    assert record.etag
+    fresh = c.update_secret("python-live", "third", if_match=record.etag)
+    assert fresh.etag and fresh.etag != record.etag
+    assert expect_conflict(lambda: c.update_secret("python-live", "fourth", if_match=record.etag)) == fresh.etag
+    expect_conflict(lambda: c.update_secret("python-live", "fourth", expected_version=record["version"]))
+    assert c.secret("python-live") == "third"
+
     history = c.get_history("secret", record["id"])
     assert isinstance(history, list), history
 
@@ -54,8 +96,8 @@ try:
     # Variables.
     c.assign_variable("PYTHON_LIVE", "secret", record["id"], "value")
     cleanup.append(lambda: c.delete_variable("PYTHON_LIVE"))
-    assert c.render("x=%%PYTHON_LIVE%%") == "x=second"
-    assert c.resolve_document({"password": "%%PYTHON_LIVE%%", "count": 2}) == {"password": "second", "count": 2}
+    assert c.render("x=%%PYTHON_LIVE%%") == "x=third"
+    assert c.resolve_document({"password": "%%PYTHON_LIVE%%", "count": 2}) == {"password": "third", "count": 2}
     assert c.get_variable("PYTHON_LIVE")["secret_id"] == record["id"]
     assert any(v["name"] == "PYTHON_LIVE" for v in c.list_variables())
 
@@ -75,15 +117,73 @@ try:
     ossl = c.generate_openssl_key("python-live-ossl", "ecdsa", curve="P-256")
     cleanup.append(lambda: c.delete_openssl_key(ossl["id"]))
 
-    # Export with include flags, audit query and export.
-    # This server build skips items whose Vault read fails and can return
-    # "items": null, so only the envelope and type filtering are asserted.
-    for flag, kind in (("include_secrets", "secret"), ("include_passwords", "password")):
-        export = c.export_to_json(**{flag: True})
-        assert export["format"] == "json" and export["count"] == len(export["items"] or [])
-        assert all(item["type"] == kind for item in export["items"] or [])
+    # GPG: generate, list, export both halves, delete.
+    gpg = c.generate_gpg_key("python-live-gpg", "gpg@example.test", "ED25519", comment="live")
+    cleanup.append(lambda: c.delete_gpg_key(gpg["id"]))
+    assert any(k["id"] == gpg["id"] for k in c.list_gpg_keys())
+    public = c.export_gpg_key(gpg["id"])
+    assert public["format"] == "public" and "BEGIN PGP PUBLIC KEY BLOCK" in public["key"]
+    assert public["fingerprint"] == gpg["fingerprint"]
+    private = c.export_gpg_key(gpg["id"], "private")
+    assert "BEGIN PGP PRIVATE KEY BLOCK" in private["key"]
+
+    # TOTP: create, list, code, export, delete.
+    totp = c.create_totp_token("python-live-totp", "Example", "live@example.test", "JBSWY3DPEHPK3PXP")
+    cleanup.append(lambda: c.delete_totp_token(totp["id"]))
+    assert any(t["id"] == totp["id"] for t in c.list_totp_tokens())
+    code = c.generate_totp_code(totp["id"])
+    assert len(code["code"]) == 6 and code["code"].isdigit()
+    uri = c.export_totp_to_uri(totp["id"])
+    assert set(uri) == {"uri"} and uri["uri"].startswith("otpauth://totp/")
+
+    # Certificates: enroll, read, raw PEM download. Enrollment generates an
+    # RSA-4096 key server-side, which can outlast the default 10 s timeout.
+    cert = SecretServerClient(KEY, URL, timeout=120).enroll_certificate("python-live-cert", "python-live.example.test", ["www.python-live.example.test"])
+    cleanup.append(lambda: c.revoke_certificate(cert["id"]))
+    assert c.get_certificate(cert["id"])["common_name"] == "python-live.example.test"
+    pem = c.download_certificate(cert["id"])
+    assert isinstance(pem, bytes) and pem.startswith(b"-----BEGIN CERTIFICATE-----")
+
+    # JKS: create, partial update (null clears notes, password rotation),
+    # ETag conflict, export, delete.
+    jks = c.create_jks_keystore("python-live-jks", password="changeit", notes="live notes",
+                                tags=["live"], container_id=CONTAINER)
+    cleanup.append(lambda: c.delete_jks_keystore(jks["id"]))
+    current = c.get_jks_keystore(jks["id"])
+    assert current.etag and current["notes"] == "live notes"
+    cleared = c.update_jks_keystore(jks["id"], {"notes": None}, if_match=current.etag)
+    assert cleared.etag and cleared.etag != current.etag
+    after = c.get_jks_keystore(jks["id"])
+    assert not after.get("notes") and after["tags"] == ["live"] and after["container_id"] == CONTAINER
+    assert after["name"] == "python-live-jks"
+    assert expect_conflict(lambda: c.update_jks_keystore(jks["id"], {"notes": "x"}, if_match=current.etag)) == after.etag
+    c.update_jks_keystore(jks["id"], {"password": "rotated-pass"})
+    exported = c.export_jks_keystore(jks["id"])
+    assert exported.get("jks"), sorted(exported)
+    assert c.get_jks_keystore(jks["id"])["tags"] == ["live"]
+
+    # YubiKey: create, partial update (null clears serial_number), delete.
+    yk = c.create_yubikey("python-live-yk", "cccccccccccb", "12345", "c2VjcmV0LWtleQ==",
+                          serial_number="9876543", notes="yk notes")
+    cleanup.append(lambda: c.delete_yubikey(yk["id"]))
+    current = c.get_yubikey(yk["id"])
+    assert current.etag and current["serial_number"] == "9876543"
+    c.update_yubikey(yk["id"], {"serial_number": None}, if_match=current.etag)
+    after = c.get_yubikey(yk["id"])
+    assert not after.get("serial_number") and after["notes"] == "yk notes" and after["public_id"] == "cccccccccccb"
+    expect_conflict(lambda: c.update_yubikey(yk["id"], {"notes": "x"}, if_match=current.etag))
+
+    # Export with include flags carries secret contents; audit query and export.
+    export = c.export_to_json(include_secrets=True)
+    assert export["format"] == "json" and export["count"] == len(export["items"])
+    assert all(item["type"] == "secret" for item in export["items"])
+    mine = [item for item in export["items"] if item["name"] == "python-live"]
+    assert mine and json.loads(mine[0]["value"]) == {"value": "third"}, "secret contents missing from export"
+    export = c.export_to_json(include_passwords=True)
+    assert any(item["name"] == "python-live-pw" for item in export["items"])
+    assert all(item["type"] == "password" for item in export["items"])
     logs = c.get_audit_logs(limit=5, action="secret.update")
-    assert isinstance(logs, dict)
+    assert logs["logs"], logs
     since = datetime.now(timezone.utc) - timedelta(hours=1)
     assert c.get_audit_logs(start_date=since, end_date=datetime.now(timezone.utc) + timedelta(hours=1))["logs"]
     assert "secret.update" in c.export_audit_logs(action="secret.update")
