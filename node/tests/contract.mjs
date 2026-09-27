@@ -242,13 +242,16 @@ function stub(routes, config = {}) {
   assert.deepEqual(await client.listTOTPTokens(), [{ id: 't1' }]);
   assert.equal(await client.downloadCertificate('c1'), '-----BEGIN CERTIFICATE-----\n');
   assert.equal(last().path, '/certificates/c1/download?format=pem');
-  await assert.rejects(client.downloadCertificate('c1', { format: 'pfx' }), /password is required/);
+  await assert.rejects(client.downloadCertificate('c1', { format: 'pfx' }), /password of 1-1024/);
+  await assert.rejects(client.downloadCertificate('c1', { format: 'p12', password: 'x'.repeat(1025) }), /password of 1-1024/);
+  await assert.rejects(client.downloadCertificate('c1', { format: 'pem', password: 'x' }), /only used with pfx/);
   await assert.rejects(client.downloadCertificate('c1', { format: 'der' }), /Invalid certificate format/);
-  const binary = stub({ 'GET /certificates/c1/download': pfx });
+  const binary = stub({ 'POST /certificates/c1/download': pfx });
   const bytes = await binary.client.downloadCertificate('c1', { format: 'p12', password: 'p&w=1' });
   assert.ok(bytes instanceof Uint8Array);
   assert.deepEqual([...bytes], [...pfx]);
-  assert.equal(binary.last().path, '/certificates/c1/download?format=p12&password=p%26w%3D1');
+  // The password travels only in the POST body, never in the URL.
+  assert.deepEqual(binary.last(), { path: '/certificates/c1/download', method: 'POST', body: { format: 'p12', password: 'p&w=1' } });
 
   await client.sign('pkcs11', 'k1', new Uint8Array([0, 255, 1]), 'test');
   assert.deepEqual(last().body, { backend: 'pkcs11', key_id: 'k1', message: 'AP8B', purpose: 'test' });

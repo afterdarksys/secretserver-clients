@@ -786,8 +786,10 @@ export class SecretServerClient {
 
   async renewCertificate(id: string): Promise<Certificate> { return this.post(`/certificates/${seg(id)}/renew`); }
   /**
-   * Download certificate material. Text formats (pem, pem-bundle, key) return a
-   * string; pfx/p12 return bytes and require an export password.
+   * Download certificate material. Text formats (pem, pem-bundle, key) use GET
+   * and return a string; pfx/p12 require an export password (1-1024 chars),
+   * are sent as POST with the password in the JSON body (never in the URL),
+   * and return bytes.
    */
   async downloadCertificate(id: string, opts?: { format?: CertificateTextFormat }): Promise<string>;
   async downloadCertificate(id: string, opts: { format: CertificateBinaryFormat; password: string }): Promise<Uint8Array>;
@@ -798,10 +800,11 @@ export class SecretServerClient {
     const format = opts.format ?? "pem";
     const binary = format === "pfx" || format === "p12";
     if (!["pem", "pem-bundle", "key", "pfx", "p12"].includes(format)) throw new SecretServerError("Invalid certificate format");
-    if (binary && !opts.password) throw new SecretServerError("A password is required for pfx/p12 export");
-    const q = new URLSearchParams({ format });
-    if (binary) q.set("password", opts.password as string);
-    const bytes = await this.download(`/certificates/${seg(id)}/download?${q}`);
+    if (binary && (!opts.password || opts.password.length > 1024)) throw new SecretServerError("A password of 1-1024 characters is required for pfx/p12 export");
+    if (!binary && opts.password !== undefined) throw new SecretServerError("A password is only used with pfx/p12 export");
+    const bytes = binary
+      ? await readCapped(await this.send("POST", `/certificates/${seg(id)}/download`, { format, password: opts.password }), MAX_RAW_BYTES)
+      : await this.download(`/certificates/${seg(id)}/download?${new URLSearchParams({ format })}`);
     return binary ? bytes : new TextDecoder().decode(bytes);
   }
 
