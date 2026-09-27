@@ -13,6 +13,20 @@ client.delete_secret("example")
 
 Use protected configuration for credentials; avoid logging returned values. Path reads use `container/name`, and history uses `container/name/2`. Generic request helpers support newer REST endpoints. Requests have a configurable timeout and do not automatically retry mutations. HTTP failures expose a status code without echoing response bodies.
 
+**Minimum server: secretserver.io 3075630 (partial, conditional updates).** Older servers treat `PUT` on secrets, JKS keystores and YubiKeys as a full replace and ignore `If-Match`, so a partial body silently blanks every omitted field. The three update methods therefore refuse to send (raising `SecretServerError` before any request) unless you opt in, or the call passes an ETag the server returned:
+
+```python
+client = SecretServerClient(api_key="scoped-token", api_url="https://your-server.example",
+                            partial_updates=True)   # or export SS_PARTIAL_UPDATES=1
+client.update_secret("example", description="new")  # allowed: opted in
+
+legacy_safe = SecretServerClient(api_key="scoped-token", api_url="https://your-server.example")
+record = legacy_safe.get_secret("example")
+legacy_safe.update_secret("example", "new-value", if_match=record.etag)  # allowed: ETag proves 3075630+
+```
+
+Only an entity tag (`"..."` or `W/"..."`) satisfies the check; a version number, `*`, an unquoted value or `expected_version` alone does not. `SS_PARTIAL_UPDATES` is read only when `partial_updates` is not passed, and only the value `1` enables it.
+
 Updates are partial. `update_secret`, `update_jks_keystore` and `update_yubikey` send one `PUT` containing only what you supply: an omitted argument (or a key absent from the `data` dict) keeps the stored value, and `None` is sent as JSON `null`, which clears the field. A secret's value cannot be cleared; omit `value` to change only metadata. `update_secret` needs only `secrets:write` and never reads the secret.
 
 ```python

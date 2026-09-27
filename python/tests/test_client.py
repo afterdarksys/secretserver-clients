@@ -33,7 +33,7 @@ class ClientContractTests(unittest.TestCase):
         self.assertEqual(urlopen.call_args.args[0].full_url, "https://example.test/api/v1/secrets")
 
     def test_update_sends_one_put_with_only_supplied_fields(self):
-        client = SecretServerClient("sk_test", "https://example.test")
+        client = SecretServerClient("sk_test", "https://example.test", partial_updates=True)
         calls = []
 
         def respond(request, **_kwargs):
@@ -53,7 +53,7 @@ class ClientContractTests(unittest.TestCase):
         self.assertNotIn("sans", calls[2][2])
 
     def test_update_distinguishes_omitted_from_cleared_metadata(self):
-        client = SecretServerClient("sk_test", "https://example.test")
+        client = SecretServerClient("sk_test", "https://example.test", partial_updates=True)
         puts = []
 
         def respond(request, **_kwargs):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import urllib.request
 import urllib.error
 import ssl
@@ -15,6 +16,15 @@ from typing import Any, Dict, List, Optional, Union
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_RAW_BYTES = 16 * 1024 * 1024
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# A strong or weak entity tag (RFC 9110 section 8.8.3). Only an ETag the
+# server sent proves it applies partial updates; servers before 3075630
+# ignore If-Match and treat PUT as a full replace.
+_ENTITY_TAG = re.compile(r'(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"')
+_PARTIAL_UPDATES_REQUIRED = (
+    "partial updates require secretserver.io 3075630 or newer; "
+    "pass an ETag from get() as if_match or enable partial_updates"
+)
 
 # Marks an optional update argument the caller did not pass: it is omitted
 # from the request, so the server keeps the stored value. ``None`` is sent as
@@ -208,6 +218,15 @@ class SecretServerClient:
                   system trust store (public CAs remain trusted). TLS
                   verification cannot be disabled; ``verify_ssl=False`` raises
                   ValueError.
+
+    Partial updates (minimum server: secretserver.io 3075630):
+        ``update_secret``, ``update_jks_keystore`` and ``update_yubikey`` send
+        only the fields you pass. Older servers treat that PUT as a full
+        replace and silently blank the omitted fields, so these methods refuse
+        to send unless the client was built with ``partial_updates=True`` (or
+        env SS_PARTIAL_UPDATES=1 when the argument is omitted) or the call
+        passes an ETag (``"..."`` or ``W/"..."``) from a previous get() as
+        ``if_match``.
     """
 
     DEFAULT_URL = "https://api.secretserver.io"
@@ -220,6 +239,7 @@ class SecretServerClient:
         timeout: int = 10,
         verify_ssl: bool = True,
         ca_file: Optional[str] = None,
+        partial_updates: Optional[bool] = None,
     ):
         if verify_ssl is not True:
             raise ValueError("TLS verification cannot be disabled; pass ca_file to trust a private CA")
@@ -227,6 +247,9 @@ class SecretServerClient:
         self.api_url = _validate_base_url(api_url or os.environ.get("SS_API_URL", self.DEFAULT_URL))
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if partial_updates is None:
+            partial_updates = os.environ.get("SS_PARTIAL_UPDATES", "") == "1"
+        self.partial_updates = partial_updates is True
         self.timeout = timeout
         self._ssl_ctx = ssl.create_default_context()
         if ca_file:
@@ -339,6 +362,14 @@ class SecretServerClient:
             raise SecretServerError("Invalid server response")
         return ETagDict(result, etag)
 
+    def _require_partial_updates(self, if_match: Optional[str]) -> None:
+        """Refuse a partial PUT unless the caller opted in or holds a server ETag."""
+        if self.partial_updates:
+            return
+        if isinstance(if_match, str) and _ENTITY_TAG.fullmatch(if_match):
+            return
+        raise SecretServerError(_PARTIAL_UPDATES_REQUIRED)
+
     def _get_list(self, path: str, *envelope_keys: str) -> List[Dict[str, Any]]:
         data = self._get(path) or []
         if isinstance(data, list):
@@ -439,6 +470,12 @@ class SecretServerClient:
         number) and ``expected_version`` make the update conditional; a stale
         precondition raises ConflictError carrying the current ETag. The
         result's ``etag`` attribute is the updated record's ETag.
+
+        Minimum server: secretserver.io 3075630 (partial, conditional
+        updates). Raises SecretServerError without sending a request unless
+        the client has ``partial_updates`` enabled or ``if_match`` is an ETag
+        (``"..."`` or ``W/"..."``); a version number, ``*`` or
+        ``expected_version`` alone does not qualify.
         """
         body: Dict[str, Any] = {}
         if value is not _UNSET:
@@ -452,7 +489,9 @@ class SecretServerClient:
             if not isinstance(expected_version, int) or isinstance(expected_version, bool):
                 raise ValueError("expected_version must be an integer")
             body["expected_version"] = expected_version
-        return self._etag_call("PUT", f"/secrets/{_seg(name)}", body, _if_match(if_match, allow_version=True))
+        header = _if_match(if_match, allow_version=True)
+        self._require_partial_updates(header)
+        return self._etag_call("PUT", f"/secrets/{_seg(name)}", body, header)
 
     def delete_secret(self, name: str) -> None:
         self._delete(f"/secrets/{_seg(name)}")
@@ -537,10 +576,16 @@ class SecretServerClient:
         rotates the stored keystore password. ``if_match`` (an ETag from
         ``get_jks_keystore(...).etag``) makes the update conditional; a stale
         one raises ConflictError. The result's ``etag`` is the new ETag.
+
+        Minimum server: secretserver.io 3075630. Raises SecretServerError
+        without sending a request unless ``partial_updates`` is enabled or
+        ``if_match`` is an ETag (``"..."`` or ``W/"..."``).
         """
         if not isinstance(data, dict):
             raise ValueError("data must be a dict")
-        return self._etag_call("PUT", f"/jks-keystores/{_seg(keystore_id)}", dict(data), _if_match(if_match))
+        header = _if_match(if_match)
+        self._require_partial_updates(header)
+        return self._etag_call("PUT", f"/jks-keystores/{_seg(keystore_id)}", dict(data), header)
 
     def delete_jks_keystore(self, keystore_id: str) -> None:
         self._delete(f"/jks-keystores/{_seg(keystore_id)}")
@@ -1095,10 +1140,16 @@ class SecretServerClient:
         must be 12 characters. ``if_match`` (an ETag from
         ``get_yubikey(...).etag``) makes the update conditional; a stale one
         raises ConflictError. The result's ``etag`` is the new ETag.
+
+        Minimum server: secretserver.io 3075630. Raises SecretServerError
+        without sending a request unless ``partial_updates`` is enabled or
+        ``if_match`` is an ETag (``"..."`` or ``W/"..."``).
         """
         if not isinstance(data, dict):
             raise ValueError("data must be a dict")
-        return self._etag_call("PUT", f"/yubikeys/{_seg(yubikey_id)}", dict(data), _if_match(if_match))
+        header = _if_match(if_match)
+        self._require_partial_updates(header)
+        return self._etag_call("PUT", f"/yubikeys/{_seg(yubikey_id)}", dict(data), header)
 
     def delete_yubikey(self, yubikey_id: str) -> None:
         self._delete(f"/yubikeys/{_seg(yubikey_id)}")

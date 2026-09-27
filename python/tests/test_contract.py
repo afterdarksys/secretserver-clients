@@ -54,7 +54,7 @@ class Recorder:
 
 class ContractTests(unittest.TestCase):
     def setUp(self):
-        self.client = SecretServerClient("sk_test", "https://example.test")
+        self.client = SecretServerClient("sk_test", "https://example.test", partial_updates=True)
 
     def run_with(self, call, *responses):
         recorder = Recorder(*responses)
@@ -261,7 +261,7 @@ class ContractTests(unittest.TestCase):
     def test_conflict_raises_conflict_error_with_current_etag(self):
         current = '"2026-09-27T10:00:05.5Z"'
         key = "sk_conflict_key_do_not_leak"
-        client = SecretServerClient(key, "https://example.test")
+        client = SecretServerClient(key, "https://example.test", partial_updates=True)
         for call in (lambda: client.update_secret("db", "v", if_match='"stale"'),
                      lambda: client.update_jks_keystore(SID, {"notes": "n"}, if_match='"stale"'),
                      lambda: client.update_yubikey(SID, {"notes": "n"}, if_match='"stale"')):
@@ -279,6 +279,90 @@ class ContractTests(unittest.TestCase):
             with self.assertRaises(ConflictError) as ctx:
                 client.update_secret("db", "v")
         self.assertIsNone(ctx.exception.etag)
+
+
+
+class PartialUpdateGateTests(unittest.TestCase):
+    """Servers before 3075630 treat these PUTs as a full replace and ignore
+    If-Match, so partial bodies need an explicit opt-in or a server ETag."""
+
+    ETAGS = ('"2026-09-27T10:00:00.1Z"', 'W/"2026-09-27T10:00:00.1Z"', '""')
+    NOT_ETAGS = ("*", "7", "2026-09-27T10:00:00.1Z", '"unterminated', 'W/unquoted', '"a" "b"', 'w/"lower"')
+
+    def client(self, **kwargs):
+        return SecretServerClient("sk_gate_key_do_not_leak", "https://example.test", **kwargs)
+
+    @staticmethod
+    def updates(client, **kwargs):
+        return (lambda: client.update_secret("db", "v", **kwargs),
+                lambda: client.update_jks_keystore(SID, {"notes": "n"}, **kwargs),
+                lambda: client.update_yubikey(SID, {"notes": "n"}, **kwargs))
+
+    def assert_refused(self, call):
+        with patch(OPEN) as opened:
+            with self.assertRaises(SecretServerError) as ctx:
+                call()
+        opened.assert_not_called()
+        message = str(ctx.exception)
+        self.assertIn("partial updates require secretserver.io 3075630 or newer", message)
+        self.assertIn("pass an ETag from get() as if_match or enable partial_updates", message)
+        self.assertNotIn("sk_gate_key_do_not_leak", message)
+
+    def assert_sent(self, call, if_match=None):
+        recorder = Recorder(Response(b'{"message": "updated"}'))
+        with patch(OPEN, side_effect=recorder):
+            call()
+        self.assertEqual([c[0] for c in recorder.calls], ["PUT"])
+        self.assertEqual(recorder.headers[0].get("If-match"), if_match)
+
+    def test_refused_without_opt_in_or_etag(self):
+        with patch.dict("os.environ", {}, clear=True):
+            client = self.client()
+        self.assertFalse(client.partial_updates)
+        for call in self.updates(client):
+            self.assert_refused(call)
+
+    def test_refused_with_version_star_or_unquoted_if_match(self):
+        with patch.dict("os.environ", {}, clear=True):
+            client = self.client()
+        for call in (lambda: client.update_secret("db", "v", if_match=7),
+                     lambda: client.update_secret("db", "v", expected_version=7),
+                     lambda: client.update_secret("db", "v", if_match=7, expected_version=7)):
+            self.assert_refused(call)
+        for bad in self.NOT_ETAGS:
+            with self.subTest(if_match=bad):
+                for call in self.updates(client, if_match=bad):
+                    self.assert_refused(call)
+
+    def test_allowed_with_quoted_or_weak_etag(self):
+        with patch.dict("os.environ", {}, clear=True):
+            client = self.client()
+        for tag in self.ETAGS:
+            with self.subTest(if_match=tag):
+                for call in self.updates(client, if_match=tag):
+                    self.assert_sent(call, tag)
+
+    def test_allowed_with_constructor_opt_in(self):
+        with patch.dict("os.environ", {}, clear=True):
+            client = self.client(partial_updates=True)
+        for call in self.updates(client):
+            self.assert_sent(call)
+        self.assert_sent(lambda: client.update_secret("db", "v", if_match=7), "7")
+
+    def test_env_opt_in(self):
+        with patch.dict("os.environ", {"SS_PARTIAL_UPDATES": "1"}, clear=True):
+            client = self.client()
+        self.assertTrue(client.partial_updates)
+        for call in self.updates(client):
+            self.assert_sent(call)
+        for value in ("0", "true", "yes", ""):
+            with patch.dict("os.environ", {"SS_PARTIAL_UPDATES": value}, clear=True):
+                client = self.client()
+            self.assertFalse(client.partial_updates, value)
+            self.assert_refused(self.updates(client)[0])
+        with patch.dict("os.environ", {"SS_PARTIAL_UPDATES": "1"}, clear=True):
+            client = self.client(partial_updates=False)
+        self.assert_refused(self.updates(client)[0])
 
 
 if __name__ == "__main__":
