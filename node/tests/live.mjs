@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {SecretServerClient, AuthError, PermissionError, ConflictError, NotFoundError} from '../dist/index.js';
+// Only ever run against the disposable loopback stack: SS_LIVE_URL and SS_LIVE_KEY are
+// required and never fall back to SS_API_URL/SS_API_KEY or the production default.
+function refuse(msg){ console.error(`live test refused: ${msg}`); process.exit(2); }
+if (!process.env.SS_LIVE_URL) refuse('SS_LIVE_URL is not set');
+let liveHost;
+try { liveHost=new URL(process.env.SS_LIVE_URL).hostname; } catch { refuse('SS_LIVE_URL is not a valid URL'); }
+if (!['localhost','127.0.0.1','[::1]'].includes(liveHost)) refuse('SS_LIVE_URL host must be loopback (localhost, 127.0.0.1, ::1)');
+if (!process.env.SS_LIVE_KEY) refuse('SS_LIVE_KEY is not set');
+if (!process.env.SS_LIVE_WRITE_KEY) refuse('SS_LIVE_WRITE_KEY is not set');
 // This stack runs a partial-update server (3075630+), so both clients opt in.
 const c=new SecretServerClient({apiKey:process.env.SS_LIVE_KEY,apiUrl:process.env.SS_LIVE_URL,partialUpdates:true});
 // Key holding ONLY secrets:write.
