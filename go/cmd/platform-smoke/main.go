@@ -14,9 +14,34 @@ import (
 	ss "github.com/afterdarksys/secretserver-go/secretserver"
 )
 
+// liveEnv returns SS_LIVE_URL, SS_LIVE_KEY and SS_LIVE_WRITE_KEY, exiting
+// non-zero before any client exists unless all are set and the URL's host is
+// loopback. It never falls back to SS_API_URL, SS_API_KEY or the default
+// production URL.
+func liveEnv() (liveURL, key, writeKey string) {
+	liveURL, key, writeKey = os.Getenv("SS_LIVE_URL"), os.Getenv("SS_LIVE_KEY"), os.Getenv("SS_LIVE_WRITE_KEY")
+	fail := func(msg string) {
+		fmt.Fprintln(os.Stderr, "platform-smoke: "+msg)
+		os.Exit(2)
+	}
+	if liveURL == "" {
+		fail("SS_LIVE_URL must be set to a loopback test server (localhost, 127.0.0.1 or ::1)")
+	}
+	u, err := url.Parse(liveURL)
+	if err != nil || (u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1" && u.Hostname() != "::1") {
+		fail("SS_LIVE_URL host must be loopback (localhost, 127.0.0.1 or ::1); refusing to run against another host")
+	}
+	if key == "" || writeKey == "" {
+		fail("SS_LIVE_KEY and SS_LIVE_WRITE_KEY must be set")
+	}
+	return liveURL, key, writeKey
+}
+
 func main() {
-	key := os.Getenv("SS_LIVE_KEY")
-	c, e := ss.NewClient(&ss.Config{APIURL: os.Getenv("SS_LIVE_URL"), APIKey: key})
+	liveURL, key, writeKey := liveEnv()
+	// The live server is 3075630 or newer, so the clients opt in to partial
+	// updates; plain below proves the ETag path without the opt-in.
+	c, e := ss.NewClient(&ss.Config{APIURL: liveURL, APIKey: key, PartialUpdates: true})
 	must(e)
 	ctx := context.Background()
 	name := "go-live"
@@ -24,7 +49,7 @@ func main() {
 
 	// Wrong key -> 401 without key material in the error.
 	wrongKey := "sk_wrong_" + strings.Repeat("0", 40)
-	bad, e := ss.NewClient(&ss.Config{APIURL: os.Getenv("SS_LIVE_URL"), APIKey: wrongKey})
+	bad, e := ss.NewClient(&ss.Config{APIURL: liveURL, APIKey: wrongKey})
 	must(e)
 	_, e = bad.Secrets.List(ctx, nil)
 	var apiErr *ss.ErrorResponse
@@ -50,7 +75,7 @@ func main() {
 
 	// Partial update with a secrets:write-only key: no 403, value replaced,
 	// container/description/tags kept, and no secret.read audit entry.
-	writer, e := ss.NewClient(&ss.Config{APIURL: os.Getenv("SS_LIVE_URL"), APIKey: os.Getenv("SS_LIVE_WRITE_KEY")})
+	writer, e := ss.NewClient(&ss.Config{APIURL: liveURL, APIKey: writeKey, PartialUpdates: true})
 	must(e)
 	readsBefore := auditCount(ctx, c, "secret.read", name)
 	_, e = writer.Secrets.Update(ctx, name, &ss.SecretUpdateRequest{Data: map[string]string{"value": "second"}})
@@ -85,6 +110,24 @@ func main() {
 	check(errors.As(e, &conflict), "stale ETag did not return ConflictError")
 	check(conflict.ETag == updated.ETag, "conflict did not carry the current ETag")
 	check(!strings.Contains(e.Error(), key), "conflict error contains key")
+
+	// Without the opt-in an update is refused unless it carries an ETag from
+	// Get; with that ETag it succeeds.
+	plain, e := ss.NewClient(&ss.Config{APIURL: liveURL, APIKey: key})
+	must(e)
+	_, e = plain.Secrets.Update(ctx, name, &ss.SecretUpdateRequest{Description: &desc, IfMatch: "3"})
+	check(errors.Is(e, ss.ErrPartialUpdatesUnconfirmed), "update without opt-in or ETag was not refused")
+	cur, e := plain.Secrets.Get(ctx, name, nil)
+	must(e)
+	plainDesc := "etag without opt-in"
+	updated, e = plain.Secrets.Update(ctx, name, &ss.SecretUpdateRequest{Description: &plainDesc, IfMatch: cur.ETag})
+	must(e)
+	check(updated.ETag != "" && updated.ETag != cur.ETag, "ETag update without opt-in returned no new ETag")
+	cur, e = plain.Secrets.Get(ctx, name, nil)
+	must(e)
+	check(cur.Description == plainDesc && cur.Data["value"] == "second" && len(cur.Tags) == 2, "ETag update without opt-in changed other fields")
+	check(cur.ContainerID != nil && *cur.ContainerID == container, "ETag update without opt-in dropped container")
+	fmt.Println("partial update without opt-in: refused without ETag, applied with ETag from Get")
 	expected := updated.Version
 	_, e = c.Secrets.Update(ctx, name, &ss.SecretUpdateRequest{Description: &desc, ExpectedVersion: &expected})
 	must(e)
@@ -172,7 +215,7 @@ func main() {
 	fmt.Println("SKIP crypto signing keys: needs an operator-provisioned crypto backend and signing key binding")
 	fmt.Println("SKIP YubiKey OTP validation: needs the external Yubico validation service")
 
-	fmt.Println("verified: write-only partial update without secret.read audit, null clear, If-Match/expected_version 409, export/json, certificates, JKS, GPG, TOTP, YubiKey")
+	fmt.Println("verified: loopback-only live env, partial-update opt-in and ETag-without-opt-in, write-only partial update without secret.read audit, null clear, If-Match/expected_version 409, export/json, certificates, JKS, GPG, TOTP, YubiKey")
 	fmt.Println("Go live contract PASS")
 }
 
