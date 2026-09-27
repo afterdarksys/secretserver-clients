@@ -180,6 +180,8 @@ try {
   assert.match(pem,/^-----BEGIN CERTIFICATE-----/);
   const p12=await c.downloadCertificate(cert.id,{format:'p12',password:'Node-Live-Export-1'});
   assert.ok(p12 instanceof Uint8Array&&p12.byteLength>100&&p12[0]===0x30);
+  // pfx/p12 travel by POST; the server refuses a password in the URL.
+  await assert.rejects(c.request('GET',`/certificates/${cert.id}/download?format=pfx&password=Node-Live-Export-1`),e=>e instanceof SecretServerError&&e.statusCode===400);
 
   // JKS: create managed keystore, partial update (notes clear via null + password rotation), ETag conflict, delete.
   const jks=await c.createJKSKeystore({name:'node-live-jks',store_type:'managed',password:'Jks-First-1',container_id:container,notes:'jks notes',tags:['jks']});
