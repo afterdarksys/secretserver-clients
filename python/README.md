@@ -13,6 +13,24 @@ client.delete_secret("example")
 
 Use protected configuration for credentials; avoid logging returned values. Path reads use `container/name`, and history uses `container/name/2`. Generic request helpers support newer REST endpoints. Requests have a configurable timeout and do not automatically retry mutations. HTTP failures expose a status code without echoing response bodies.
 
+Updates are partial. `update_secret`, `update_jks_keystore` and `update_yubikey` send one `PUT` containing only what you supply: an omitted argument (or a key absent from the `data` dict) keeps the stored value, and `None` is sent as JSON `null`, which clears the field. A secret's value cannot be cleared; omit `value` to change only metadata. `update_secret` needs only `secrets:write` and never reads the secret.
+
+```python
+client.update_secret("example", description=None)          # clear the description, keep everything else
+client.update_jks_keystore(ks_id, {"notes": None, "password": "new"})  # clear notes, rotate password
+client.update_yubikey(yk_id, {"serial_number": None})
+```
+
+Optimistic concurrency: `get_secret`, `get_jks_keystore`, `get_yubikey` and the three update methods return an `ETagDict`, a plain `dict` whose `.etag` attribute is the response's `ETag` header (None when the server sends none). Pass it back as `if_match=`; `update_secret` also accepts a version number there, or `expected_version=`. A stale precondition raises `ConflictError` (a `SecretServerError`, status 409) whose `.etag` is the current ETag.
+
+```python
+record = client.get_secret("example")
+try:
+    client.update_secret("example", "new-value", if_match=record.etag)
+except ConflictError as exc:
+    ...  # re-read (exc.etag is the current ETag) and retry
+```
+
 Transport policy: `api_url` must be `https://` (plain `http://` is accepted only for `localhost`, `127.0.0.1` or `::1`), URLs with embedded credentials are rejected, TLS 1.2 is the minimum and certificate verification cannot be disabled (`verify_ssl=False` raises `ValueError`). To trust a private CA pass `ca_file="/path/to/ca.pem"`; the bundle is added to the system trust store, so public CAs stay trusted. Redirects are never followed, JSON responses are capped at 4 MiB (raw downloads at 16 MiB), and every caller-supplied path segment is percent-encoded.
 
 This source checkout includes fixes not yet published. See the repository compatibility matrix for validation scope.

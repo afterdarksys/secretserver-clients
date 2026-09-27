@@ -1,12 +1,14 @@
 """Offline tests pinning request shapes to the server's API contract."""
 
+import io
 import json
+import urllib.error
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from secretserver.client import SecretServerClient, SecretServerError
+from secretserver.client import ConflictError, ETagDict, SecretServerClient, SecretServerError
 
 OPEN = "urllib.request.OpenerDirector.open"
 SID = "0b6f2c1e-7a4d-4c55-9d8e-1f2a3b4c5d6e"
@@ -14,8 +16,9 @@ UID = "11111111-2222-4333-8444-555555555555"
 
 
 class Response:
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, headers=None):
         self.body = body
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -28,16 +31,24 @@ class Response:
 
 
 class Recorder:
-    """Replays queued responses and records (method, url, json body)."""
+    """Replays queued responses and records (method, url, json body).
+
+    Request headers are kept in ``headers`` (one dict per call); a queued
+    ``Response`` is returned as is, anything else is JSON-encoded.
+    """
 
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.headers = []
 
     def __call__(self, request, **_kwargs):
         body = json.loads(request.data) if request.data else None
         self.calls.append((request.get_method(), request.full_url, body))
+        self.headers.append(dict(request.header_items()))
         payload = self.responses.pop(0) if self.responses else {}
+        if isinstance(payload, Response):
+            return payload
         return Response(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
 
 
@@ -189,18 +200,85 @@ class ContractTests(unittest.TestCase):
         result, _ = self.run_with(lambda: self.client.decode("{}", "json"), {"result": {"a": 1}})
         self.assertEqual(result, {"a": 1})
 
-    def test_jks_and_yubikey_updates_read_merge_write(self):
-        current = {"id": SID, "name": "ks", "notes": "n", "tags": ["x"], "container_id": UID, "store_type": "raw"}
-        _, calls = self.run_with(lambda: self.client.update_jks_keystore(SID, {"notes": "new"}), current, {})
-        self.assertEqual([c[0] for c in calls], ["GET", "PUT"])
-        self.assertEqual(calls[1][2], {"container_id": UID, "name": "ks", "notes": "new", "tags": ["x"]})
+    def test_jks_and_yubikey_updates_send_only_supplied_fields(self):
+        _, calls = self.run_with(lambda: self.client.update_jks_keystore(SID, {"notes": None, "password": "pw2"}))
+        self.assertEqual([c[0] for c in calls], ["PUT"])
+        self.assertTrue(calls[0][1].endswith(f"/api/v1/jks-keystores/{SID}"))
+        self.assertEqual(calls[0][2], {"notes": None, "password": "pw2"})
 
-        yubi = {"id": SID, "name": "yk", "public_id": "cccccccccccb", "client_id": "1", "validation_server": "v",
-                "serial_number": "9", "notes": "", "tags": None}
-        _, calls = self.run_with(lambda: self.client.update_yubikey(SID, {"name": "renamed"}), yubi, {})
-        self.assertEqual(calls[1][2]["name"], "renamed")
-        self.assertEqual(calls[1][2]["public_id"], "cccccccccccb")
-        self.assertNotIn("api_key", calls[1][2])
+        _, calls = self.run_with(lambda: self.client.update_yubikey(SID, {"serial_number": None, "name": "renamed"}))
+        self.assertEqual([c[0] for c in calls], ["PUT"])
+        self.assertEqual(calls[0][2], {"serial_number": None, "name": "renamed"})
+        for bad in (None, [("name", "x")]):
+            with self.assertRaises(ValueError):
+                self.client.update_yubikey(SID, bad)
+            with self.assertRaises(ValueError):
+                self.client.update_jks_keystore(SID, bad)
+
+    def test_get_methods_expose_the_etag_header(self):
+        tag = '"2026-09-27T10:00:00.123456789Z"'
+        for call, path in ((lambda: self.client.get_secret("db"), "/secrets/db"),
+                           (lambda: self.client.get_jks_keystore(SID), f"/jks-keystores/{SID}"),
+                           (lambda: self.client.get_yubikey(SID), f"/yubikeys/{SID}")):
+            record, calls = self.run_with(call, Response(b'{"id": "x", "name": "n"}', {"ETag": tag}))
+            self.assertIsInstance(record, ETagDict)
+            self.assertEqual(record, {"id": "x", "name": "n"})
+            self.assertEqual(record.etag, tag)
+            self.assertTrue(calls[0][1].endswith("/api/v1" + path))
+        record, _ = self.run_with(lambda: self.client.get_secret("prod/db"), {"name": "db"})
+        self.assertIsNone(record.etag)
+
+    def test_updates_send_if_match_and_return_the_new_etag(self):
+        tag, new = '"2026-09-27T10:00:00.1Z"', '"2026-09-27T10:00:01.2Z"'
+        for call in (lambda: self.client.update_secret("db", "v", if_match=tag),
+                     lambda: self.client.update_jks_keystore(SID, {"notes": "n"}, if_match=tag),
+                     lambda: self.client.update_yubikey(SID, {"notes": "n"}, if_match=tag)):
+            recorder = Recorder(Response(b'{"message": "updated"}', {"ETag": new}))
+            with patch(OPEN, side_effect=recorder):
+                result = call()
+            self.assertEqual(recorder.headers[0]["If-match"], tag)
+            self.assertEqual(result.etag, new)
+        recorder = Recorder({})
+        with patch(OPEN, side_effect=recorder):
+            self.client.update_secret("db", "v")
+            self.client.update_secret("db", "v", if_match=7, expected_version=7)
+        self.assertNotIn("If-match", recorder.headers[0])
+        self.assertEqual(recorder.headers[1]["If-match"], "7")
+        self.assertEqual(recorder.calls[1][2], {"data": {"value": "v"}, "expected_version": 7})
+
+    def test_if_match_rejects_header_injection_and_bad_types(self):
+        with patch(OPEN) as opened:
+            for bad in ("", "  ", '"x"\r\nX-Evil: 1', "a\nb", "a\x00b", True, 1.5):
+                with self.assertRaises(ValueError):
+                    self.client.update_secret("db", "v", if_match=bad)
+            for bad in (7, '"x"\r\nX-Evil: 1'):
+                with self.assertRaises(ValueError):
+                    self.client.update_jks_keystore(SID, {"notes": "n"}, if_match=bad)
+                with self.assertRaises(ValueError):
+                    self.client.update_yubikey(SID, {"notes": "n"}, if_match=bad)
+        opened.assert_not_called()
+
+    def test_conflict_raises_conflict_error_with_current_etag(self):
+        current = '"2026-09-27T10:00:05.5Z"'
+        key = "sk_conflict_key_do_not_leak"
+        client = SecretServerClient(key, "https://example.test")
+        for call in (lambda: client.update_secret("db", "v", if_match='"stale"'),
+                     lambda: client.update_jks_keystore(SID, {"notes": "n"}, if_match='"stale"'),
+                     lambda: client.update_yubikey(SID, {"notes": "n"}, if_match='"stale"')):
+            error = urllib.error.HTTPError("https://example.test", 409, "Conflict", {"ETag": current},
+                                           io.BytesIO(b'{"error": "body-must-not-leak"}'))
+            with patch(OPEN, side_effect=error):
+                with self.assertRaises(ConflictError) as ctx:
+                    call()
+            self.assertIsInstance(ctx.exception, SecretServerError)
+            self.assertEqual((ctx.exception.status_code, ctx.exception.etag), (409, current))
+            self.assertNotIn(key, str(ctx.exception))
+            self.assertNotIn("body-must-not-leak", str(ctx.exception))
+        error = urllib.error.HTTPError("https://example.test", 409, "Conflict", None, io.BytesIO(b""))
+        with patch(OPEN, side_effect=error):
+            with self.assertRaises(ConflictError) as ctx:
+                client.update_secret("db", "v")
+        self.assertIsNone(ctx.exception.etag)
 
 
 if __name__ == "__main__":

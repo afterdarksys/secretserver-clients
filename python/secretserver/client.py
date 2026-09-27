@@ -10,13 +10,15 @@ import ssl
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlsplit
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_RAW_BYTES = 16 * 1024 * 1024
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 
-# Marks an optional update argument the caller did not pass ("keep current").
+# Marks an optional update argument the caller did not pass: it is omitted
+# from the request, so the server keeps the stored value. ``None`` is sent as
+# JSON null, which clears the field.
 _UNSET: Any = object()
 
 # Values accepted by the server for :type in history, share and temp-access routes.
@@ -45,6 +47,30 @@ class PermissionError(SecretServerError):
 
 class NotFoundError(SecretServerError):
     """Raised on 404 Not Found."""
+
+
+class ConflictError(SecretServerError):
+    """Raised on 409 Conflict, e.g. a stale If-Match on an update.
+
+    ``etag`` is the resource's current ETag from the response header (or
+    None when the server sent none); re-read the resource and retry with it.
+    """
+    def __init__(self, message: str, status_code: int = 409, etag: Optional[str] = None):
+        super().__init__(message, status_code)
+        self.etag = etag
+
+
+class ETagDict(dict):
+    """A response object that also carries the response's ``ETag`` header.
+
+    It behaves exactly like the dict the server returned; ``etag`` is the
+    header value (for example ``'"2026-09-27T10:00:00.123456789Z"'``) or None
+    when the server sent none. Pass it back as ``if_match`` to make an update
+    conditional.
+    """
+    def __init__(self, data: Dict[str, Any], etag: Optional[str] = None):
+        super().__init__(data)
+        self.etag = etag
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -84,6 +110,17 @@ def _seg(value: Any) -> str:
     if text in ("", ".", ".."):
         raise ValueError("path segment must not be empty, '.' or '..'")
     return quote(text, safe="")
+
+
+def _if_match(value: Any, allow_version: bool = False) -> Optional[str]:
+    """Validate an If-Match value: an ETag string or, where allowed, a version number."""
+    if value is None:
+        return None
+    if allow_version and isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if not isinstance(value, str) or not value.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError("if_match must be a non-empty ETag string" + (" or a version number" if allow_version else ""))
+    return value
 
 
 def _secret_type(secret_type: str) -> str:
@@ -228,7 +265,8 @@ class SecretServerClient:
         """
         return self._send(method, path, body)
 
-    def _send(self, method: str, path: str, body: Optional[Any] = None, raw: bool = False) -> Any:
+    def _send(self, method: str, path: str, body: Optional[Any] = None, raw: bool = False,
+              if_match: Optional[str] = None, with_etag: bool = False) -> Any:
         method = method.upper()
         if not path.startswith("/"):
             path = "/" + path
@@ -241,17 +279,23 @@ class SecretServerClient:
         headers = self._headers()
         if raw:
             headers["Accept"] = "*/*"
+        if if_match is not None:
+            headers["If-Match"] = if_match
         limit = _MAX_RAW_BYTES if raw else _MAX_JSON_BYTES
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=self._ssl_ctx))
             with opener.open(req, timeout=self.timeout) as resp:
                 payload = resp.read(limit + 1)
+                resp_headers = getattr(resp, "headers", None)
             if len(payload) > limit:
                 raise SecretServerError("Response too large")
             if raw:
                 return payload
-            return json.loads(payload) if payload else None
+            result = json.loads(payload) if payload else None
+            if with_etag:
+                return result, resp_headers.get("ETag") if resp_headers is not None else None
+            return result
         except urllib.error.HTTPError as e:
             e.close()
             detail = f"SecretServer request failed (HTTP {e.code})"
@@ -261,6 +305,8 @@ class SecretServerClient:
                 raise PermissionError(detail, status_code=403) from None
             if e.code == 404:
                 raise NotFoundError(detail, status_code=404) from None
+            if e.code == 409:
+                raise ConflictError(detail, etag=e.headers.get("ETag") if e.headers is not None else None) from None
             raise SecretServerError(detail, status_code=e.code) from None
         except (ValueError, UnicodeError):
             raise SecretServerError("Invalid server response") from None
@@ -285,6 +331,13 @@ class SecretServerClient:
 
     def _delete(self, path: str) -> Any:
         return self._request("DELETE", path)
+
+    def _etag_call(self, method: str, path: str, body: Optional[Any] = None,
+                   if_match: Optional[str] = None) -> ETagDict:
+        result, etag = self._send(method, path, body, if_match=if_match, with_etag=True)
+        if not isinstance(result, dict):
+            raise SecretServerError("Invalid server response")
+        return ETagDict(result, etag)
 
     def _get_list(self, path: str, *envelope_keys: str) -> List[Dict[str, Any]]:
         data = self._get(path) or []
@@ -341,9 +394,13 @@ class SecretServerClient:
         """
         return _scalar(self._get(_secret_route(path)))
 
-    def get_secret(self, path: str) -> Dict[str, Any]:
-        """Get the full secret record for a name, container/key or container/key/version."""
-        return self._get(_secret_route(path))
+    def get_secret(self, path: str) -> ETagDict:
+        """Get the full secret record for a name, container/key or container/key/version.
+
+        The result's ``etag`` attribute holds the ETag header (reads by name
+        carry one; pass it as ``update_secret(..., if_match=...)``).
+        """
+        return self._etag_call("GET", _secret_route(path))
 
     # ------------------------------------------------------------------
     # Secrets
@@ -364,31 +421,38 @@ class SecretServerClient:
     def update_secret(
         self,
         name: str,
-        value: str,
+        value: str = _UNSET,
         description: Optional[str] = _UNSET,
         tags: Optional[List[str]] = _UNSET,
         container_id: Optional[str] = _UNSET,
-    ) -> Dict:
-        """Replace a secret's value, keeping metadata the caller does not override.
+        if_match: Union[str, int, None] = None,
+        expected_version: Optional[int] = None,
+    ) -> ETagDict:
+        """Partially update a secret; only the arguments you pass are sent.
 
-        The server's PUT replaces description, tags and container_id, so the
-        current record is read first and its metadata carried over. Omitting an
-        argument keeps the current value; passing ``None`` clears it
-        (``container_id=None`` detaches the secret from its container,
-        ``description=None`` sends ``""`` and ``tags=None`` sends ``[]``).
+        An omitted argument keeps the stored value; ``None`` sends JSON null,
+        which clears it (``container_id=None`` detaches the secret from its
+        container). Omitting ``value`` leaves the stored value untouched; it
+        cannot be cleared. Needs only secrets:write and never reads the value.
+
+        ``if_match`` (an ETag from ``get_secret(...).etag`` or a version
+        number) and ``expected_version`` make the update conditional; a stale
+        precondition raises ConflictError carrying the current ETag. The
+        result's ``etag`` attribute is the updated record's ETag.
         """
-        route = f"/secrets/{_seg(name)}"
-        current = self._get(route)
-        if not isinstance(current, dict):
-            raise SecretServerError("Invalid secret response")
-        body: Dict[str, Any] = {
-            "name": name,
-            "data": {"value": value},
-            "description": current.get("description", "") if description is _UNSET else (description or ""),
-            "tags": (current.get("tags") or []) if tags is _UNSET else (tags or []),
-            "container_id": current.get("container_id") if container_id is _UNSET else container_id,
-        }
-        return self._put(route, body)
+        body: Dict[str, Any] = {}
+        if value is not _UNSET:
+            if value is None:
+                raise ValueError("value cannot be cleared; omit it to keep the current value")
+            body["data"] = {"value": value}
+        for key, arg in (("description", description), ("tags", tags), ("container_id", container_id)):
+            if arg is not _UNSET:
+                body[key] = arg
+        if expected_version is not None:
+            if not isinstance(expected_version, int) or isinstance(expected_version, bool):
+                raise ValueError("expected_version must be an integer")
+            body["expected_version"] = expected_version
+        return self._etag_call("PUT", f"/secrets/{_seg(name)}", body, _if_match(if_match, allow_version=True))
 
     def delete_secret(self, name: str) -> None:
         self._delete(f"/secrets/{_seg(name)}")
@@ -456,21 +520,27 @@ class SecretServerClient:
     def list_jks_keystores(self) -> List[Dict[str, Any]]:
         return self._get("/jks-keystores") or []
 
-    def get_jks_keystore(self, keystore_id: str) -> Dict[str, Any]:
-        return self._get(f"/jks-keystores/{_seg(keystore_id)}")
+    def get_jks_keystore(self, keystore_id: str) -> ETagDict:
+        """Get a keystore; the result's ``etag`` attribute holds its ETag."""
+        return self._etag_call("GET", f"/jks-keystores/{_seg(keystore_id)}")
 
     def create_jks_keystore(self, name: str, store_type: str = "managed", **options: Any) -> Dict[str, Any]:
         return self._post("/jks-keystores", {"name": name, "store_type": store_type, **options})
 
-    def update_jks_keystore(self, keystore_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Update a keystore; fields absent from ``data`` keep their current values."""
-        route = f"/jks-keystores/{_seg(keystore_id)}"
-        current = self._get(route)
-        if not isinstance(current, dict):
-            raise SecretServerError("Invalid keystore response")
-        body = {key: current.get(key) for key in ("container_id", "name", "notes", "tags")}
-        body.update(data)
-        return self._put(route, body)
+    def update_jks_keystore(self, keystore_id: str, data: Dict[str, Any],
+                            if_match: Optional[str] = None) -> ETagDict:
+        """Partially update a keystore with exactly the fields in ``data``.
+
+        A key absent from ``data`` keeps the stored value; a key set to None is
+        sent as JSON null and clears ``notes``, ``tags`` or ``container_id``.
+        ``jks`` (raw keystores) must come with ``password``; ``password`` alone
+        rotates the stored keystore password. ``if_match`` (an ETag from
+        ``get_jks_keystore(...).etag``) makes the update conditional; a stale
+        one raises ConflictError. The result's ``etag`` is the new ETag.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("data must be a dict")
+        return self._etag_call("PUT", f"/jks-keystores/{_seg(keystore_id)}", dict(data), _if_match(if_match))
 
     def delete_jks_keystore(self, keystore_id: str) -> None:
         self._delete(f"/jks-keystores/{_seg(keystore_id)}")
@@ -1000,8 +1070,9 @@ class SecretServerClient:
     def list_yubikeys(self) -> List[Dict]:
         return self._get("/yubikeys") or []
 
-    def get_yubikey(self, yubikey_id: str) -> Dict:
-        return self._get(f"/yubikeys/{_seg(yubikey_id)}")
+    def get_yubikey(self, yubikey_id: str) -> ETagDict:
+        """Get a YubiKey; the result's ``etag`` attribute holds its ETag."""
+        return self._etag_call("GET", f"/yubikeys/{_seg(yubikey_id)}")
 
     def create_yubikey(self, name: str, public_id: str, client_id: str, api_key: str,
                        serial_number: str = "", validation_server: str = "", notes: str = "") -> Dict:
@@ -1014,21 +1085,20 @@ class SecretServerClient:
             body["notes"] = notes
         return self._post("/yubikeys", body)
 
-    YUBIKEY_FIELDS = ("container_id", "name", "serial_number", "public_id", "client_id",
-                      "validation_server", "notes", "tags")
+    def update_yubikey(self, yubikey_id: str, data: Dict[str, Any],
+                       if_match: Optional[str] = None) -> ETagDict:
+        """Partially update a YubiKey with exactly the fields in ``data``.
 
-    def update_yubikey(self, yubikey_id: str, data: Dict) -> Dict:
-        """Update a YubiKey; fields absent from ``data`` keep their current values.
-
-        ``api_key`` is only sent when supplied in ``data``.
+        A key absent from ``data`` keeps the stored value; a key set to None is
+        sent as JSON null and clears ``serial_number``, ``notes``, ``tags`` or
+        ``container_id``. ``api_key`` replaces the stored key; ``public_id``
+        must be 12 characters. ``if_match`` (an ETag from
+        ``get_yubikey(...).etag``) makes the update conditional; a stale one
+        raises ConflictError. The result's ``etag`` is the new ETag.
         """
-        route = f"/yubikeys/{_seg(yubikey_id)}"
-        current = self._get(route)
-        if not isinstance(current, dict):
-            raise SecretServerError("Invalid yubikey response")
-        body = {key: current.get(key) for key in self.YUBIKEY_FIELDS}
-        body.update(data)
-        return self._put(route, body)
+        if not isinstance(data, dict):
+            raise ValueError("data must be a dict")
+        return self._etag_call("PUT", f"/yubikeys/{_seg(yubikey_id)}", dict(data), _if_match(if_match))
 
     def delete_yubikey(self, yubikey_id: str) -> None:
         self._delete(f"/yubikeys/{_seg(yubikey_id)}")

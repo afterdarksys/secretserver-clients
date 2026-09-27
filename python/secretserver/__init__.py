@@ -1,11 +1,21 @@
 """SecretServer.io Python client library."""
 
-from .client import SecretServerClient, SecretServerError, AuthError, NotFoundError, PermissionError
+from .client import (
+    AuthError,
+    ConflictError,
+    ETagDict,
+    NotFoundError,
+    PermissionError,
+    SecretServerClient,
+    SecretServerError,
+)
 
 __all__ = [
     "SecretServerClient",
     "SecretServerError",
     "AuthError",
+    "ConflictError",
+    "ETagDict",
     "NotFoundError",
     "PermissionError",
 ]

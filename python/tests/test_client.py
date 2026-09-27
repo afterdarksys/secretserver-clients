@@ -32,53 +32,52 @@ class ClientContractTests(unittest.TestCase):
             self.assertEqual(client.list_secrets()[0]["name"], "db")
         self.assertEqual(urlopen.call_args.args[0].full_url, "https://example.test/api/v1/secrets")
 
-    def test_update_preserves_metadata_and_enrollment_matches_backend_fields(self):
+    def test_update_sends_one_put_with_only_supplied_fields(self):
         client = SecretServerClient("sk_test", "https://example.test")
-        container = "5f0c5a4e-1111-4222-8333-444455556666"
         calls = []
 
         def respond(request, **_kwargs):
             calls.append((request.get_method(), request.full_url, json.loads(request.data) if request.data else None))
-            if request.get_method() == "GET":
-                return FakeResponse({"name": "db", "description": "keep", "tags": ["t"], "container_id": container})
             return FakeResponse({})
 
         with patch("urllib.request.OpenerDirector.open", side_effect=respond):
             client.update_secret("db", "new")
-            client.update_secret("db", "newer", description="changed", tags=[])
+            client.update_secret("db", description="changed", tags=[])
             client.enroll_certificate("wildcard", "example.test", ["www.example.test"])
 
-        self.assertEqual([c[0] for c in calls], ["GET", "PUT", "GET", "PUT", "POST"])
-        self.assertEqual(calls[1][2], {"name": "db", "data": {"value": "new"}, "description": "keep",
-                                       "tags": ["t"], "container_id": container})
-        self.assertEqual(calls[3][2]["description"], "changed")
-        self.assertEqual(calls[3][2]["tags"], [])
-        self.assertEqual(calls[3][2]["container_id"], container)
-        self.assertEqual(calls[4][2]["dns_names"], ["www.example.test"])
-        self.assertNotIn("sans", calls[4][2])
+        self.assertEqual([c[0] for c in calls], ["PUT", "PUT", "POST"])
+        self.assertTrue(calls[0][1].endswith("/api/v1/secrets/db"))
+        self.assertEqual(calls[0][2], {"data": {"value": "new"}})
+        self.assertEqual(calls[1][2], {"description": "changed", "tags": []})
+        self.assertEqual(calls[2][2]["dns_names"], ["www.example.test"])
+        self.assertNotIn("sans", calls[2][2])
 
     def test_update_distinguishes_omitted_from_cleared_metadata(self):
         client = SecretServerClient("sk_test", "https://example.test")
-        container = "5f0c5a4e-1111-4222-8333-444455556666"
         puts = []
 
         def respond(request, **_kwargs):
-            if request.get_method() == "GET":
-                return FakeResponse({"name": "db", "description": "keep", "tags": ["t"], "container_id": container})
-            puts.append(json.loads(request.data))
+            puts.append(request.data.decode())
             return FakeResponse({})
 
         with patch("urllib.request.OpenerDirector.open", side_effect=respond):
             client.update_secret("db", "kept")
-            client.update_secret("db", "cleared", description=None, tags=None, container_id=None)
-            client.update_secret("db", "moved", container_id="6f0c5a4e-1111-4222-8333-444455556666")
+            client.update_secret("db", description=None, tags=None, container_id=None)
+            client.update_secret("db", container_id="6f0c5a4e-1111-4222-8333-444455556666")
 
-        self.assertEqual((puts[0]["description"], puts[0]["tags"], puts[0]["container_id"]), ("keep", ["t"], container))
-        self.assertEqual((puts[1]["description"], puts[1]["tags"]), ("", []))
-        self.assertIn("container_id", puts[1])
-        self.assertIsNone(puts[1]["container_id"])
-        self.assertEqual(puts[2]["container_id"], "6f0c5a4e-1111-4222-8333-444455556666")
-        self.assertEqual((puts[2]["description"], puts[2]["tags"]), ("keep", ["t"]))
+        self.assertEqual(json.loads(puts[0]), {"data": {"value": "kept"}})
+        self.assertEqual(json.loads(puts[1]), {"description": None, "tags": None, "container_id": None})
+        self.assertIn('"description": null', puts[1])
+        self.assertEqual(json.loads(puts[2]), {"container_id": "6f0c5a4e-1111-4222-8333-444455556666"})
+
+    def test_update_refuses_to_clear_the_value(self):
+        client = SecretServerClient("sk_test", "https://example.test")
+        with patch("urllib.request.OpenerDirector.open") as urlopen:
+            with self.assertRaises(ValueError):
+                client.update_secret("db", None)
+            with self.assertRaises(ValueError):
+                client.update_secret("db", "v", expected_version="3")
+        urlopen.assert_not_called()
 
     def test_path_envelope_and_empty_value(self):
         client = SecretServerClient("sk_test", "https://example.test")
