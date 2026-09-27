@@ -47,6 +47,7 @@ class SecretServerClient
     private int     $timeout;
     private bool    $allowHttp;
     private ?string $caFile;
+    private bool    $partialUpdates;
 
     /**
      * Threats: rejects plaintext transport to non-loopback hosts, credentials
@@ -61,6 +62,10 @@ class SecretServerClient
      * @param bool        $verifySsl Kept for signature compatibility; TLS verification
      *                               cannot be disabled and false throws.
      * @param string|null $caFile    PEM bundle used to trust a private CA
+     * @param bool        $partialUpdates Opt in to partial updates (updateSecret,
+     *                               updateJKSKeystore, updateYubikey) without an ETag.
+     *                               Only safe against secretserver.io 3075630 or newer;
+     *                               also enabled by SS_PARTIAL_UPDATES=1.
      * @throws AuthException|SecretServerException
      */
     public function __construct(
@@ -68,7 +73,8 @@ class SecretServerClient
         ?string $apiUrl   = null,
         int     $timeout  = 10,
         bool    $verifySsl = true,
-        ?string $caFile   = null
+        ?string $caFile   = null,
+        bool    $partialUpdates = false
     ) {
         $this->apiKey    = $apiKey ?? (string) getenv('SS_API_KEY');
         $this->apiUrl    = rtrim($apiUrl ?? (string)(getenv('SS_API_URL') ?: self::DEFAULT_URL), '/');
@@ -76,6 +82,7 @@ class SecretServerClient
             $this->apiUrl = substr($this->apiUrl, 0, -7);
         }
         $this->timeout   = $timeout;
+        $this->partialUpdates = $partialUpdates || getenv('SS_PARTIAL_UPDATES') === '1';
 
         if ($this->apiKey === '') {
             throw new AuthException('No API key provided. Pass $apiKey or set SS_API_KEY env var.');
@@ -104,6 +111,33 @@ class SecretServerClient
         if ($scheme === 'http' && !$this->allowHttp) {
             throw new SecretServerException('SecretServer base URL must use https (http is allowed only for loopback hosts)');
         }
+    }
+
+    /**
+     * Enable or disable partial updates without an ETag. Servers older than
+     * secretserver.io 3075630 treat these PUTs as a full replace and blank
+     * omitted fields, so enable this only against 3075630 or newer.
+     */
+    public function setPartialUpdates(bool $enabled): static
+    {
+        $this->partialUpdates = $enabled;
+        return $this;
+    }
+
+    /**
+     * Refuse a partial update unless the caller opted in or passes an ETag
+     * previously received from the server (strong "..." or weak W/"...").
+     * An old server ignores If-Match, so a version number, "*" or an
+     * unquoted value does not prove partial-update support.
+     *
+     * @throws SecretServerException
+     */
+    private function requirePartialUpdates(string|int|null $ifMatch): void
+    {
+        if ($this->partialUpdates || (is_string($ifMatch) && preg_match('#^(W/)?"[\x21\x23-\x7e]*"$#', $ifMatch) === 1)) {
+            return;
+        }
+        throw new SecretServerException('partial updates require secretserver.io 3075630 or newer; pass an ETag from get() as if_match or enable partial_updates');
     }
 
     /**
@@ -236,7 +270,10 @@ class SecretServerClient
     }
 
     /**
-     * Partially update a secret. Only what the caller supplies is sent:
+     * Partially update a secret. Minimum server: secretserver.io 3075630
+     * (partial, conditional updates). Refused client-side unless the client
+     * opted in ($partialUpdates / setPartialUpdates() / SS_PARTIAL_UPDATES=1)
+     * or $ifMatch is an ETag from getSecret(). Only what the caller supplies is sent:
      * a null $value keeps the stored value; a key absent from $opts keeps
      * that field; a key present with null clears it (description, tags,
      * container_id). Needs only secrets:write and does not read the value.
@@ -252,6 +289,7 @@ class SecretServerClient
      */
     public function updateSecret(string $name, ?string $value = null, array $opts = [], string|int|null $ifMatch = null): array
     {
+        $this->requirePartialUpdates($ifMatch);
         $body = self::patchFields($opts, ['description', 'tags', 'container_id', 'expected_version']);
         if (array_key_exists('expected_version', $body) && !is_int($body['expected_version'])) {
             throw new SecretServerException('expected_version must be an integer');
@@ -353,7 +391,10 @@ class SecretServerClient
     }
 
     /**
-     * Partially update a keystore. A key absent from $data keeps that field; a
+     * Partially update a keystore. Minimum server: secretserver.io 3075630
+     * (partial, conditional updates). Refused client-side unless the client
+     * opted in ($partialUpdates / setPartialUpdates() / SS_PARTIAL_UPDATES=1)
+     * or $ifMatch is an ETag from getJKSKeystore(). A key absent from $data keeps that field; a
      * key present with null clears it (notes, tags, container_id). 'password'
      * alone rotates the stored password; 'jks' (raw keystores) requires 'password'.
      * $ifMatch is an ETag; on mismatch ConflictException carries the current one.
@@ -365,6 +406,7 @@ class SecretServerClient
      */
     public function updateJKSKeystore(string $id, array $data, ?string $ifMatch = null): array
     {
+        $this->requirePartialUpdates($ifMatch);
         $body = self::patchFields($data, ['name', 'notes', 'tags', 'container_id', 'password', 'jks']);
         if (array_key_exists('jks', $body) && !array_key_exists('password', $body)) {
             throw new SecretServerException('jks requires password');
@@ -930,7 +972,10 @@ class SecretServerClient
     }
 
     /**
-     * Partially update a YubiKey. A key absent from $data keeps that field; a
+     * Partially update a YubiKey. Minimum server: secretserver.io 3075630
+     * (partial, conditional updates). Refused client-side unless the client
+     * opted in ($partialUpdates / setPartialUpdates() / SS_PARTIAL_UPDATES=1)
+     * or $ifMatch is an ETag from getYubikey(). A key absent from $data keeps that field; a
      * key present with null clears it (notes, tags, container_id,
      * serial_number). 'api_key' replaces the stored key; 'public_id' must be
      * 12 characters. $ifMatch is an ETag; on mismatch ConflictException
@@ -943,6 +988,7 @@ class SecretServerClient
      */
     public function updateYubikey(string $id, array $data, ?string $ifMatch = null): array
     {
+        $this->requirePartialUpdates($ifMatch);
         $body = self::patchFields($data, [
             'name', 'notes', 'tags', 'container_id', 'serial_number', 'public_id', 'client_id', 'api_key', 'validation_server',
         ]);

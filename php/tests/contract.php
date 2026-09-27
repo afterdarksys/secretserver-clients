@@ -40,6 +40,7 @@ function expectFailure(callable $fn, string $what): SecretServerException
 }
 
 $client = new SecretServerClient('sk_test', $baseURL . '/api/v1');
+$partial = new SecretServerClient('sk_test', $baseURL . '/api/v1', 10, true, null, true);
 
 // ---------------------------------------------------------------------------
 // Security policy: construction
@@ -145,59 +146,111 @@ try {
 // Contract
 // ---------------------------------------------------------------------------
 
+// Partial updates need an explicit opt-in or a server ETag (A1): an old
+// server treats PUT as a full replace and ignores If-Match.
+putenv('SS_PARTIAL_UPDATES');
+$partialError = 'partial updates require secretserver.io 3075630 or newer; pass an ETag from get() as if_match or enable partial_updates';
+// Port 1 on loopback is closed: a request that was actually sent would fail
+// with "SecretServer connection failed" instead of the partial-update error.
+$offline = new SecretServerClient('sk_test', 'http://127.0.0.1:1');
+$refusals = [
+    'updateSecret without opt-in or ETag' => fn () => $offline->updateSecret('s', 'v'),
+    'updateSecret with version-only If-Match' => fn () => $offline->updateSecret('s', 'v', [], 3),
+    'updateSecret with numeric-string If-Match' => fn () => $offline->updateSecret('s', 'v', [], '3'),
+    'updateSecret with * If-Match' => fn () => $offline->updateSecret('s', 'v', [], '*'),
+    'updateSecret with unquoted If-Match' => fn () => $offline->updateSecret('s', 'v', [], '2026-01-01T00:00:00Z'),
+    'updateSecret with half-quoted If-Match' => fn () => $offline->updateSecret('s', 'v', [], '"abc'),
+    'updateSecret with lowercase w/ If-Match' => fn () => $offline->updateSecret('s', 'v', [], 'w/"abc"'),
+    'updateSecret with expected_version only' => fn () => $offline->updateSecret('s', 'v', ['expected_version' => 3]),
+    'updateJKSKeystore without opt-in or ETag' => fn () => $offline->updateJKSKeystore('j1', ['notes' => null]),
+    'updateJKSKeystore with * If-Match' => fn () => $offline->updateJKSKeystore('j1', ['notes' => null], '*'),
+    'updateYubikey without opt-in or ETag' => fn () => $offline->updateYubikey('y1', ['name' => 'n']),
+    'updateYubikey with unquoted If-Match' => fn () => $offline->updateYubikey('y1', ['name' => 'n'], 'abc'),
+];
+foreach ($refusals as $what => $fn) {
+    $e = expectFailure($fn, "$what refused");
+    check($e->getMessage() === $partialError && $e->getCode() === 0, "$what refused client-side before any request");
+}
+// Against a reachable fixture the refusal still comes from the client.
+$e = expectFailure(fn () => $client->updateSecret('prod/db', 'v'), 'refused against a live fixture too');
+check($e->getMessage() === $partialError, 'refusal message names the minimum server and both remedies');
+
+// Allowed: quoted and weak ETags without opt-in.
+check($client->updateSecret('prod/db', 'v', [], '"2026-01-01T00:00:00Z"')['if_match'] === '"2026-01-01T00:00:00Z"', 'quoted ETag allows updateSecret without opt-in');
+check($client->updateSecret('prod/db', 'v', [], 'W/"2026-01-01T00:00:00Z"')['if_match'] === 'W/"2026-01-01T00:00:00Z"', 'weak ETag allows updateSecret without opt-in');
+check($client->updateJKSKeystore('j1', ['notes' => null], '"2026-01-01T00:00:00Z"')['raw'] === '{"notes":null}', 'quoted ETag allows updateJKSKeystore without opt-in');
+check($client->updateYubikey('y1', ['name' => 'n'], 'W/"2026-01-01T00:00:00Z"')['raw'] === '{"name":"n"}', 'weak ETag allows updateYubikey without opt-in');
+
+// Allowed: constructor opt-in, setter, and SS_PARTIAL_UPDATES=1.
+check($partial->updateSecret('prod/db', 'v')['raw'] === '{"data":{"value":"v"}}', 'constructor opt-in allows updateSecret');
+check($partial->updateSecret('prod/db', 'v', [], '*')['if_match'] === '*', 'opt-in allows * If-Match');
+check($partial->updateJKSKeystore('j1', ['notes' => null])['raw'] === '{"notes":null}', 'constructor opt-in allows updateJKSKeystore');
+check($partial->updateYubikey('y1', ['name' => 'n'])['raw'] === '{"name":"n"}', 'constructor opt-in allows updateYubikey');
+$toggled = (new SecretServerClient('sk_test', $baseURL))->setPartialUpdates(true);
+check($toggled->updateSecret('prod/db', 'v')['raw'] === '{"data":{"value":"v"}}', 'setPartialUpdates(true) allows updateSecret');
+$toggled->setPartialUpdates(false);
+check(expectFailure(fn () => $toggled->updateSecret('prod/db', 'v'), 'setPartialUpdates(false) refuses again')->getMessage() === $partialError, 'setPartialUpdates(false) restores refusal');
+putenv('SS_PARTIAL_UPDATES=1');
+$fromEnv = new SecretServerClient('sk_test', $baseURL);
+putenv('SS_PARTIAL_UPDATES=true');
+$notOne = new SecretServerClient('sk_test', 'http://127.0.0.1:1');
+putenv('SS_PARTIAL_UPDATES');
+check($fromEnv->updateYubikey('y1', ['name' => 'n'])['raw'] === '{"name":"n"}', 'SS_PARTIAL_UPDATES=1 enables partial updates');
+check(expectFailure(fn () => $notOne->updateSecret('s', 'v'), 'SS_PARTIAL_UPDATES other than 1 does not opt in')->getMessage() === $partialError, 'only SS_PARTIAL_UPDATES=1 opts in');
+
 $secrets = $client->listSecrets();
 check(($secrets[0]['name'] ?? null) === 'db', 'secret list envelope unwrapped');
 
 // Partial updates: omitted = keep, explicit null = clear; no pre-read GET.
-$update = $client->updateSecret('prod/db', 'new');
+$update = $partial->updateSecret('prod/db', 'new');
 check(($update['method'] ?? null) === 'PUT' && ($update['path'] ?? null) === '/api/v1/secrets/prod%2Fdb', 'secret update path');
 check($update['raw'] === '{"data":{"value":"new"}}', 'secret update sends only data (no read-merge-write)');
 check($update['if_match'] === null, 'no If-Match unless requested');
 check($update[SecretServerClient::ETAG_KEY] === '"2026-03-03T00:00:00Z"', 'update exposes response ETag');
-$update = $client->updateSecret('prod/db', null, ['description' => null]);
+$update = $partial->updateSecret('prod/db', null, ['description' => null]);
 check($update['raw'] === '{"description":null}', 'null value omits data; explicit null description is sent as null');
-$update = $client->updateSecret('prod/db', 'v', ['tags' => [], 'container_id' => null, 'description' => '']);
+$update = $partial->updateSecret('prod/db', 'v', ['tags' => [], 'container_id' => null, 'description' => '']);
 check(json_decode($update['raw'], true) === ['tags' => [], 'container_id' => null, 'description' => '', 'data' => ['value' => 'v']], 'empty string and empty list are sent literally');
-check($client->updateSecret('prod/db')['raw'] === '{}', 'empty partial update is a JSON object');
-check($client->updateSecret('prod/db', null, ['expected_version' => 3])['raw'] === '{"expected_version":3}', 'expected_version sent in body');
-expectFailure(fn () => $client->updateSecret('prod/db', null, ['expected_version' => '3']), 'non-integer expected_version rejected');
-expectFailure(fn () => $client->updateSecret('prod/db', 'v', ['descrption' => 'x']), 'unknown secret update field rejected');
+check($partial->updateSecret('prod/db')['raw'] === '{}', 'empty partial update is a JSON object');
+check($partial->updateSecret('prod/db', null, ['expected_version' => 3])['raw'] === '{"expected_version":3}', 'expected_version sent in body');
+expectFailure(fn () => $partial->updateSecret('prod/db', null, ['expected_version' => '3']), 'non-integer expected_version rejected');
+expectFailure(fn () => $partial->updateSecret('prod/db', 'v', ['descrption' => 'x']), 'unknown secret update field rejected');
 $record = $client->getSecret('db1');
 check($record[SecretServerClient::ETAG_KEY] === '"2026-01-01T00:00:00Z"' && $record['name'] === 'db1', 'getSecret exposes ETag');
 check($client->secret('db1') === 'v1', 'ETag key does not disturb scalar extraction');
-check($client->updateSecret('prod/db', 'v', [], $record[SecretServerClient::ETAG_KEY])['if_match'] === '"2026-01-01T00:00:00Z"', 'If-Match ETag sent');
-check($client->updateSecret('prod/db', 'v', [], 3)['if_match'] === '3', 'If-Match version number sent');
-check($client->updateSecret('prod/db', 'v', [], 'W/"2026-01-01T00:00:00Z"')['if_match'] === 'W/"2026-01-01T00:00:00Z"', 'weak If-Match sent verbatim');
-$e = expectFailure(fn () => $client->updateSecret('prod/db', 'v', [], '"stale"'), 'stale ETag raises');
+check($partial->updateSecret('prod/db', 'v', [], $record[SecretServerClient::ETAG_KEY])['if_match'] === '"2026-01-01T00:00:00Z"', 'If-Match ETag sent');
+check($partial->updateSecret('prod/db', 'v', [], 3)['if_match'] === '3', 'If-Match version number sent');
+check($partial->updateSecret('prod/db', 'v', [], 'W/"2026-01-01T00:00:00Z"')['if_match'] === 'W/"2026-01-01T00:00:00Z"', 'weak If-Match sent verbatim');
+$e = expectFailure(fn () => $partial->updateSecret('prod/db', 'v', [], '"stale"'), 'stale ETag raises');
 check($e instanceof ConflictException, 'HTTP 409 raises ConflictException');
 check($e->getCode() === 409 && $e->getMessage() === 'SecretServer request failed (HTTP 409)', 'conflict message format');
 check($e->getETag() === '"2026-02-02T00:00:00Z"', 'ConflictException carries current ETag');
 check(!str_contains($e->getMessage(), 'BODY_LEAK_MARKER') && !str_contains($e->getMessage(), 'sk_test'), 'conflict error free of key and body');
 check($e instanceof SecretServerException, 'ConflictException is a SecretServerException');
-$e = expectFailure(fn () => $client->updateSecret('prod/db', 'v', [], 4), 'stale version raises');
+$e = expectFailure(fn () => $partial->updateSecret('prod/db', 'v', [], 4), 'stale version raises');
 check($e instanceof ConflictException, 'stale version raises ConflictException');
-$e = expectFailure(fn () => $client->updateSecret('prod/db', 'v', [], "\"x\"\r\nX-Injected: 1"), 'CRLF in If-Match rejected');
+$e = expectFailure(fn () => $partial->updateSecret('prod/db', 'v', [], "\"x\"\r\nX-Injected: 1"), 'CRLF in If-Match rejected');
 check(!($e instanceof ConflictException), 'CRLF If-Match rejected before any request');
-expectFailure(fn () => $client->updateSecret('prod/db', 'v', [], ''), 'empty If-Match rejected');
+expectFailure(fn () => $partial->updateSecret('prod/db', 'v', [], ''), 'empty If-Match rejected');
 
 $jks = $client->getJKSKeystore('j1');
 check($jks[SecretServerClient::ETAG_KEY] === '"2026-01-01T00:00:00Z"', 'getJKSKeystore exposes ETag');
-$jks = $client->updateJKSKeystore('j1', ['notes' => null], $jks[SecretServerClient::ETAG_KEY]);
+$jks = $partial->updateJKSKeystore('j1', ['notes' => null], $jks[SecretServerClient::ETAG_KEY]);
 check($jks['raw'] === '{"notes":null}' && $jks['if_match'] === '"2026-01-01T00:00:00Z"', 'JKS update sends only notes:null with If-Match');
 check($jks[SecretServerClient::ETAG_KEY] === '"2026-03-03T00:00:00Z"', 'JKS update exposes new ETag');
-check($client->updateJKSKeystore('j1', ['password' => 'pw2'])['raw'] === '{"password":"pw2"}', 'JKS password rotation sends only password');
-expectFailure(fn () => $client->updateJKSKeystore('j1', ['jks' => 'AAAA']), 'JKS upload without password rejected');
-expectFailure(fn () => $client->updateJKSKeystore('j1', ['store_type' => 'raw']), 'unknown JKS update field rejected');
-$e = expectFailure(fn () => $client->updateJKSKeystore('j1', ['name' => 'n'], '"stale"'), 'stale JKS ETag raises');
+check($partial->updateJKSKeystore('j1', ['password' => 'pw2'])['raw'] === '{"password":"pw2"}', 'JKS password rotation sends only password');
+expectFailure(fn () => $partial->updateJKSKeystore('j1', ['jks' => 'AAAA']), 'JKS upload without password rejected');
+expectFailure(fn () => $partial->updateJKSKeystore('j1', ['store_type' => 'raw']), 'unknown JKS update field rejected');
+$e = expectFailure(fn () => $partial->updateJKSKeystore('j1', ['name' => 'n'], '"stale"'), 'stale JKS ETag raises');
 check($e instanceof ConflictException && $e->getETag() === '"2026-02-02T00:00:00Z"', 'JKS conflict carries ETag');
 
 $yk = $client->getYubikey('y1');
 check($yk[SecretServerClient::ETAG_KEY] === '"2026-01-01T00:00:00Z"', 'getYubikey exposes ETag');
-$yk = $client->updateYubikey('y1', ['serial_number' => null, 'name' => 'yk2'], '*');
+$yk = $partial->updateYubikey('y1', ['serial_number' => null, 'name' => 'yk2'], '*');
 check(json_decode($yk['raw'], true) === ['serial_number' => null, 'name' => 'yk2'] && $yk['if_match'] === '*', 'YubiKey update sends only given fields');
-expectFailure(fn () => $client->updateYubikey('y1', ['public_id' => 'short']), 'YubiKey public_id length enforced');
-expectFailure(fn () => $client->updateYubikey('y1', ['id' => 'y2']), 'unknown YubiKey update field rejected');
-$e = expectFailure(fn () => $client->updateYubikey('y1', ['name' => 'n'], '"stale"'), 'stale YubiKey ETag raises');
+expectFailure(fn () => $partial->updateYubikey('y1', ['public_id' => 'short']), 'YubiKey public_id length enforced');
+expectFailure(fn () => $partial->updateYubikey('y1', ['id' => 'y2']), 'unknown YubiKey update field rejected');
+$e = expectFailure(fn () => $partial->updateYubikey('y1', ['name' => 'n'], '"stale"'), 'stale YubiKey ETag raises');
 check($e instanceof ConflictException && $e->getETag() === '"2026-02-02T00:00:00Z"', 'YubiKey conflict carries ETag');
 
 $pw = $client->createPassword('pw', 'alice', 's3cret');
