@@ -240,17 +240,28 @@ func (s *SecretsUI) showEditForm(sec *secretserver.Secret) {
 		}
 
 		_, err := s.app.Client.Secrets.Update(context.Background(), sec.Name, req)
-		var conflict *secretserver.ConflictError
-		if errors.As(err, &conflict) {
-			dialog.ShowError(fmt.Errorf("'%s' was changed by someone else; reload it and edit again", sec.Name), s.app.MainWindow)
-			return
-		}
 		if err != nil {
-			dialog.ShowError(err, s.app.MainWindow)
+			dialog.ShowError(editUpdateError(sec.Name, err), s.app.MainWindow)
 			return
 		}
 		s.Refresh()
 	}, s.app.MainWindow)
+}
+
+// editUpdateError explains an edit-form update failure. A stale ETag is a
+// concurrent change; a refused partial update means the server sent no ETag
+// with the loaded secret, so it may be older than secretserver.io 3075630 and
+// would blank the fields the form does not send. Nothing was saved in either
+// case.
+func editUpdateError(name string, err error) error {
+	var conflict *secretserver.ConflictError
+	switch {
+	case errors.As(err, &conflict):
+		return fmt.Errorf("'%s' was changed by someone else; reload it and edit again", name)
+	case errors.Is(err, secretserver.ErrPartialUpdatesUnconfirmed):
+		return fmt.Errorf("'%s' was not saved: the server sent no ETag for it, so it may be older than secretserver.io 3075630, which would erase fields this form does not send. Upgrade the server, then reload the secret and edit again", name)
+	}
+	return err
 }
 
 // editUpdateRequest builds a partial update holding only what the edit form
