@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -41,6 +42,10 @@ func TestLive(t *testing.T) {
 	rawURL, tokenFile := os.Getenv("SS_LIVE_URL"), os.Getenv("SS_LIVE_TOKEN_FILE")
 	if rawURL == "" || tokenFile == "" {
 		t.Skip("run scripts/live-integration.sh")
+	}
+	// Never exercise a non-disposable server: the live test writes and deletes data.
+	if u, err := url.Parse(rawURL); err != nil || !isLoopback(u.Hostname()) || os.Getenv("SS_LIVE_KEY") == "" {
+		t.Fatal("SS_LIVE_URL must be a loopback URL and SS_LIVE_KEY must be set")
 	}
 	client, err := NewClient(rawURL, tokenFile)
 	if err != nil {
@@ -94,4 +99,8 @@ func TestLive(t *testing.T) {
 	if err != nil || !result.IsError {
 		t.Fatal("unlisted variable was not refused")
 	}
+}
+
+func isLoopback(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
