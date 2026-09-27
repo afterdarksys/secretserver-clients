@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {SecretServerClient, AuthError, PermissionError, ConflictError, NotFoundError} from '../dist/index.js';
+import {SecretServerClient, AuthError, PermissionError, ConflictError, NotFoundError, SecretServerError} from '../dist/index.js';
 // Only ever run against the disposable loopback stack: SS_LIVE_URL and SS_LIVE_KEY are
 // required and never fall back to SS_API_URL/SS_API_KEY or the production default.
 function refuse(msg){ console.error(`live test refused: ${msg}`); process.exit(2); }
