@@ -20,19 +20,30 @@ type SecretCreateRequest struct {
 	Tags        []string          `json:"tags,omitempty"`
 }
 
-// SecretUpdateRequest represents a secret update request.
+// SecretUpdateRequest is a partial update (PUT /secrets/:name).
 //
-// The server's PUT is a full replace of data, description, tags and
-// container. SecretsService.Update therefore reads the current secret and
-// keeps its ContainerID, Description and Tags when the caller leaves them
-// nil. A non-nil Description replaces the stored one; a pointer to "" clears
-// it. Data is required and replaces all existing fields.
+// Convention: a nil field is OMITTED and the server keeps the stored value;
+// to CLEAR a field, name it in Clear and it is sent as JSON null. Clearable
+// fields are "description", "tags" and "container_id". A field cannot be both
+// set and cleared. A pointer to "" sends an empty description; a pointer to an
+// empty slice sends [] (no tags).
+//
+// Data, when non-nil, must be non-empty and replaces the whole value (the
+// previous value is kept in history when history is enabled); nil Data leaves
+// the value untouched, so metadata-only updates never read or rewrite it.
+//
+// IfMatch, when set, is sent as the If-Match header: an ETag from Get or
+// Update, a secret version number such as "3", or "*". ExpectedVersion, when
+// set, is sent as the expected_version body field. On a mismatch Update
+// returns *ConflictError carrying the current ETag.
 type SecretUpdateRequest struct {
-	ContainerID *string           `json:"container_id"`
-	Name        string            `json:"name"`
-	Description *string           `json:"description"`
-	Data        map[string]string `json:"data"`
-	Tags        []string          `json:"tags"`
+	Data            map[string]string
+	Description     *string
+	Tags            *[]string
+	ContainerID     *string
+	Clear           []string
+	IfMatch         string
+	ExpectedVersion *int
 }
 
 // SecretListOptions for listing secrets. Tags is applied client-side (the
@@ -132,10 +143,11 @@ func (s *SecretsService) Get(ctx context.Context, name string, opts *SecretGetOp
 	}
 
 	var secret Secret
-	_, err = s.client.Do(req, &secret)
+	resp, err := s.client.Do(req, &secret)
 	if err != nil {
 		return nil, err
 	}
+	secret.ETag = resp.Header.Get("ETag")
 
 	return &secret, nil
 }
@@ -156,52 +168,57 @@ func (s *SecretsService) Create(ctx context.Context, createReq *SecretCreateRequ
 	return &secret, nil
 }
 
-// Update replaces a secret's data using read-merge-write: the current
-// secret is fetched first and its ContainerID, Description and Tags are kept
-// unless the request sets them (non-nil ContainerID, Description or Tags).
-// Pass a pointer to "" to clear the description and an empty non-nil Tags
-// slice to clear tags. The request is not modified.
+// Update applies a partial update and returns the updated secret metadata
+// with its new ETag. Only the fields set in the request are sent; see
+// SecretUpdateRequest for the omit/clear convention. It needs only the
+// secrets:write permission and never reads the secret value.
 func (s *SecretsService) Update(ctx context.Context, name string, updateReq *SecretUpdateRequest) (*Secret, error) {
 	if updateReq == nil {
 		return nil, fmt.Errorf("update request is required")
-	}
-	if len(updateReq.Data) == 0 {
-		return nil, fmt.Errorf("update data must not be empty")
-	}
-	if updateReq.Name != "" && updateReq.Name != name {
-		return nil, fmt.Errorf("secret name is immutable")
 	}
 	p, err := seg(name)
 	if err != nil {
 		return nil, err
 	}
-
-	current, err := s.Get(ctx, name, nil)
-	if err != nil {
+	body := map[string]interface{}{}
+	if updateReq.Data != nil {
+		if len(updateReq.Data) == 0 {
+			return nil, fmt.Errorf("update data must not be empty")
+		}
+		body["data"] = updateReq.Data
+	}
+	if updateReq.Description != nil {
+		body["description"] = *updateReq.Description
+	}
+	if updateReq.Tags != nil {
+		tags := *updateReq.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		body["tags"] = tags
+	}
+	if updateReq.ContainerID != nil {
+		if *updateReq.ContainerID == "" {
+			return nil, fmt.Errorf("container_id must not be empty; use Clear to remove the container")
+		}
+		body["container_id"] = *updateReq.ContainerID
+	}
+	if updateReq.ExpectedVersion != nil {
+		body["expected_version"] = *updateReq.ExpectedVersion
+	}
+	if err := patchClear(body, updateReq.Clear, "description", "tags", "container_id"); err != nil {
 		return nil, err
 	}
-	merged := *updateReq
-	merged.Name = name
-	if merged.ContainerID == nil {
-		merged.ContainerID = current.ContainerID
-	}
-	if merged.Description == nil {
-		merged.Description = &current.Description
-	}
-	if merged.Tags == nil {
-		merged.Tags = current.Tags
-	}
-
-	req, err := s.client.NewRequest(ctx, "PUT", "/api/v1/secrets/"+p, &merged)
-	if err != nil {
-		return nil, err
+	if len(body) == 0 {
+		return nil, fmt.Errorf("update must set or clear at least one field")
 	}
 
 	var secret Secret
-	_, err = s.client.Do(req, &secret)
+	resp, err := s.client.callWithIfMatch(ctx, "PUT", "/api/v1/secrets/"+p, updateReq.IfMatch, body, &secret)
 	if err != nil {
 		return nil, err
 	}
+	secret.ETag = resp.Header.Get("ETag")
 
 	return &secret, nil
 }

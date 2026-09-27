@@ -4,79 +4,170 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestUpdateReadMergeWritePreservesMetadata(t *testing.T) {
-	var put map[string]interface{}
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			_, _ = w.Write([]byte(`{"id":"1","name":"db","container_id":"c-1","description":"desc","tags":["a","b"],"data":{"v":"old"}}`))
-		case http.MethodPut:
-			if err := json.NewDecoder(r.Body).Decode(&put); err != nil {
+// capturedRequest is one request seen by updateServer.
+type capturedRequest struct {
+	method, ifMatch string
+	body            map[string]json.RawMessage
+}
+
+// updateServer records each request's method, raw body and If-Match header
+// and answers with the given status and ETag.
+func updateServer(t *testing.T, status int, etag string, got *[]capturedRequest) *Client {
+	t.Helper()
+	return newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		req := capturedRequest{method: r.Method, ifMatch: r.Header.Get("If-Match")}
+		if r.Method == http.MethodPut {
+			if err := json.NewDecoder(r.Body).Decode(&req.body); err != nil {
 				t.Error(err)
 			}
-			_, _ = w.Write([]byte(`{"id":"1","name":"db"}`))
+		}
+		*got = append(*got, req)
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			_, _ = w.Write([]byte(`{"id":"1","name":"db","version":4}`))
+		} else {
+			_, _ = w.Write([]byte(`{"error":"conflict body sk_test_do_not_leak"}`))
 		}
 	})
-	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Data: map[string]string{"v": "new"}}); err != nil {
+}
+
+func rawBody(t *testing.T, body map[string]json.RawMessage) map[string]string {
+	t.Helper()
+	out := make(map[string]string, len(body))
+	for k, v := range body {
+		out[k] = string(v)
+	}
+	return out
+}
+
+func TestSecretUpdateSendsOnlyProvidedFields(t *testing.T) {
+	var got []capturedRequest
+	c := updateServer(t, http.StatusOK, `"2026-09-27T10:00:00.123456789Z"`, &got)
+	ctx := context.Background()
+
+	sec, err := c.Secrets.Update(ctx, "db", &SecretUpdateRequest{Data: map[string]string{"v": "new"}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if put["container_id"] != "c-1" || put["description"] != "desc" || put["name"] != "db" {
-		t.Fatalf("metadata not preserved: %#v", put)
+	if sec.ETag != `"2026-09-27T10:00:00.123456789Z"` || sec.Version != 4 {
+		t.Fatalf("update result = %#v", sec)
 	}
-	if tags, _ := put["tags"].([]interface{}); len(tags) != 2 {
-		t.Fatalf("tags not preserved: %#v", put["tags"])
+	if len(got) != 1 || got[0].method != http.MethodPut {
+		t.Fatalf("expected a single PUT with no pre-read GET, got %#v", got)
 	}
-	if data, _ := put["data"].(map[string]interface{}); data["v"] != "new" {
-		t.Fatalf("data not replaced: %#v", put["data"])
+	if b := rawBody(t, got[0].body); !reflect.DeepEqual(b, map[string]string{"data": `{"v":"new"}`}) {
+		t.Fatalf("body = %v", b)
+	}
+	if got[0].ifMatch != "" {
+		t.Fatalf("If-Match sent without being requested: %q", got[0].ifMatch)
 	}
 
-	other, d2 := "c-2", "d2"
-	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Data: map[string]string{"v": "x"}, ContainerID: &other, Description: &d2, Tags: []string{}}); err != nil {
+	got = nil
+	empty, other, tags := "", "c-2", []string{}
+	if _, err := c.Secrets.Update(ctx, "db", &SecretUpdateRequest{Description: &empty, ContainerID: &other, Tags: &tags}); err != nil {
 		t.Fatal(err)
 	}
-	if put["container_id"] != "c-2" || put["description"] != "d2" {
-		t.Fatalf("caller overrides ignored: %#v", put)
-	}
-	if tags, ok := put["tags"].([]interface{}); !ok || len(tags) != 0 {
-		t.Fatalf("explicit empty tags not sent: %#v", put["tags"])
-	}
-
-	empty := ""
-	put = nil
-	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Data: map[string]string{"v": "x"}, Description: &empty}); err != nil {
-		t.Fatal(err)
-	}
-	if d, ok := put["description"]; !ok || d != "" {
-		t.Fatalf("explicit empty description not sent: %#v", put)
-	}
-	if put["container_id"] != "c-1" {
-		t.Fatalf("clearing description dropped container: %#v", put)
+	want := map[string]string{"description": `""`, "container_id": `"c-2"`, "tags": `[]`}
+	if b := rawBody(t, got[0].body); !reflect.DeepEqual(b, want) {
+		t.Fatalf("body = %v, want %v", b, want)
 	}
 }
 
-func TestUpdateRejectsEmptyDataAndRename(t *testing.T) {
+func TestSecretUpdateClearSendsNull(t *testing.T) {
+	var got []capturedRequest
+	c := updateServer(t, http.StatusOK, `"e"`, &got)
+	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Clear: []string{"description", "tags", "container_id"}}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"description": "null", "tags": "null", "container_id": "null"}
+	if b := rawBody(t, got[0].body); !reflect.DeepEqual(b, want) {
+		t.Fatalf("body = %v, want %v", b, want)
+	}
+}
+
+func TestSecretUpdateSendsIfMatchAndExpectedVersion(t *testing.T) {
+	var got []capturedRequest
+	c := updateServer(t, http.StatusOK, `"e"`, &got)
+	v := 3
+	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{IfMatch: `"etag-1"`, ExpectedVersion: &v, Data: map[string]string{"v": "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ifMatch != `"etag-1"` {
+		t.Fatalf("If-Match = %q", got[0].ifMatch)
+	}
+	if string(got[0].body["expected_version"]) != "3" {
+		t.Fatalf("expected_version = %s", got[0].body["expected_version"])
+	}
+}
+
+func TestSecretUpdateConflictReturnsConflictError(t *testing.T) {
+	var got []capturedRequest
+	c := updateServer(t, http.StatusConflict, `"2026-09-27T11:00:00Z"`, &got)
+	_, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{IfMatch: `"stale"`, Data: map[string]string{"v": "x"}})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err = %T %v, want *ConflictError", err, err)
+	}
+	if conflict.ETag != `"2026-09-27T11:00:00Z"` {
+		t.Fatalf("conflict ETag = %q", conflict.ETag)
+	}
+	var apiErr *ErrorResponse
+	if !errors.As(err, &apiErr) || apiErr.Response.StatusCode != http.StatusConflict {
+		t.Fatalf("ConflictError does not unwrap to *ErrorResponse: %v", err)
+	}
+	if msg := err.Error(); msg != "SecretServer request failed (HTTP 409)" || strings.Contains(msg, testKey) || strings.Contains(msg, "conflict body") {
+		t.Fatalf("conflict error text = %q", msg)
+	}
+}
+
+func TestSecretGetExposesETag(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"g-1"`)
+		_, _ = w.Write([]byte(`{"id":"1","name":"db","data":{"v":"x"}}`))
+	})
+	sec, err := c.Secrets.Get(context.Background(), "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sec.ETag != `"g-1"` {
+		t.Fatalf("ETag = %q", sec.ETag)
+	}
+}
+
+func TestSecretUpdateRejectsInvalidInputWithoutRequest(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 	})
-	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{}); err == nil {
-		t.Fatal("empty data accepted")
+	ctx := context.Background()
+	d, empty := "d", ""
+	for name, req := range map[string]*SecretUpdateRequest{
+		"nil":             nil,
+		"no fields":       {},
+		"empty data":      {Data: map[string]string{}},
+		"unknown clear":   {Clear: []string{"data"}},
+		"set and clear":   {Description: &d, Clear: []string{"description"}},
+		"empty container": {ContainerID: &empty},
+	} {
+		if _, err := c.Secrets.Update(ctx, "db", req); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
-	if _, err := c.Secrets.Update(context.Background(), "db", &SecretUpdateRequest{Name: "other", Data: map[string]string{"v": "x"}}); err == nil {
-		t.Fatal("rename accepted")
-	}
-	if _, err := c.Secrets.Get(context.Background(), "db", &SecretGetOptions{Version: "1"}); err == nil {
+	if _, err := c.Secrets.Get(ctx, "db", &SecretGetOptions{Version: "1"}); err == nil {
 		t.Fatal("Get with version accepted")
 	}
-	if _, err := c.Secrets.List(context.Background(), &SecretListOptions{Limit: 1001}); err == nil {
+	if _, err := c.Secrets.List(ctx, &SecretListOptions{Limit: 1001}); err == nil {
 		t.Fatal("limit 1001 accepted")
 	}
-	if _, err := c.Secrets.List(context.Background(), &SecretListOptions{Limit: -1}); err == nil {
+	if _, err := c.Secrets.List(ctx, &SecretListOptions{Limit: -1}); err == nil {
 		t.Fatal("negative limit accepted")
 	}
 }

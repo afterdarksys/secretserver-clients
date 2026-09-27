@@ -397,14 +397,64 @@ func (e *ErrorResponse) Error() string {
 	return e.Message
 }
 
+// ConflictError is returned for HTTP 409, for example when an update's
+// If-Match precondition no longer matches. ETag is the resource's current
+// entity tag from the response; re-read the resource and retry with it.
+// errors.As also matches the wrapped *ErrorResponse.
+type ConflictError struct {
+	*ErrorResponse
+	ETag string
+}
+
+// Unwrap exposes the underlying *ErrorResponse.
+func (e *ConflictError) Unwrap() error { return e.ErrorResponse }
+
 func checkResponse(r *http.Response) error {
 	if c := r.StatusCode; 200 <= c && c <= 299 {
 		return nil
 	}
 
 	errorResponse := &ErrorResponse{Response: r, Message: fmt.Sprintf("SecretServer request failed (HTTP %d)", r.StatusCode)}
+	if r.StatusCode == http.StatusConflict {
+		return &ConflictError{ErrorResponse: errorResponse, ETag: r.Header.Get("ETag")}
+	}
 
 	return errorResponse
+}
+
+// callWithIfMatch is Call with an optional If-Match header.
+func (c *Client) callWithIfMatch(ctx context.Context, method, path, ifMatch string, body, output interface{}) (*Response, error) {
+	req, err := c.NewRequest(ctx, method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	return c.Do(req, output)
+}
+
+// patchClear adds an explicit JSON null to body for every field in clear.
+// Only the names in allowed may be cleared, and a field cannot be both set
+// and cleared.
+func patchClear(body map[string]interface{}, clear []string, allowed ...string) error {
+	for _, field := range clear {
+		ok := false
+		for _, a := range allowed {
+			if field == a {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return fmt.Errorf("field %q cannot be cleared; allowed: %s", field, strings.Join(allowed, ", "))
+		}
+		if v, set := body[field]; set && v != nil {
+			return fmt.Errorf("field %q is both set and cleared", field)
+		}
+		body[field] = nil
+	}
+	return nil
 }
 
 // Common types
@@ -420,6 +470,9 @@ type Secret struct {
 	Version     int               `json:"version"`
 	CreatedAt   string            `json:"created_at"`
 	UpdatedAt   string            `json:"updated_at"`
+	// ETag is the entity tag from the response header of Get or Update. Pass
+	// it as SecretUpdateRequest.IfMatch for an optimistic-concurrency update.
+	ETag string `json:"-"`
 }
 
 // Certificate represents TLS certificate metadata. CertificatePEM is only

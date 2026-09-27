@@ -52,8 +52,8 @@ func TestClientMatchesBackendContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updateBody["name"] != "prod/db" {
-		t.Fatalf("update body did not include required name: %#v", updateBody)
+	if _, sent := updateBody["name"]; sent || len(updateBody) != 1 {
+		t.Fatalf("partial update sent more than the data field: %#v", updateBody)
 	}
 	if err := client.JKS.DeleteEntry(context.Background(), "store", "release/key"); err != nil {
 		t.Fatal(err)

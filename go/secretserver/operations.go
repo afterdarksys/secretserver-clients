@@ -76,6 +76,9 @@ type JKSKeystore struct {
 	Tags        []string `json:"tags,omitempty"`
 	CreatedAt   string   `json:"created_at,omitempty"`
 	UpdatedAt   string   `json:"updated_at,omitempty"`
+	// ETag is the entity tag from the Get response header; pass it as
+	// JKSKeystoreUpdate.IfMatch for an optimistic-concurrency update.
+	ETag string `json:"-"`
 }
 
 type JKSEntry struct {
@@ -109,23 +112,27 @@ type CreateJKSEntryRequest struct {
 	KeyPassword string `json:"key_password,omitempty"`
 }
 
-// JKSKeystoreUpdate changes keystore metadata. A nil field keeps the stored
-// value. Name must not be empty; a pointer to "" for ContainerID moves the
-// keystore out of its container, for Notes clears the notes, and a pointer to
-// an empty slice for Tags clears the tags.
+// JKSKeystoreUpdate is a partial update (PUT /jks-keystores/:id).
+//
+// Convention: a nil field is OMITTED and the server keeps the stored value;
+// to CLEAR a field, name it in Clear and it is sent as JSON null. Clearable
+// fields are "notes", "tags" and "container_id". A field cannot be both set
+// and cleared.
+//
+// Name, when set, must not be empty. Password alone rotates the stored
+// keystore password; JKS (base64 keystore bytes, raw keystores only) replaces
+// the keystore and requires Password. IfMatch, when set, is sent as the
+// If-Match header (an ETag from Get or Update, or "*"); on a mismatch Update
+// returns *ConflictError carrying the current ETag.
 type JKSKeystoreUpdate struct {
 	Name        *string
 	ContainerID *string
 	Notes       *string
 	Tags        *[]string
-}
-
-// jksKeystorePut is the full body the server's PUT replaces the record with.
-type jksKeystorePut struct {
-	Name        string   `json:"name"`
-	ContainerID *string  `json:"container_id"`
-	Notes       string   `json:"notes"`
-	Tags        []string `json:"tags"`
+	Password    *string
+	JKS         *string
+	Clear       []string
+	IfMatch     string
 }
 
 type JKSExport struct {
@@ -148,8 +155,12 @@ func (s *JKSService) Get(ctx context.Context, id string) (*JKSKeystore, error) {
 		return nil, err
 	}
 	var result JKSKeystore
-	_, err = s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+p, nil, &result)
-	return &result, err
+	resp, err := s.client.Call(ctx, http.MethodGet, "/jks-keystores/"+p, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	result.ETag = resp.Header.Get("ETag")
+	return &result, nil
 }
 
 func (s *JKSService) Create(ctx context.Context, input *CreateJKSKeystoreRequest) (*JKSKeystore, error) {
@@ -161,53 +172,65 @@ func (s *JKSService) Create(ctx context.Context, input *CreateJKSKeystoreRequest
 	return &result, err
 }
 
-// Update changes keystore metadata with read-merge-write: the server's PUT
-// replaces name, container, notes and tags, so the current keystore is read
-// first and every field the caller leaves nil is carried over.
-func (s *JKSService) Update(ctx context.Context, id string, input *JKSKeystoreUpdate) error {
+// Update applies a partial update and returns the keystore's new ETag.
+// Only the fields set in input are sent; see JKSKeystoreUpdate.
+func (s *JKSService) Update(ctx context.Context, id string, input *JKSKeystoreUpdate) (string, error) {
 	if input == nil {
-		return fmt.Errorf("JKS keystore update is required")
-	}
-	if input.Name != nil && *input.Name == "" {
-		return fmt.Errorf("JKS keystore name must not be empty")
+		return "", fmt.Errorf("JKS keystore update is required")
 	}
 	p, err := seg(id)
 	if err != nil {
-		return err
+		return "", err
 	}
-	current, err := s.Get(ctx, id)
-	if err != nil {
-		return err
-	}
-	body := jksKeystorePut{
-		Name:        current.Name,
-		ContainerID: current.ContainerID,
-		Notes:       current.Notes,
-		Tags:        current.Tags,
-	}
+	body := map[string]interface{}{}
 	if input.Name != nil {
-		body.Name = *input.Name
+		if *input.Name == "" {
+			return "", fmt.Errorf("JKS keystore name must not be empty")
+		}
+		body["name"] = *input.Name
 	}
 	if input.ContainerID != nil {
-		body.ContainerID = input.ContainerID
 		if *input.ContainerID == "" {
-			body.ContainerID = nil
+			return "", fmt.Errorf("container_id must not be empty; use Clear to remove the container")
 		}
+		body["container_id"] = *input.ContainerID
 	}
 	if input.Notes != nil {
-		body.Notes = *input.Notes
+		body["notes"] = *input.Notes
 	}
 	if input.Tags != nil {
-		body.Tags = *input.Tags
+		tags := *input.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		body["tags"] = tags
 	}
-	if body.Name == "" {
-		return fmt.Errorf("invalid JKS keystore response")
+	if input.JKS != nil {
+		if *input.JKS == "" {
+			return "", fmt.Errorf("JKS keystore data must not be empty")
+		}
+		if input.Password == nil {
+			return "", fmt.Errorf("password is required with jks")
+		}
+		body["jks"] = *input.JKS
 	}
-	if body.Tags == nil {
-		body.Tags = []string{}
+	if input.Password != nil {
+		if *input.Password == "" {
+			return "", fmt.Errorf("JKS keystore password must not be empty")
+		}
+		body["password"] = *input.Password
 	}
-	_, err = s.client.Call(ctx, http.MethodPut, "/jks-keystores/"+p, &body, nil)
-	return err
+	if err := patchClear(body, input.Clear, "notes", "tags", "container_id"); err != nil {
+		return "", err
+	}
+	if len(body) == 0 {
+		return "", fmt.Errorf("update must set or clear at least one field")
+	}
+	resp, err := s.client.callWithIfMatch(ctx, http.MethodPut, "/jks-keystores/"+p, input.IfMatch, body, nil)
+	if err != nil {
+		return "", err
+	}
+	return resp.Header.Get("ETag"), nil
 }
 
 func (s *JKSService) Delete(ctx context.Context, id string) error {
