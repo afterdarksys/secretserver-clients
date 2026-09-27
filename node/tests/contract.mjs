@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { SecretServerClient, SecretServerError } from "../dist/index.js";
+import { SecretServerClient, SecretServerError, ConflictError } from "../dist/index.js";
 
 const calls = [];
 const fetchFn = async (url, init) => {
@@ -22,11 +22,10 @@ await client.enrollCertificate("wildcard", "example.test", ["www.example.test"])
 
 assert.equal(secrets[0].name, "db");
 assert.equal(calls[0].url, "https://example.test/api/v1/secrets");
-assert.equal(calls[1].init.method, "GET");
-assert.equal(calls[2].init.method, "PUT");
-assert.equal(calls[2].url, "https://example.test/api/v1/secrets/prod%2Fdb");
-assert.equal(JSON.parse(calls[2].init.body).name, "prod/db");
-const enrollment = JSON.parse(calls[3].init.body);
+assert.equal(calls[1].init.method, "PUT");
+assert.equal(calls[1].url, "https://example.test/api/v1/secrets/prod%2Fdb");
+assert.deepEqual(JSON.parse(calls[1].init.body), { data: { value: "new" } });
+const enrollment = JSON.parse(calls[2].init.body);
 assert.deepEqual(enrollment.dns_names, ["www.example.test"]);
 assert.equal("sans" in enrollment, false);
 
@@ -105,23 +104,67 @@ function stub(routes) {
   const log = [];
   const client = new SecretServerClient({ apiKey: KEY, apiUrl: 'https://example.test', fetchFn: async (url, init) => {
     const path = url.replace('https://example.test/api/v1', '');
-    log.push({ path, method: init.method, body: init.body ? JSON.parse(init.body) : undefined });
-    const hit = routes[`${init.method} ${path.split('?')[0]}`];
+    // headers is non-enumerable so deepEqual on log entries compares path/method/body only.
+    log.push(Object.defineProperty({ path, method: init.method, body: init.body ? JSON.parse(init.body) : undefined }, 'headers', { value: init.headers }));
+    const route = routes[`${init.method} ${path.split('?')[0]}`];
+    const hit = typeof route === 'function' ? route() : route;
+    if (hit instanceof Response) return hit;
     if (hit instanceof Uint8Array || typeof hit === 'string') return new Response(hit, { status: 200 });
     return new Response(JSON.stringify(hit ?? {}), { status: 200 });
   } });
   return { client, log, last: () => log.at(-1) };
 }
 
-// updateSecret is read-merge-write: container, description and tags survive.
+// updateSecret is a partial PUT with no pre-read: omitted = keep, null = clear, "" = literal.
 {
   const cid = '11111111-1111-1111-1111-111111111111';
-  const { client, log } = stub({ 'GET /secrets/db': { id: 'x', name: 'db', description: 'd', tags: ['t'], container_id: cid } });
-  await client.updateSecret('db', 'v2');
-  assert.deepEqual(log[1], { path: '/secrets/db', method: 'PUT', body: { name: 'db', data: { value: 'v2' }, description: 'd', tags: ['t'], container_id: cid } });
-  await client.updateSecret('db', 'v3', { containerID: null, tags: [] });
-  assert.equal(log[3].body.container_id, null);
-  assert.deepEqual(log[3].body.tags, []);
+  const etagged = () => new Response(JSON.stringify({ id: 'x', name: 'db', version: 3 }), { status: 200, headers: { etag: '"2026-01-02T03:04:05.123456Z"' } });
+  const { client, log, last } = stub({ 'PUT /secrets/db': etagged, 'GET /secrets/db': etagged });
+  const updated = await client.updateSecret('db', 'v2');
+  assert.equal(log.length, 1);
+  assert.deepEqual(last(), { path: '/secrets/db', method: 'PUT', body: { data: { value: 'v2' } } });
+  assert.equal('If-Match' in last().headers, false);
+  assert.equal(updated.etag, '"2026-01-02T03:04:05.123456Z"');
+  await client.updateSecret('db', undefined, { description: null, tags: null, containerID: null });
+  assert.deepEqual(last().body, { description: null, tags: null, container_id: null });
+  await client.updateSecret('db', undefined, { description: '', tags: [], containerID: cid });
+  assert.deepEqual(last().body, { description: '', tags: [], container_id: cid });
+  await client.updateSecret('db', '');
+  assert.deepEqual(last().body, { data: { value: '' } });
+  await client.updateSecret('db', undefined, { description: 'd', tags: undefined });
+  assert.deepEqual(last().body, { description: 'd' });
+  assert.equal(log.every(e => e.method === 'PUT'), true);
+  // If-Match: ETag string or version number; expected_version travels in the body.
+  await client.updateSecret('db', 'v4', { ifMatch: '"2026-01-02T03:04:05.123456Z"' });
+  assert.equal(last().headers['If-Match'], '"2026-01-02T03:04:05.123456Z"');
+  await client.updateSecret('db', 'v5', { ifMatch: 3, expectedVersion: 3 });
+  assert.equal(last().headers['If-Match'], '3');
+  assert.deepEqual(last().body, { data: { value: 'v5' }, expected_version: 3 });
+  const n = log.length;
+  await assert.rejects(client.updateSecret('db', null), /cannot be null/);
+  for (const bad of [-1, 1.5, '', ' ', 'a\r\nX-Injected: 1']) {
+    await assert.rejects(client.updateSecret('db', 'v', { ifMatch: bad }), SecretServerError, String(bad));
+  }
+  assert.equal(log.length, n);
+  // GET by bare name exposes the ETag.
+  assert.equal((await client.getSecret('db')).etag, '"2026-01-02T03:04:05.123456Z"');
+}
+
+// HTTP 409 -> ConflictError carrying the current ETag; message free of key and body.
+{
+  const conflict = () => new Response(JSON.stringify({ error: `stale ${KEY} conflict-body-marker` }), { status: 409, headers: { etag: '"2026-02-02T00:00:00.5Z"' } });
+  const { client } = stub({ 'PUT /secrets/db': conflict, 'PUT /jks-keystores/j1': conflict, 'PUT /yubikeys/y1': conflict });
+  for (const call of [
+    () => client.updateSecret('db', 'v', { ifMatch: '"old"' }),
+    () => client.updateJKSKeystore('j1', { notes: null }, { ifMatch: '"old"' }),
+    () => client.updateYubikey('y1', { notes: null }, { ifMatch: 'W/"old"' }),
+  ]) {
+    await assert.rejects(call(), e => e instanceof ConflictError && e instanceof SecretServerError && e.statusCode === 409
+      && e.etag === '"2026-02-02T00:00:00.5Z"' && e.message === 'SecretServer request failed (HTTP 409)'
+      && !e.message.includes(KEY) && !e.message.includes('conflict-body-marker'));
+  }
+  const bare = new SecretServerClient({ apiKey: KEY, fetchFn: async () => ({ ok: false, status: 409, text: async () => '' }) });
+  await assert.rejects(bare.updateSecret('db', 'v'), e => e instanceof ConflictError && e.etag === undefined);
 }
 
 // secret()/getSecret(): 1..3 segments, version 1..12, container path returns {meta,data}.
@@ -223,17 +266,33 @@ function stub(routes) {
   assert.equal(last().path, '/audit/logs/export?format=json');
 }
 
-// JKS / YubiKey updates are read-merge-write.
+// JKS / YubiKey updates are partial PUTs with no pre-read; gets and updates expose the ETag.
 {
-  const cid = '22222222-2222-2222-2222-222222222222';
-  const { client, log } = stub({
-    'GET /jks-keystores/j1': { id: 'j1', name: 'ks', container_id: cid, notes: 'n', tags: ['a'] },
-    'GET /yubikeys/y1': { id: 'y1', name: 'yk', container_id: cid, serial_number: '1', public_id: 'cccccccccccb', client_id: '9', validation_server: 'https://v.example.test', notes: 'x', tags: ['b'] },
+  const tagged = (body, etag) => new Response(JSON.stringify(body), { status: 200, headers: { etag } });
+  const { client, log, last } = stub({
+    'GET /jks-keystores/j1': () => tagged({ id: 'j1', name: 'ks' }, '"j-etag"'),
+    'PUT /jks-keystores/j1': () => tagged({ message: 'updated' }, '"j-etag-2"'),
+    'GET /yubikeys/y1': () => tagged({ id: 'y1', name: 'yk' }, '"y-etag"'),
+    'PUT /yubikeys/y1': () => tagged({ message: 'updated' }, '"y-etag-2"'),
   });
-  await client.updateJKSKeystore('j1', { notes: 'new' });
-  assert.deepEqual(log[1].body, { name: 'ks', container_id: cid, notes: 'new', tags: ['a'] });
-  await client.updateYubikey('y1', { name: 'renamed' });
-  assert.deepEqual(log[3].body, { name: 'renamed', container_id: cid, serial_number: '1', public_id: 'cccccccccccb', client_id: '9', validation_server: 'https://v.example.test', notes: 'x', tags: ['b'] });
+  assert.equal((await client.getJKSKeystore('j1')).etag, '"j-etag"');
+  assert.deepEqual(await client.updateJKSKeystore('j1', { notes: null, tags: undefined, password: 'rotated' }, { ifMatch: '"j-etag"' }), { message: 'updated', etag: '"j-etag-2"' });
+  assert.deepEqual(last().body, { notes: null, password: 'rotated' });
+  assert.equal(last().headers['If-Match'], '"j-etag"');
+  await client.updateJKSKeystore('j1', { notes: '', container_id: null });
+  assert.deepEqual(last().body, { notes: '', container_id: null });
+  assert.equal('If-Match' in last().headers, false);
+  assert.equal((await client.getYubikey('y1')).etag, '"y-etag"');
+  assert.deepEqual(await client.updateYubikey('y1', { name: 'renamed', serial_number: null }), { message: 'updated', etag: '"y-etag-2"' });
+  assert.deepEqual(last().body, { name: 'renamed', serial_number: null });
+  await client.updateYubikey('y1', { notes: '', api_key: 'c2VjcmV0' }, { ifMatch: '"y-etag-2"' });
+  assert.deepEqual(last().body, { notes: '', api_key: 'c2VjcmV0' });
+  assert.equal(log.filter(e => e.method === 'GET').length, 2);
+  const n = log.length;
+  await assert.rejects(client.updateJKSKeystore('j1', { jks: 'AAAA' }), /password is required/);
+  await assert.rejects(client.updateYubikey('y1', { public_id: 'short' }), /12 modhex/);
+  await assert.rejects(client.updateYubikey('y1', { public_id: null }), /12 modhex/);
+  assert.equal(log.length, n);
 }
 
 console.log('contract + security tests PASS');

@@ -22,6 +22,10 @@ export class SecretServerError extends Error {
 export class AuthError extends SecretServerError { constructor(m: string) { super(m, 401); this.name = "AuthError"; } }
 export class PermissionError extends SecretServerError { constructor(m: string) { super(m, 403); this.name = "PermissionError"; } }
 export class NotFoundError extends SecretServerError { constructor(m: string) { super(m, 404); this.name = "NotFoundError"; } }
+/** HTTP 409 from a conditional update: `etag` is the resource's current ETag (re-read and retry). */
+export class ConflictError extends SecretServerError {
+  constructor(m: string, public readonly etag?: string) { super(m, 409); this.name = "ConflictError"; }
+}
 
 export interface ClientConfig {
   /** API key — also reads SS_API_KEY from process.env */
@@ -51,6 +55,22 @@ export interface Secret {
   version: number;
   created_at: string;
   updated_at: string;
+  /** ETag response header of getSecret(name)/updateSecret; pass it back as `ifMatch`. Not a stored field. */
+  etag?: string;
+}
+
+/**
+ * Partial secret update. OMITTED (undefined) = keep the stored value;
+ * null = clear it. "" is sent as a literal empty string, not a clear.
+ */
+export interface UpdateSecretOptions {
+  description?: string | null;
+  tags?: string[] | null;
+  containerID?: string | null;
+  /** Conditional update: an ETag from getSecret/updateSecret, or the secret's version number. */
+  ifMatch?: string | number;
+  /** Conditional update on the secret's version number (sent as body field expected_version). */
+  expectedVersion?: number;
 }
 
 /** Response of a container path lookup (/s/container/key[/version]). */
@@ -270,6 +290,23 @@ export interface YubikeyCredential {
   tags?: string[];
   created_at: string;
   updated_at: string;
+  /** ETag response header of getYubikey; pass it back as `ifMatch`. Not a stored field. */
+  etag?: string;
+}
+
+/** Partial YubiKey update: undefined = keep, null = clear (nullable fields only). */
+export interface UpdateYubikeyInput {
+  name?: string;
+  container_id?: string | null;
+  serial_number?: string | null;
+  /** Exactly 12 modhex characters. */
+  public_id?: string;
+  client_id?: string;
+  validation_server?: string;
+  notes?: string | null;
+  tags?: string[] | null;
+  /** Replaces the stored Yubico API key (base64). */
+  api_key?: string;
 }
 
 export interface YubikeyValidateResult {
@@ -339,6 +376,26 @@ export interface JKSKeystore {
   tags?: string[];
   created_at?: string;
   updated_at?: string;
+  /** ETag response header of getJKSKeystore; pass it back as `ifMatch`. Not a stored field. */
+  etag?: string;
+}
+
+/** Partial keystore update: undefined = keep, null = clear (container_id, notes, tags). */
+export interface UpdateJKSKeystoreInput {
+  name?: string;
+  container_id?: string | null;
+  notes?: string | null;
+  tags?: string[] | null;
+  /** Replacement keystore (base64, raw keystores only); requires `password`. */
+  jks?: string;
+  /** Alone, rotates the stored keystore password. */
+  password?: string;
+}
+
+/** Result of a keystore/YubiKey update; `etag` is the new ETag response header. */
+export interface UpdateResult {
+  message: string;
+  etag?: string;
 }
 
 export interface JKSEntry {
@@ -418,6 +475,27 @@ function secretPath(path: string): string[] {
   return parts;
 }
 
+/** Build the If-Match header. Numbers (secret versions) must be non-negative integers. */
+function ifMatchHeader(ifMatch: string | number | undefined): Record<string, string> | undefined {
+  if (ifMatch === undefined) return undefined;
+  if (typeof ifMatch === "number") {
+    if (!Number.isInteger(ifMatch) || ifMatch < 0) throw new SecretServerError("ifMatch version must be a non-negative integer");
+    return { "If-Match": String(ifMatch) };
+  }
+  if (typeof ifMatch !== "string" || ifMatch.trim() === "" || /[\r\n]/.test(ifMatch)) throw new SecretServerError("Invalid ifMatch value");
+  return { "If-Match": ifMatch };
+}
+
+/** Keep only the keys the caller set: undefined = omit, null = sent as JSON null. */
+function providedFields(input: object): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
+}
+
+function withETag<T>(data: T, etag: string | undefined): T {
+  if (etag !== undefined && data !== null && typeof data === "object") Object.assign(data, { etag });
+  return data;
+}
+
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -488,22 +566,31 @@ export class SecretServerClient {
   // HTTP core
   // -----------------------------------------------------------------------
 
-  private headers(): Record<string, string> {
+  private headers(extra?: Record<string, string>): Record<string, string> {
     return {
       Authorization: `Bearer ${this.apiKey}`,
       Accept: "application/json",
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
+      ...extra,
     };
   }
 
   /** Call any REST endpoint using a path relative to `/api/v1`. */
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await this.send(method, path, body);
+    return (await this.requestWithETag<T>(method, path, body)).data;
+  }
+
+  /** Like request(), also returning the response ETag header when present. */
+  private async requestWithETag<T>(
+    method: string, path: string, body?: unknown, headers?: Record<string, string>,
+  ): Promise<{ data: T; etag?: string }> {
+    const res = await this.send(method, path, body, headers);
+    const etag = res.headers?.get?.("etag") ?? undefined;
     const text = new TextDecoder().decode(await readCapped(res, MAX_JSON_BYTES));
-    if (text.trim() === "") return undefined as T;
+    if (text.trim() === "") return { data: undefined as T, etag };
     try {
-      return JSON.parse(text) as T;
+      return { data: JSON.parse(text) as T, etag };
     } catch {
       throw new SecretServerError("SecretServer returned an invalid JSON response", res.status);
     }
@@ -514,14 +601,14 @@ export class SecretServerClient {
     return readCapped(await this.send("GET", path), MAX_RAW_BYTES);
   }
 
-  private async send(method: string, path: string, body?: unknown): Promise<Response> {
+  private async send(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<Response> {
     const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
     const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
     const res = await this.fetchFn(url, {
       method,
       redirect: "error",
       signal: AbortSignal.timeout(this.timeoutMs),
-      headers: this.headers(),
+      headers: this.headers(headers),
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
@@ -531,6 +618,7 @@ export class SecretServerClient {
       if (res.status === 401) throw new AuthError(msg);
       if (res.status === 403) throw new PermissionError(msg);
       if (res.status === 404) throw new NotFoundError(msg);
+      if (res.status === 409) throw new ConflictError(msg, res.headers?.get?.("etag") ?? undefined);
       throw new SecretServerError(msg, res.status);
     }
     return res;
@@ -589,12 +677,15 @@ export class SecretServerClient {
   }
 
   /**
-   * Get the full secret: a Secret for a bare name, or {meta, data} (PathSecret)
-   * for "container/key[/version]".
+   * Get the full secret: a Secret for a bare name (with its `etag`), or
+   * {meta, data} (PathSecret) for "container/key[/version]".
    */
   async getSecret(path: string): Promise<Secret | PathSecret> {
     const parts = secretPath(path);
-    if (parts.length === 1) return this.get(`/secrets/${seg(parts[0])}`);
+    if (parts.length === 1) {
+      const { data, etag } = await this.requestWithETag<Secret>("GET", `/secrets/${seg(parts[0])}`);
+      return withETag(data, etag);
+    }
     return this.get(`/s/${parts.map(seg).join("/")}`);
   }
 
@@ -616,22 +707,24 @@ export class SecretServerClient {
   }
 
   /**
-   * Replace a secret's value. The server PUT is a full replace, so the current
-   * description, tags and container are read first and preserved unless given.
+   * Partially update a secret; only the fields you pass are sent. `value`
+   * undefined keeps the stored value (null is rejected). In `opts`, undefined
+   * keeps a field, null clears it, and "" is a literal empty value. Needs only
+   * secrets:write and never reads the secret. With `ifMatch`/`expectedVersion`
+   * a stale precondition throws ConflictError carrying the current ETag. The
+   * result carries the new `etag`.
    */
-  async updateSecret(
-    name: string,
-    value: string,
-    opts: { description?: string; tags?: string[]; containerID?: string | null } = {},
-  ): Promise<Secret> {
-    const current = await this.get<Secret>(`/secrets/${seg(name)}`);
-    return this.put(`/secrets/${seg(name)}`, {
-      name,
-      data: { value },
-      description: opts.description ?? current.description ?? "",
-      tags: opts.tags ?? current.tags ?? [],
-      container_id: opts.containerID !== undefined ? opts.containerID : current.container_id ?? null,
+  async updateSecret(name: string, value?: string, opts: UpdateSecretOptions = {}): Promise<Secret> {
+    if (value === null) throw new SecretServerError("value cannot be null; omit it to keep the current value");
+    const body = providedFields({
+      data: value === undefined ? undefined : { value },
+      description: opts.description,
+      tags: opts.tags,
+      container_id: opts.containerID,
+      expected_version: opts.expectedVersion,
     });
+    const { data, etag } = await this.requestWithETag<Secret>("PUT", `/secrets/${seg(name)}`, body, ifMatchHeader(opts.ifMatch));
+    return withETag(data, etag);
   }
 
   async deleteSecret(name: string): Promise<{ message: string }> { return this.delete(`/secrets/${seg(name)}`); }
@@ -705,24 +798,25 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
 
   async listJKSKeystores(): Promise<JKSKeystore[]> { return this.get("/jks-keystores"); }
-  async getJKSKeystore(id: string): Promise<JKSKeystore> { return this.get(`/jks-keystores/${seg(id)}`); }
+  /** The result carries the response `etag` for conditional updates. */
+  async getJKSKeystore(id: string): Promise<JKSKeystore> {
+    const { data, etag } = await this.requestWithETag<JKSKeystore>("GET", `/jks-keystores/${seg(id)}`);
+    return withETag(data, etag);
+  }
   async createJKSKeystore(input: CreateJKSKeystoreInput): Promise<{ id: string; name: string; store_type: "raw" | "managed"; created_at: string }> {
     return this.post("/jks-keystores", input);
   }
   /**
-   * Update a keystore. The server PUT is a full replace of name, container,
-   * notes and tags, so the current record is read and merged first.
+   * Partially update a keystore; only the fields you pass are sent (undefined
+   * keeps, null clears container_id/notes/tags, "" is a literal value). `jks`
+   * requires `password`; `password` alone rotates the stored password. A stale
+   * `ifMatch` ETag throws ConflictError carrying the current ETag.
    */
-  async updateJKSKeystore(id: string, input: Partial<Omit<CreateJKSKeystoreInput, "store_type">>): Promise<{ message: string }> {
-    const current = await this.get<JKSKeystore>(`/jks-keystores/${seg(id)}`);
-    return this.put(`/jks-keystores/${seg(id)}`, {
-      name: input.name ?? current.name,
-      container_id: input.container_id !== undefined ? input.container_id : current.container_id ?? null,
-      notes: input.notes ?? current.notes ?? "",
-      tags: input.tags ?? current.tags ?? [],
-      jks: input.jks,
-      password: input.password,
-    });
+  async updateJKSKeystore(id: string, input: UpdateJKSKeystoreInput, opts: { ifMatch?: string } = {}): Promise<UpdateResult> {
+    if (input.jks !== undefined && input.password === undefined) throw new SecretServerError("password is required with jks");
+    const { data, etag } = await this.requestWithETag<UpdateResult>(
+      "PUT", `/jks-keystores/${seg(id)}`, providedFields(input), ifMatchHeader(opts.ifMatch));
+    return withETag(data, etag);
   }
   async deleteJKSKeystore(id: string): Promise<void> { return this.delete(`/jks-keystores/${seg(id)}`); }
   async exportJKSKeystore(id: string): Promise<JKSExport> { return this.get(`/jks-keystores/${seg(id)}/export`); }
@@ -1056,7 +1150,11 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
 
   async listYubikeys(): Promise<YubikeyCredential[]> { return this.get("/yubikeys"); }
-  async getYubikey(id: string): Promise<YubikeyCredential> { return this.get(`/yubikeys/${seg(id)}`); }
+  /** The result carries the response `etag` for conditional updates. */
+  async getYubikey(id: string): Promise<YubikeyCredential> {
+    const { data, etag } = await this.requestWithETag<YubikeyCredential>("GET", `/yubikeys/${seg(id)}`);
+    return withETag(data, etag);
+  }
 
   async createYubikey(
     name: string, publicId: string, clientId: string, apiKey: string,
@@ -1069,25 +1167,18 @@ export class SecretServerClient {
   }
 
   /**
-   * Update a YubiKey credential. The server PUT is a full replace of the
-   * metadata, so the current record is read and merged first.
+   * Partially update a YubiKey credential; only the fields you pass are sent
+   * (undefined keeps, null clears container_id/serial_number/notes/tags, "" is
+   * a literal value). A stale `ifMatch` ETag throws ConflictError carrying the
+   * current ETag.
    */
-  async updateYubikey(
-    id: string,
-    data: Partial<Omit<YubikeyCredential, "id" | "created_at" | "updated_at"> & { api_key: string }>,
-  ): Promise<{ message: string }> {
-    const current = await this.get<YubikeyCredential>(`/yubikeys/${seg(id)}`);
-    return this.put(`/yubikeys/${seg(id)}`, {
-      name: data.name ?? current.name,
-      container_id: data.container_id !== undefined ? data.container_id : current.container_id ?? null,
-      serial_number: data.serial_number ?? current.serial_number ?? "",
-      public_id: data.public_id ?? current.public_id,
-      client_id: data.client_id ?? current.client_id,
-      validation_server: data.validation_server ?? current.validation_server,
-      notes: data.notes ?? current.notes ?? "",
-      tags: data.tags ?? current.tags ?? [],
-      api_key: data.api_key,
-    });
+  async updateYubikey(id: string, data: UpdateYubikeyInput, opts: { ifMatch?: string } = {}): Promise<UpdateResult> {
+    if (data.public_id !== undefined && (typeof data.public_id !== "string" || data.public_id.length !== 12)) {
+      throw new SecretServerError("public_id must be exactly 12 modhex characters");
+    }
+    const { data: result, etag } = await this.requestWithETag<UpdateResult>(
+      "PUT", `/yubikeys/${seg(id)}`, providedFields(data), ifMatchHeader(opts.ifMatch));
+    return withETag(result, etag);
   }
 
   async deleteYubikey(id: string): Promise<void> { return this.delete(`/yubikeys/${seg(id)}`); }
