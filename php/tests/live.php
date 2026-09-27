@@ -2,11 +2,29 @@
 // Live contract test, run by scripts/live-integration.sh against a disposable
 // loopback server (SS_LIVE_URL, SS_LIVE_KEY with admin:*, SS_LIVE_WRITE_KEY
 // with only secrets:write, SS_LIVE_CONTAINER).
+
+// Refuse to run anywhere but a loopback server, before any client exists.
+// Never fall back to SS_API_URL / SS_API_KEY or the production default.
+$liveUrl = (string) getenv('SS_LIVE_URL');
+$liveParts = parse_url($liveUrl);
+$liveHost = strtolower((string) (is_array($liveParts) ? ($liveParts['host'] ?? '') : ''));
+if ($liveUrl === '' || !in_array($liveHost, ['localhost', '127.0.0.1', '::1', '[::1]'], true)) {
+    fwrite(STDERR, "refusing to run: SS_LIVE_URL must be set to a loopback URL (localhost, 127.0.0.1 or ::1)\n");
+    exit(2);
+}
+foreach (['SS_LIVE_KEY', 'SS_LIVE_WRITE_KEY', 'SS_LIVE_CONTAINER'] as $required) {
+    if ((string) getenv($required) === '') {
+        fwrite(STDERR, "refusing to run: $required must be set\n");
+        exit(2);
+    }
+}
+
 require dirname(__DIR__) . '/src/SecretServerClient.php';
 
 use SecretServer\AuthException;
 use SecretServer\ConflictException;
 use SecretServer\SecretServerClient;
+use SecretServer\SecretServerException;
 
 function ok(bool $condition, string $what): void
 {
@@ -39,8 +57,9 @@ function jksPasswordMatches(string $jks, string $password): bool
 }
 
 $key = getenv('SS_LIVE_KEY');
-$c = new SecretServerClient($key, getenv('SS_LIVE_URL'));
-$writer = new SecretServerClient(getenv('SS_LIVE_WRITE_KEY'), getenv('SS_LIVE_URL'));
+// The server under test is 3075630+ (partial, conditional updates): opt in.
+$c = new SecretServerClient($key, $liveUrl, partialUpdates: true);
+$writer = new SecretServerClient(getenv('SS_LIVE_WRITE_KEY'), $liveUrl, partialUpdates: true);
 $container = getenv('SS_LIVE_CONTAINER');
 $E = SecretServerClient::ETAG_KEY;
 $sfx = bin2hex(random_bytes(4));
@@ -51,7 +70,7 @@ try {
     // Wrong key -> auth error that does not echo the key.
     $wrongKey = 'sk_wrong_' . bin2hex(random_bytes(12));
     try {
-        (new SecretServerClient($wrongKey, getenv('SS_LIVE_URL')))->listSecrets();
+        (new SecretServerClient($wrongKey, $liveUrl))->listSecrets();
         ok(false, 'wrong API key rejected');
     } catch (AuthException $e) {
         ok(!str_contains($e->getMessage(), $wrongKey) && !str_contains($e->getMessage(), $key), 'wrong API key -> AuthException without key in message');
@@ -89,6 +108,22 @@ try {
     $conflict = expectConflict(fn () => $c->updateSecret($name, null, ['description' => 'stale'], $etag), 'stale secret ETag');
     ok($conflict->getETag() === $fresh[$E] && $conflict->getCode() === 409 && !str_contains($conflict->getMessage(), $key), 'stale ETag -> ConflictException with current ETag');
     ok(($c->getSecret($name)['description'] ?? null) === 'etag ok', 'conflicting update was not applied');
+
+    // Without the opt-in: refused client-side unless the If-Match is a server ETag.
+    $strict = new SecretServerClient($key, $liveUrl);
+    $strict->setPartialUpdates(false);
+    try {
+        $strict->updateSecret($name, null, ['description' => 'no opt-in']);
+        ok(false, 'partial update without opt-in or ETag refused');
+    } catch (SecretServerException $e) {
+        ok(str_contains($e->getMessage(), '3075630') && !($e instanceof ConflictException), 'partial update without opt-in or ETag refused client-side');
+    }
+    ok(($c->getSecret($name)['description'] ?? null) === 'etag ok', 'refused update was not applied');
+    $strictEtag = $strict->getSecret($name)[$E] ?? '';
+    $strictUpdated = $strict->updateSecret($name, null, ['description' => 'etag no opt-in'], $strictEtag);
+    ok(($strictUpdated[$E] ?? $strictEtag) !== $strictEtag, 'update without opt-in succeeds with the ETag from getSecret()');
+    $record = $c->getSecret($name);
+    ok(($record['description'] ?? null) === 'etag no opt-in' && $c->secret("prod/$name") === 'second' && ($record['tags'] ?? null) === ['php-live'], 'ETag update applied and preserved value, tags and container');
     $history = $c->getHistory('secret', $record['id']);
     ok(is_array($history) && ($history === [] || array_keys($history) === range(0, count($history) - 1)), 'getHistory returns a list (' . count($history) . ' entries)');
 
