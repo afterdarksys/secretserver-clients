@@ -124,6 +124,12 @@ type CreateJKSEntryRequest struct {
 // the keystore and requires Password. IfMatch, when set, is sent as the
 // If-Match header (an ETag from Get or Update, or "*"); on a mismatch Update
 // returns *ConflictError carrying the current ETag.
+//
+// Minimum server: secretserver.io 3075630 (partial, conditional updates).
+// Unless the client was built with Config.PartialUpdates, IfMatch must be an
+// ETag from Get or Update (a quoted "..." or W/"..." value); "*" does not
+// qualify, and Update returns ErrPartialUpdatesUnconfirmed without sending a
+// request.
 type JKSKeystoreUpdate struct {
 	Name        *string
 	ContainerID *string
@@ -173,7 +179,9 @@ func (s *JKSService) Create(ctx context.Context, input *CreateJKSKeystoreRequest
 }
 
 // Update applies a partial update and returns the keystore's new ETag.
-// Only the fields set in input are sent; see JKSKeystoreUpdate.
+// Only the fields set in input are sent; see JKSKeystoreUpdate. It refuses
+// with ErrPartialUpdatesUnconfirmed, sending nothing, unless
+// Config.PartialUpdates is set or input.IfMatch is an ETag from Get.
 func (s *JKSService) Update(ctx context.Context, id string, input *JKSKeystoreUpdate) (string, error) {
 	if input == nil {
 		return "", fmt.Errorf("JKS keystore update is required")
@@ -225,6 +233,9 @@ func (s *JKSService) Update(ctx context.Context, id string, input *JKSKeystoreUp
 	}
 	if len(body) == 0 {
 		return "", fmt.Errorf("update must set or clear at least one field")
+	}
+	if err := s.client.checkPartialUpdate(input.IfMatch); err != nil {
+		return "", err
 	}
 	resp, err := s.client.callWithIfMatch(ctx, http.MethodPut, "/jks-keystores/"+p, input.IfMatch, body, nil)
 	if err != nil {

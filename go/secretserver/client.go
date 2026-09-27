@@ -29,12 +29,22 @@ const (
 // ErrResponseTooLarge is returned when a response body exceeds the client cap.
 var ErrResponseTooLarge = errors.New("SecretServer response exceeds size limit")
 
+// ErrPartialUpdatesUnconfirmed is returned, before any request is sent, by the
+// partial update methods (Secrets.Update, JKS.Update) when the client has not
+// opted in with Config.PartialUpdates and the call carries no server entity
+// tag as IfMatch. Servers older than secretserver.io 3075630 treat these PUTs
+// as a full replace and ignore If-Match, so a partial body would silently
+// blank every omitted field.
+var ErrPartialUpdatesUnconfirmed = errors.New("partial updates require secretserver.io 3075630 or newer; pass an ETag from get() as if_match or enable partial_updates (Go: SecretUpdateRequest.IfMatch / JKSKeystoreUpdate.IfMatch, or Config.PartialUpdates)")
+
 // Client is the SecretServer API client
 type Client struct {
 	baseURL    *url.URL
 	apiKey     string
 	httpClient *http.Client
 	userAgent  string
+	// partialUpdates is Config.PartialUpdates.
+	partialUpdates bool
 
 	// Service clients
 	Secrets      *SecretsService
@@ -69,11 +79,18 @@ type Client struct {
 // client, and raises TLS MinVersion to 1.2. To trust a private CA, pass an
 // *http.Transport whose TLSClientConfig.RootCAs contains it. Redirects are
 // never followed.
+//
+// PartialUpdates opts in to partial updates (Secrets.Update, JKS.Update)
+// without an If-Match ETag. Minimum server: secretserver.io 3075630 (partial,
+// conditional updates); older servers treat these PUTs as a full replace and
+// blank omitted fields. Set it only when the server is known to be 3075630 or
+// newer. Without it, each update must carry an ETag from Get as IfMatch.
 type Config struct {
-	APIURL     string
-	APIKey     string
-	HTTPClient *http.Client
-	UserAgent  string
+	APIURL         string
+	APIKey         string
+	HTTPClient     *http.Client
+	UserAgent      string
+	PartialUpdates bool
 }
 
 // NewClient creates a new SecretServer client
@@ -120,10 +137,11 @@ func NewClient(cfg *Config) (*Client, error) {
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	c := &Client{
-		baseURL:    baseURL,
-		apiKey:     cfg.APIKey,
-		httpClient: httpClient,
-		userAgent:  cfg.UserAgent,
+		baseURL:        baseURL,
+		apiKey:         cfg.APIKey,
+		httpClient:     httpClient,
+		userAgent:      cfg.UserAgent,
+		partialUpdates: cfg.PartialUpdates,
 	}
 
 	// Initialize service clients
@@ -420,6 +438,31 @@ func checkResponse(r *http.Response) error {
 	}
 
 	return errorResponse
+}
+
+// checkPartialUpdate returns ErrPartialUpdatesUnconfirmed unless the client
+// opted in to partial updates or ifMatch is a server entity tag.
+func (c *Client) checkPartialUpdate(ifMatch string) error {
+	if c.partialUpdates || isEntityTag(ifMatch) {
+		return nil
+	}
+	return ErrPartialUpdatesUnconfirmed
+}
+
+// isEntityTag reports whether v is an RFC 9110 entity tag: a non-empty quoted
+// opaque string, optionally prefixed with the weak indicator W/. A bare
+// version number, "*" or an unquoted value is not an entity tag.
+func isEntityTag(v string) bool {
+	v = strings.TrimPrefix(v, "W/")
+	if len(v) < 3 || v[0] != '"' || v[len(v)-1] != '"' {
+		return false
+	}
+	for _, b := range []byte(v[1 : len(v)-1]) {
+		if b != 0x21 && (b < 0x23 || b == 0x7f) {
+			return false
+		}
+	}
+	return true
 }
 
 // callWithIfMatch is Call with an optional If-Match header.

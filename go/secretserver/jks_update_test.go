@@ -68,9 +68,9 @@ func TestJKSGetExposesETag(t *testing.T) {
 }
 
 func TestJKSUpdateRejectsInvalidInputWithoutRequest(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClientConfig(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-	})
+	}, Config{PartialUpdates: true})
 	ctx := context.Background()
 	empty, data, notes := "", "AAAA", "n"
 	for name, input := range map[string]*JKSKeystoreUpdate{

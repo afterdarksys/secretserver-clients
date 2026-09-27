@@ -36,6 +36,12 @@ type SecretCreateRequest struct {
 // Update, a secret version number such as "3", or "*". ExpectedVersion, when
 // set, is sent as the expected_version body field. On a mismatch Update
 // returns *ConflictError carrying the current ETag.
+//
+// Minimum server: secretserver.io 3075630 (partial, conditional updates).
+// Unless the client was built with Config.PartialUpdates, IfMatch must be an
+// ETag from Get or Update (a quoted "..." or W/"..." value); a version
+// number, "*" or ExpectedVersion alone does not qualify, and Update returns
+// ErrPartialUpdatesUnconfirmed without sending a request.
 type SecretUpdateRequest struct {
 	Data            map[string]string
 	Description     *string
@@ -172,6 +178,10 @@ func (s *SecretsService) Create(ctx context.Context, createReq *SecretCreateRequ
 // with its new ETag. Only the fields set in the request are sent; see
 // SecretUpdateRequest for the omit/clear convention. It needs only the
 // secrets:write permission and never reads the secret value.
+//
+// Minimum server: secretserver.io 3075630. Update refuses with
+// ErrPartialUpdatesUnconfirmed, sending nothing, unless Config.PartialUpdates
+// is set or updateReq.IfMatch is an ETag from Get or Update.
 func (s *SecretsService) Update(ctx context.Context, name string, updateReq *SecretUpdateRequest) (*Secret, error) {
 	if updateReq == nil {
 		return nil, fmt.Errorf("update request is required")
@@ -211,6 +221,10 @@ func (s *SecretsService) Update(ctx context.Context, name string, updateReq *Sec
 	}
 	if len(body) == 0 {
 		return nil, fmt.Errorf("update must set or clear at least one field")
+	}
+
+	if err := s.client.checkPartialUpdate(updateReq.IfMatch); err != nil {
+		return nil, err
 	}
 
 	var secret Secret

@@ -218,6 +218,30 @@ key, err := client.SSHKeys.Generate(ctx, &ss.GenerateSSHKeyRequest{
 })
 ```
 
+<!-- go-partial-updates:begin -->
+#### Go: partial updates
+
+**Minimum server: secretserver.io 3075630 (partial, conditional updates).**
+Older servers treat `PUT` on secrets and JKS keystores as a full replace and
+ignore `If-Match`, so a partial body would blank every omitted field.
+`Secrets.Update` and `JKS.Update` therefore return
+`ss.ErrPartialUpdatesUnconfirmed`, without sending a request, unless either:
+
+- the client opts in with `ss.Config{PartialUpdates: true}` (only for servers
+  known to be 3075630 or newer), or
+- the call passes an ETag from `Get` as `IfMatch` (a quoted `"..."` or
+  `W/"..."` value; a version number, `*` or `ExpectedVersion` alone does not
+  count).
+
+```go
+cur, err := client.Secrets.Get(ctx, "db", nil)
+desc := "rotated"
+_, err = client.Secrets.Update(ctx, "db", &ss.SecretUpdateRequest{Description: &desc, IfMatch: cur.ETag})
+```
+
+The Go SDK does not read `SS_PARTIAL_UPDATES`; set `Config.PartialUpdates`.
+<!-- go-partial-updates:end -->
+
 ### Ansible
 
 ```yaml

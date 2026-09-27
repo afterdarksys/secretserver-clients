@@ -24,10 +24,10 @@ func TestSegRejectsDotAndEmptySegments(t *testing.T) {
 
 func TestBadPathSegmentsSendNoRequest(t *testing.T) {
 	var requests atomic.Int32
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClientConfig(t, func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		_, _ = w.Write([]byte(`{}`))
-	})
+	}, Config{PartialUpdates: true})
 	ctx := context.Background()
 	for _, bad := range []string{"", ".", ".."} {
 		calls := map[string]error{}

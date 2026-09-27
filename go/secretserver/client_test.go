@@ -40,7 +40,7 @@ func TestClientMatchesBackendContract(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&Config{APIURL: server.URL + "/proxy/api/v1", APIKey: "sk_test"})
+	client, err := NewClient(&Config{APIURL: server.URL + "/proxy/api/v1", APIKey: "sk_test", PartialUpdates: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,9 +70,17 @@ const testKey = "sk_test_do_not_leak_0123456789"
 
 func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Helper()
+	return newTestClientConfig(t, h, Config{})
+}
+
+// newTestClientConfig is newTestClient with extra Config fields; APIURL and
+// APIKey are filled in.
+func newTestClientConfig(t *testing.T, h http.HandlerFunc, cfg Config) *Client {
+	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	c, err := NewClient(&Config{APIURL: srv.URL, APIKey: testKey})
+	cfg.APIURL, cfg.APIKey = srv.URL, testKey
+	c, err := NewClient(&cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

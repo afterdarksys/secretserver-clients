@@ -19,10 +19,11 @@ type capturedRequest struct {
 }
 
 // updateServer records each request's method, raw body and If-Match header
-// and answers with the given status and ETag.
+// and answers with the given status and ETag. The client opts in to partial
+// updates.
 func updateServer(t *testing.T, status int, etag string, got *[]capturedRequest) *Client {
 	t.Helper()
-	return newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	return newTestClientConfig(t, func(w http.ResponseWriter, r *http.Request) {
 		req := capturedRequest{method: r.Method, ifMatch: r.Header.Get("If-Match")}
 		if r.Method == http.MethodPut {
 			if err := json.NewDecoder(r.Body).Decode(&req.body); err != nil {
@@ -37,7 +38,7 @@ func updateServer(t *testing.T, status int, etag string, got *[]capturedRequest)
 		} else {
 			_, _ = w.Write([]byte(`{"error":"conflict body sk_test_do_not_leak"}`))
 		}
-	})
+	}, Config{PartialUpdates: true})
 }
 
 func rawBody(t *testing.T, body map[string]json.RawMessage) map[string]string {
@@ -144,9 +145,9 @@ func TestSecretGetExposesETag(t *testing.T) {
 }
 
 func TestSecretUpdateRejectsInvalidInputWithoutRequest(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClientConfig(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-	})
+	}, Config{PartialUpdates: true})
 	ctx := context.Background()
 	d, empty := "d", ""
 	for name, req := range map[string]*SecretUpdateRequest{
