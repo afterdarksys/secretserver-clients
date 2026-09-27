@@ -1,7 +1,7 @@
 # Client compatibility verification
 
-**Verified:** 2026-09-26
-**Backend:** `secretserver.io` origin/main `086b727` (clean worktree, built from source)
+**Verified:** 2026-09-27
+**Backend:** `secretserver.io` branch `prod-readiness-2026-09-26` at `3075630` (partial, conditional updates), clean detached worktree built from source. Earlier passes ran against origin/main `086b727`.
 **REST contract:** `/api/v1`
 **Method:** static contract audit of every client method against the server's registered gin routes and handler bind structs, plus live runs against a disposable server.
 
@@ -12,17 +12,18 @@
 | Go SDK (`go/`) | gofmt clean, `go vet` clean, staticcheck v0.8.1 clean | `go test -race` pass | Pass (`go/cmd/platform-smoke`) |
 | Go GUI (`go-gui/`) | gofmt, vet, staticcheck clean | `go test -race` pass (keychain, extractor naming) | Not run: desktop GUI; its API calls go through the Go SDK, which was verified live |
 | MCP bridge (`mcp/`) | gofmt, vet, staticcheck clean | `go test -race` pass | Pass (`TestLive`, resolves an allowlisted variable through the MCP tool layer) |
-| Python 1.3.0 (`python/`) | ruff `E9,F,B` clean | pytest: 41 pass | Pass (`python/tests/live.py`) |
-| Ansible lookup (`ansible/`) | ruff `E9,F,B` clean | pytest: 15 pass | Pass (`ansible/tests/live.yml`) |
+| Python 1.3.0 (`python/`) | ruff `E9,F,B` clean | pytest: python+ansible 68 pass; system Python unittest 50 OK | Pass (`python/tests/live.py`) |
+| Ansible lookup (`ansible/`) | ruff `E9,F,B` clean | pytest (included above) | Pass (`ansible/tests/live.yml`) |
 | Node.js 1.3.0 (`node/`) | `tsc --strict` build (lockfile, `npm ci`) | contract and security tests pass | Pass (`node/tests/live.mjs`) |
-| PHP 1.3.0 (`php/`) | `php -l` on all files | `composer test`: 103 checks pass | Pass (`php/tests/live.php`) |
+| PHP 1.3.0 (`php/`) | `php -l` on all files | `composer test`: 138 checks pass | Pass (`php/tests/live.php`) |
 | Cache service | n/a: design documents only, no code | n/a | n/a |
 
 The harness shows `NOT VERIFIED` instead of `PASS` for a client that passed every
-check it ran but printed `SKIP`/`NOT VERIFIED` lines (checks blocked by the
-server defects below or needing external services). Latest run: mcp and ansible
-PASS; go, python, node and php NOT VERIFIED for the items listed under
-"Not verified live"; exit 0, no failures.
+check it ran but printed `SKIP`/`NOT VERIFIED` lines. Latest run against
+`3075630`: exit 0, no failures; mcp and ansible PASS; go, python, node and php
+NOT VERIFIED solely because of SKIP lines for external dependencies (Yubico OTP
+validation, HSM signing, LDAP server, a second tenant user for sharing, a public
+webhook receiver). No server-defect tolerances remain.
 
 The live flows cover:
 
@@ -39,7 +40,7 @@ Each run also checks that the API key never appears in the server log.
 ## How to reproduce
 
 ```bash
-git -C ../secretserver.io worktree add --detach /tmp/ss-main origin/main
+git -C ../secretserver.io worktree add --detach /tmp/ss-main 3075630   # or any later server commit with partial updates
 SECRETSERVER_SRC=/tmp/ss-main scripts/live-integration.sh     # prints a per-client PASS/FAIL table
 
 (cd go && go vet ./... && go test -race ./...)
@@ -56,8 +57,9 @@ The harness needs `initdb`, `pg_ctl`, `vault`, `go`, `node`, `php`, `python3` an
 
 **Secrets**
 
-- `PUT /secrets/:name` is a full replace. Every client's update now reads the secret, merges in the caller's changes, then writes it back. Before this, updates wiped description and tags, and detached the secret from its container, which broke `/s/<container>/<key>` reads.
-- JKS keystore and YubiKey updates got the same read-merge-write treatment.
+- `PUT /secrets/:name`, `/jks-keystores/:id` and `/yubikeys/:id` are partial updates on the server (as of `3075630`). Every client now sends only the fields the caller provided, with no pre-read GET. Convention in all clients: **omitted = keep, explicit null = clear** (Python `None` vs the `_UNSET` default; Node `null` vs `undefined`, `""` is a literal value; PHP key present with `null` vs absent; Go nil = keep and field names in `Clear` are sent as null).
+- Update and get methods expose the response `ETag`; updates accept an optional If-Match (ETag, or for secrets a version number / `expected_version`). HTTP 409 raises a typed conflict error (`ConflictError` / `ConflictException`) carrying the current ETag.
+- Live-verified in Go, Python, Node and PHP: a `secrets:write`-only key can update a value (no 403) and the update produces no `secret.read` audit entry; explicit null clears a field while omitted fields survive; a stale If-Match is rejected with the conflict error.
 - Go SDK: `Get` rejects the ignored `version` parameter, and tags are filtered client-side because the server ignores the tags query. `ContainerID` survives edits in both the SDK and the GUI.
 
 **Passwords and tokens**
@@ -136,18 +138,17 @@ The harness needs `initdb`, `pg_ctl`, `vault`, `go`, `node`, `php`, `python3` an
 
 ## Not verified live
 
-These are covered offline only. Each reason was confirmed against the disposable server.
-
 | Area | Reason |
 |---|---|
-| GPG generate/export | Server returns HTTP 500: migration `024_add_user_id_to_keys.sql` is not in the core migration set, so `gpg_keys.user_id` is missing |
-| TOTP create/list/code/export | Server returns HTTP 500: `027_totp_authenticators.sql` is not in the core migration set |
-| Certificate enroll/download | Server returns HTTP 500: `dns_names` is bound with `pq.Array` into a JSON column, and the unique `secret_name` is left empty |
-| JKS keystores and entries | Server returns HTTP 500: the Vault write path falls outside the KV mount |
-| `/export/json` secret contents | Server silently skips secrets whose Vault read fails, because `ListSecrets` does not select `vault_path` |
-| Audit `resource_id`/`user_id` filters | Server returns HTTP 400: gin cannot bind `*uuid.UUID` from a query string |
-| Secret version history contents | Server does not write `secret_version_history` for plain secret updates. Only the list shape was verified |
-| Crypto signing (PKCS#11/eHSM), LDAP search, sharing, webhooks | Need an HSM, an LDAP server, a tenant user or group, or outbound network |
+| YubiKey OTP validation | Calls the external Yubico validation service |
+| Crypto signing (PKCS#11/eHSM) | Needs an operator-provisioned crypto backend and signing-key binding |
+| LDAP search | Needs a reachable LDAP server behind a stored bind credential |
+| Sharing | Recipient must be an active user or group of the tenant; the harness provisions none |
+| Webhook create/test | The server's SSRF guard rejects loopback/private receivers |
+| Audit `resource_id`/`user_id` filters | On `086b727` gin could not bind `*uuid.UUID` from a query string (HTTP 400); not re-checked on `3075630` |
 | GraphQL / gRPC | Documented by the backend as design artifacts, not operational transports |
+
+GPG, TOTP, certificate enroll/download, JKS keystores and `/export/json` secret
+contents, which failed on `086b727`, are exercised for real against `3075630`.
 
 Server-side observation, not a client issue: `hasExportPermission` in `handlers/ssh.go` always returns true, and the SSH export and certificate download routes are not wrapped in `RequirePermissions(PermExportRead)`.
