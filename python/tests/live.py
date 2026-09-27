@@ -2,14 +2,40 @@
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
-from secretserver import AuthError, ConflictError, PermissionError, SecretServerClient
 
-URL, KEY, CONTAINER = os.environ["SS_LIVE_URL"], os.environ["SS_LIVE_KEY"], os.environ["SS_LIVE_CONTAINER"]
-WRITE_KEY = os.environ["SS_LIVE_WRITE_KEY"]
-c = SecretServerClient(KEY, URL)
-writer = SecretServerClient(WRITE_KEY, URL)
+def live_env():
+    """Return the harness settings or exit before any client exists.
+
+    Only the SS_LIVE_* variables are read, never SS_API_URL/SS_API_KEY or the
+    production default, and the URL must point at a loopback host.
+    """
+    url = os.environ.get("SS_LIVE_URL", "")
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        parts, host = None, ""
+    if not url or parts is None or "@" in parts.netloc or host not in ("localhost", "127.0.0.1", "::1"):
+        sys.exit("live.py: refusing to run: SS_LIVE_URL must be set to a loopback URL (localhost, 127.0.0.1 or ::1)")
+    missing = [name for name in ("SS_LIVE_KEY", "SS_LIVE_WRITE_KEY", "SS_LIVE_CONTAINER") if not os.environ.get(name)]
+    if missing:
+        sys.exit("live.py: refusing to run: " + ", ".join(missing) + " must be set")
+    return url, os.environ["SS_LIVE_KEY"], os.environ["SS_LIVE_CONTAINER"], os.environ["SS_LIVE_WRITE_KEY"]
+
+
+URL, KEY, CONTAINER, WRITE_KEY = live_env()
+
+from secretserver import AuthError, ConflictError, PermissionError, SecretServerClient, SecretServerError  # noqa: E402
+
+# The disposable server is 3075630 or newer, so the main clients opt in to
+# partial updates; ``plain`` does not and must present an ETag instead.
+c = SecretServerClient(KEY, URL, partial_updates=True)
+writer = SecretServerClient(WRITE_KEY, URL, partial_updates=True)
+plain = SecretServerClient(KEY, URL, partial_updates=False)
 cleanup = []
 
 # Flows that need something outside the disposable stack. Printed so the
@@ -78,6 +104,19 @@ try:
     assert expect_conflict(lambda: c.update_secret("python-live", "fourth", if_match=record.etag)) == fresh.etag
     expect_conflict(lambda: c.update_secret("python-live", "fourth", expected_version=record["version"]))
     assert c.secret("python-live") == "third"
+
+    # Without the opt-in a partial update is refused unless it carries an
+    # ETag from get(); with one it goes through and keeps the container.
+    try:
+        plain.update_secret("python-live", "unsent")
+        raise AssertionError("partial update without opt-in or ETag was sent")
+    except SecretServerError as exc:
+        assert "3075630" in str(exc) and KEY not in str(exc)
+    current = plain.get_secret("python-live")
+    via_etag = plain.update_secret("python-live", "third", description="via etag", if_match=current.etag)
+    assert via_etag.etag and via_etag.etag != current.etag
+    assert c.secret("prod/python-live") == "third"
+    assert c.get_secret("python-live")["description"] == "via etag"
 
     history = c.get_history("secret", record["id"])
     assert isinstance(history, list), history
