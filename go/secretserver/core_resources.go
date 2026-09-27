@@ -98,6 +98,8 @@ type CertificateDownloadOptions struct {
 
 // Download writes the raw certificate material (at most 16 MiB) to w. The
 // response is buffered and checked first, so nothing is written on error.
+// PEM formats use GET; pfx/p12 use POST with the password in the JSON body so
+// it never appears in a URL, proxy log or access log.
 func (s *CertificatesService) Download(ctx context.Context, id string, opts *CertificateDownloadOptions, w io.Writer) error {
 	if w == nil {
 		return fmt.Errorf("download writer is required")
@@ -114,10 +116,9 @@ func (s *CertificatesService) Download(ctx context.Context, id string, opts *Cer
 				return fmt.Errorf("password is only used with pfx or p12 format")
 			}
 		case "pfx", "p12":
-			if opts.Password == "" {
-				return fmt.Errorf("password is required for %s format", opts.Format)
+			if opts.Password == "" || len(opts.Password) > 1024 {
+				return fmt.Errorf("password of 1-1024 bytes is required for %s format", opts.Format)
 			}
-			params.Set("password", opts.Password)
 		default:
 			return fmt.Errorf("invalid certificate format: must be pem, pem-bundle, key, pfx or p12")
 		}
@@ -126,10 +127,15 @@ func (s *CertificatesService) Download(ctx context.Context, id string, opts *Cer
 		}
 	}
 	path := "/certificates/" + p + "/download"
-	if len(params) > 0 {
-		path += "?" + params.Encode()
+	var req *http.Request
+	if opts != nil && (opts.Format == "pfx" || opts.Format == "p12") {
+		req, err = s.client.NewRequest(ctx, http.MethodPost, path, map[string]string{"format": opts.Format, "password": opts.Password})
+	} else {
+		if len(params) > 0 {
+			path += "?" + params.Encode()
+		}
+		req, err = s.client.NewRequest(ctx, http.MethodGet, path, nil)
 	}
-	req, err := s.client.NewRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}

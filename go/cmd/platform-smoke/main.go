@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -244,8 +245,12 @@ func liveCertificates(ctx context.Context, c *ss.Client) string {
 	check(strings.Contains(bundle.String(), "PRIVATE KEY"), "pem-bundle download missing key")
 	must(c.Certificates.Download(ctx, cert.ID, &ss.CertificateDownloadOptions{Format: "pfx", Password: "go-live-pfx"}, &pfx))
 	check(pfx.Len() > 0, "pfx download empty")
+	// The server must refuse a password in the URL; the SDK never sends one.
+	_, e = c.Call(ctx, "GET", "/certificates/"+cert.ID+"/download?format=pfx&password=go-live-pfx", nil, io.Discard)
+	var apiErr *ss.ErrorResponse
+	check(errors.As(e, &apiErr) && apiErr.Response.StatusCode == 400, "GET pfx with password in URL was not rejected with 400")
 	must(c.Certificates.Revoke(ctx, cert.ID))
-	fmt.Println("certificates: enroll/list/get/pem/pem-bundle/pfx/revoke ok")
+	fmt.Println("certificates: enroll/list/get/pem/pem-bundle/pfx(POST)/GET-password-rejected/revoke ok")
 	return withPEM.CertificatePEM
 }
 

@@ -206,9 +206,11 @@ func TestSigningKeysBackendParamOnlyWhenSet(t *testing.T) {
 }
 
 func TestCertificateDownloadStreamsRawBytes(t *testing.T) {
-	var query, accept string
+	var query, accept, method, body string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		query, accept = r.URL.RawQuery, r.Header.Get("Accept")
+		query, accept, method = r.URL.RawQuery, r.Header.Get("Accept"), r.Method
+		raw, _ := io.ReadAll(r.Body)
+		body = string(raw)
 		w.Header().Set("Content-Type", "application/x-pem-file")
 		_, _ = w.Write([]byte("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"))
 	})
@@ -223,10 +225,21 @@ func TestCertificateDownloadStreamsRawBytes(t *testing.T) {
 	if err := c.Certificates.Download(context.Background(), "1", &CertificateDownloadOptions{Format: "pfx", Password: "p&w"}, &buf); err != nil {
 		t.Fatal(err)
 	}
-	if query != "format=pfx&password=p%26w" {
-		t.Fatalf("pfx query = %q", query)
+	if method != http.MethodPost || query != "" || strings.Contains(query, "p&w") {
+		t.Fatalf("pfx must POST without a query: method=%s query=%q", method, query)
 	}
-	for _, bad := range []*CertificateDownloadOptions{{Format: "pfx"}, {Format: "der"}, {Format: "pem", Password: "x"}} {
+	var sent map[string]string
+	if err := json.Unmarshal([]byte(body), &sent); err != nil || sent["format"] != "pfx" || sent["password"] != "p&w" || len(sent) != 2 {
+		t.Fatalf("pfx body = %q", body)
+	}
+	buf.Reset()
+	if err := c.Certificates.Download(context.Background(), "1", &CertificateDownloadOptions{Format: "pem-bundle"}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodGet || query != "format=pem-bundle" {
+		t.Fatalf("pem-bundle must GET: method=%s query=%q", method, query)
+	}
+	for _, bad := range []*CertificateDownloadOptions{{Format: "pfx"}, {Format: "p12", Password: strings.Repeat("x", 1025)}, {Format: "der"}, {Format: "pem", Password: "x"}} {
 		if err := c.Certificates.Download(context.Background(), "1", bad, &buf); err == nil {
 			t.Fatalf("Download accepted %#v", bad)
 		}
