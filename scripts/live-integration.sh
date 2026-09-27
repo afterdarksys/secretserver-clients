@@ -80,20 +80,27 @@ if [[ $ready != 1 ]]; then echo "API did not become ready" >&2; curl -sS "$API/r
 echo "==> Bootstrap tenant, API key and 'prod' container"
 RAW_KEY="sk_$(openssl rand -hex 24)"
 KEY_HASH=$(printf '%s' "$RAW_KEY" | shasum -a 256 | cut -d' ' -f1)
+# A least-privilege key for update tests: it may write but never read secrets.
+WRITE_KEY="sk_$(openssl rand -hex 24)"
+WRITE_HASH=$(printf '%s' "$WRITE_KEY" | shasum -a 256 | cut -d' ' -f1)
 psql -q -h "$SOCK" -p "$PG_PORT" -U ss_admin -d ss_live -v ON_ERROR_STOP=1 \
-  -v key_hash="$KEY_HASH" -v key_prefix="${RAW_KEY:0:11}" <<'SQL' >/dev/null
+  -v key_hash="$KEY_HASH" -v key_prefix="${RAW_KEY:0:11}" \
+  -v write_hash="$WRITE_HASH" -v write_prefix="${WRITE_KEY:0:11}" <<'SQL' >/dev/null
 WITH t AS (
   INSERT INTO tenants (name, email, password_hash, vault_path, plan, max_secrets, max_certs, max_api_keys)
   VALUES ('Client Live', 'live@example.test', 'unused', 'client-live', 'enterprise', 10000, 1000, 50)
   RETURNING id)
 INSERT INTO api_keys (tenant_id, name, key_hash, key_prefix, permissions)
-SELECT id, 'client-live', :'key_hash', :'key_prefix', '["admin:*"]'::jsonb FROM t;
+SELECT id, 'client-live', :'key_hash', :'key_prefix', '["admin:*"]'::jsonb FROM t
+UNION ALL
+SELECT id, 'client-live-write', :'write_hash', :'write_prefix', '["secrets:write"]'::jsonb FROM t;
 SQL
 printf 'Authorization: Bearer %s\n' "$RAW_KEY" >"$WORK/auth.header"
 printf '%s\n' "$RAW_KEY" >"$WORK/token"
 CONTAINER=$(curl -fsS -H @"$WORK/auth.header" -H 'Content-Type: application/json' \
   -d '{"name":"Production","slug":"prod"}' "$API/api/v1/containers" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 
+export SS_LIVE_WRITE_KEY="$WRITE_KEY"
 export SS_LIVE_URL="$API" SS_LIVE_KEY="$RAW_KEY" SS_LIVE_CONTAINER="$CONTAINER" SS_LIVE_TOKEN_FILE="$WORK/token"
 
 declare -a NAMES STATUS
@@ -109,7 +116,7 @@ run() {
       STATUS+=(PASS)
     fi
   else
-    STATUS+=(FAIL); sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | tail -30 >&2
+    STATUS+=(FAIL); sed -e "s/$RAW_KEY/<redacted>/g" -e "s/$WRITE_KEY/<redacted>/g" "$WORK/$name.out" | tail -30 >&2
   fi
   NAMES+=("$name")
   sed "s/$RAW_KEY/<redacted>/g" "$WORK/$name.out" | grep -E '^(NOT VERIFIED|SKIP)' || true
@@ -131,7 +138,7 @@ for i in "${!NAMES[@]}"; do
   printf '%-10s %s\n' "${NAMES[$i]}" "${STATUS[$i]}"
   if [[ "${STATUS[$i]}" == FAIL ]]; then failed=1; fi
 done
-if grep -qF "$RAW_KEY" "$WORK/api.log"; then echo "FAIL: API key appeared in server log" >&2; failed=1; fi
+if grep -qF -e "$RAW_KEY" -e "$WRITE_KEY" "$WORK/api.log"; then echo "FAIL: API key appeared in server log" >&2; failed=1; fi
 if [[ $failed == 0 ]] && printf '%s\n' "${STATUS[@]}" | grep -q "NOT VERIFIED"; then
   echo "All clients passed their executed checks; NOT VERIFIED rows list checks that were skipped or blocked by server defects."
 fi
