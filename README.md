@@ -4,6 +4,13 @@ Official client libraries for [SecretServer.io](https://secretserver.io) — ent
 
 **📦 [Download from GitHub](https://github.com/afterdarksys/secretserver-clients/releases) | [View Source](https://github.com/afterdarksys/secretserver-clients)**
 
+> **Minimum server for updates: secretserver.io `3075630`.** Secret, JKS keystore
+> and YubiKey updates are partial and are refused unless you opt in
+> (`partial_updates` / `partialUpdates` / `Config.PartialUpdates` /
+> `SS_PARTIAL_UPDATES=1`) or pass an ETag returned by the server. See
+> [CLIENT_COMPATIBILITY_VERIFIED.md](CLIENT_COMPATIBILITY_VERIFIED.md) for the
+> breaking changes and migration notes.
+
 ## REST API compatibility
 
 The clients target the authenticated REST API under `/api/v1`. Python, Node.js,

@@ -5,6 +5,17 @@
 **REST contract:** `/api/v1`
 **Method:** static contract audit of every client method against the server's registered gin routes and handler bind structs, plus live runs against a disposable server.
 
+> **Minimum server: secretserver.io `3075630` (partial, conditional updates).**
+> Secret, JKS keystore and YubiKey updates in every client are partial and are
+> refused client-side (no request sent) unless the client opts in
+> (Python `partial_updates=True`, Node `partialUpdates: true`, PHP
+> `partialUpdates: true`, Go `Config.PartialUpdates`, or `SS_PARTIAL_UPDATES=1`
+> for Python/Node/PHP) or the call carries an ETag previously returned by the
+> server as If-Match. Older servers (e.g. `086b727`) treat PUT as a full replace
+> and ignore If-Match, so a partial body would silently blank omitted fields;
+> they never emit an ETag, which is why only a real ETag or an explicit opt-in
+> unlocks updates. All other operations work against `086b727`.
+
 ## Result
 
 | Client | Build / lint | Unit tests | Live (disposable server) |
@@ -135,6 +146,42 @@ The harness needs `initdb`, `pg_ctl`, `vault`, `go`, `node`, `php`, `python3` an
 **Tooling**
 
 - `scripts/sync.sh` no longer copies the server's SDK and plugin over the clients, which would have reintroduced the `SS_INSECURE` TLS bypass. It now reports drift only.
+
+## Breaking changes and migration (since `90033ae`)
+
+**All clients**
+
+- Base URLs must be `https://` (plain `http://` only for localhost/127.0.0.1/::1); URLs with userinfo, query or fragment are rejected.
+- TLS verification cannot be disabled: Python `verify_ssl=False` raises, PHP `$verifySsl=false` throws, Ansible `SS_INSECURE` is gone, and Go refuses caller transports that are not an inspectable `*http.Transport` or that set `InsecureSkipVerify`. Use Python `ca_file`, PHP `caFile`, Ansible `ca_path` (both added to the system trust store), Node `NODE_EXTRA_CA_CERTS`, or a Go `*http.Transport` with `RootCAs`.
+- Updates of secrets, JKS keystores and YubiKeys are **partial**: only the fields you pass are sent. Omitted = keep, explicit null = clear. They require server `3075630`+ and are refused unless you opt in or pass an ETag (see the banner above). Get/update results expose the ETag; HTTP 409 raises `ConflictError` (PHP `ConflictException`) with the current ETag.
+- Request/response shapes now match the server: sharing takes a user or group UUID (no email); `generate_password` needs a name, stores the password and returns it in `value`; API token create needs `value` + `environment` and rotate needs the new value; GPG uses `algorithm`/`armored_key`/`?format=`; OpenSSL uses `algorithm`/`key_size`/`curve`; certificate download returns raw bytes/text; export methods take `include_*` flags and `tags` instead of `items`; webhook create takes `secret` instead of `auth_type`; history returns a list; TOTP list is unwrapped.
+
+**Go**
+
+- `SecretUpdateRequest`: `Description *string`, `Tags *[]string`, `ContainerID *string`, new `Clear []string`, `IfMatch`, `ExpectedVersion`; the `Name` field is removed. `Update` refuses an update that neither opts in (`Config.PartialUpdates`) nor carries an ETag (`ErrPartialUpdatesUnconfirmed`).
+- `JKS.Update(ctx, id, *JKSKeystoreUpdate) (etag string, err error)` replaces the raw-map version.
+- `Certificates.Download(ctx, id, *CertificateDownloadOptions, io.Writer) error`; `SSHKeys.Export` returns `*SSHKey`; `Extraction.ExtractFromDB`, `LDAP.Import`, `LDAP.Search`, `LDAP.Export` take readers/typed options; `Certificate.ChainPEM`/`PrivateKeyPEM` and `ImportSSHKeyRequest.PublicKey` are removed; `Secrets.Get` rejects `Version`.
+- go-gui: `App.ReloadClient` returns an error; the API key moves from preferences to the OS keychain automatically.
+
+**Python**
+
+- `update_secret(name, value=_UNSET, description=_UNSET, tags=_UNSET, container_id=_UNSET, if_match=None, expected_version=None)`: `None` now **clears**; omit an argument to keep it. `update_jks_keystore`/`update_yubikey` send only the keys in the dict. The three return `ETagDict` (a dict with `.etag`).
+- New constructor argument `partial_updates`; `SS_PARTIAL_UPDATES=1` also opts in.
+- The intermediate `YUBIKEY_FIELDS` constant (never in a release) is gone.
+
+**Node**
+
+- `null` now **clears** a field; `""` is sent as a literal empty value (previously `""` cleared the description). `undefined` keeps.
+- `updateSecret(name, value?, opts)`, `updateJKSKeystore(id, input, {ifMatch})`, `updateYubikey(id, input, {ifMatch})`; the latter two return `{message, etag}`. New `partialUpdates` config option.
+
+**PHP**
+
+- `updateSecret(string $name, ?string $value = null, array $opts = [], string|int|null $ifMatch = null)`, `updateJKSKeystore($id, $data, ?string $ifMatch = null)`, `updateYubikey($id, $data, ?string $ifMatch = null)`: a key present with `null` clears, an absent key keeps; unknown keys are rejected. The ETag is returned under `SecretServerClient::ETAG_KEY` (`_etag`).
+- New constructor parameter `partialUpdates` (named) / `setPartialUpdates()`; `SS_PARTIAL_UPDATES=1` also opts in. New optional `caFile`.
+
+**MCP bridge**
+
+- `resolve_secret_template` now also requires `SECRETSERVER_RESOLVE_ALLOW`; the bridge refuses to start without it when resolution is enabled.
 
 ## Not verified live
 
