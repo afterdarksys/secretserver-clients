@@ -2,7 +2,9 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -232,22 +234,46 @@ func (s *SecretsUI) showEditForm(sec *secretserver.Secret) {
 			return
 		}
 
-		// The server replaces the whole record on update; carry the loaded
-		// container and tags so the secret stays in its container. The
-		// description is always sent so clearing the field clears it.
-		desc := descEntry.Text
-		req := &secretserver.SecretUpdateRequest{
-			ContainerID: sec.ContainerID,
-			Description: &desc,
-			Data:        dataMap,
-			Tags:        sec.Tags,
+		req := editUpdateRequest(sec, descEntry.Text, dataMap)
+		if req == nil {
+			return
 		}
 
 		_, err := s.app.Client.Secrets.Update(context.Background(), sec.Name, req)
+		var conflict *secretserver.ConflictError
+		if errors.As(err, &conflict) {
+			dialog.ShowError(fmt.Errorf("'%s' was changed by someone else; reload it and edit again", sec.Name), s.app.MainWindow)
+			return
+		}
 		if err != nil {
 			dialog.ShowError(err, s.app.MainWindow)
 			return
 		}
 		s.Refresh()
 	}, s.app.MainWindow)
+}
+
+// editUpdateRequest builds a partial update holding only what the edit form
+// changed, or nil when nothing changed. An emptied description is cleared
+// (sent as null); the data is sent only when it differs. The loaded ETag is
+// sent as If-Match so a concurrent change is reported instead of overwritten.
+func editUpdateRequest(sec *secretserver.Secret, desc string, data map[string]string) *secretserver.SecretUpdateRequest {
+	req := &secretserver.SecretUpdateRequest{IfMatch: sec.ETag}
+	changed := false
+	if desc != sec.Description {
+		changed = true
+		if desc == "" {
+			req.Clear = []string{"description"}
+		} else {
+			req.Description = &desc
+		}
+	}
+	if !maps.Equal(data, sec.Data) {
+		changed = true
+		req.Data = data
+	}
+	if !changed {
+		return nil
+	}
+	return req
 }
