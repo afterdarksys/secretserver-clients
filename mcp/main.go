@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/afterdarksys/secretserver-clients/mcp/internal/securemem"
 	"log"
 	"os"
 	"regexp"
@@ -147,6 +148,7 @@ func newServer(client *Client, opts serverOptions) *mcp.Server {
 }
 
 func main() {
+	defer securemem.Purge()
 	opts, err := loadOptions(os.Getenv)
 	if err != nil {
 		log.Fatalf("configure SecretServer MCP bridge: %v", err)

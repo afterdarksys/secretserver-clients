@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import base64
+import threading
 import json
 import re
 import urllib.request
@@ -11,7 +13,7 @@ import ssl
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlsplit
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_RAW_BYTES = 16 * 1024 * 1024
@@ -198,6 +200,27 @@ def _scalar(payload):
     raise SecretServerError("Secret response has no supported scalar field")
 
 
+class _Credential:
+    """Best-effort owned-buffer cleanup, not locked memory or erasure of prior copies."""
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str):
+        self._value = bytearray(value, "utf-8")
+
+    def text(self) -> str:
+        return self._value.decode("utf-8")
+
+    def close(self):
+        self._value[:] = b"\0" * len(self._value)
+        self._value.clear()
+
+    def __repr__(self):
+        return "<redacted credential>"
+
+    def __reduce__(self):
+        raise TypeError("credentials cannot be serialized")
+
+
 class SecretServerClient:
     """
     SecretServer.io API client.
@@ -240,10 +263,16 @@ class SecretServerClient:
         verify_ssl: bool = True,
         ca_file: Optional[str] = None,
         partial_updates: Optional[bool] = None,
+        credential_provider: Optional[Callable[[], str]] = None,
     ):
         if verify_ssl is not True:
             raise ValueError("TLS verification cannot be disabled; pass ca_file to trust a private CA")
-        self.api_key = api_key or os.environ.get("SS_API_KEY", "")
+        if credential_provider is not None and (not callable(credential_provider) or api_key is not None):
+            raise ValueError("provide either api_key or a callable credential_provider")
+        self._credential_lock = threading.RLock()
+        self._closed = False
+        self._credential_provider = credential_provider
+        self._credential = _Credential("" if credential_provider is not None else (api_key or os.environ.get("SS_API_KEY", "")))
         self.api_url = _validate_base_url(api_url or os.environ.get("SS_API_URL", self.DEFAULT_URL))
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -256,7 +285,7 @@ class SecretServerClient:
             self._ssl_ctx.load_verify_locations(cafile=ca_file)
         self._ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-        if not self.api_key:
+        if self._credential_provider is None and not self.api_key:
             raise AuthError("No API key provided. Set api_key= or SS_API_KEY env var.")
         if any(ch in self.api_key for ch in "\r\n\0"):
             raise ValueError("api_key contains invalid characters")
@@ -265,9 +294,59 @@ class SecretServerClient:
     # Core HTTP helpers
     # ------------------------------------------------------------------
 
+    @property
+    def api_key(self) -> str:
+        """Compatibility accessor; explicitly creates an ordinary string copy."""
+        with self._credential_lock:
+            return self._credential.text()
+
+    @api_key.setter
+    def api_key(self, value: str):
+        with self._credential_lock:
+            if self._closed:
+                raise SecretServerError("client is closed")
+            if not isinstance(value, str) or any(ch in value for ch in "\r\n\0"):
+                raise ValueError("invalid API key")
+            self._credential.close()
+            self._credential = _Credential(value)
+
+    def close(self):
+        with self._credential_lock:
+            self._closed = True
+            self._credential.close()
+            self._credential_provider = None
+
+    def __enter__(self):
+        if self._closed:
+            raise SecretServerError("client is closed")
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def __repr__(self):
+        return "<SecretServerClient closed=%s credentials=redacted>" % self._closed
+
+    def __reduce__(self):
+        raise TypeError("authenticated clients cannot be serialized")
+
     def _headers(self) -> Dict[str, str]:
+        with self._credential_lock:
+            if self._closed:
+                raise SecretServerError("client is closed")
+            provider = self._credential_provider
+            key = self.api_key if provider is None else None
+        try:
+            if provider is not None:
+                key = provider()
+        except Exception:
+            raise AuthError("credential provider failed") from None
+        if self._closed:
+            raise SecretServerError("client is closed")
+        if not isinstance(key, str) or not key or any(ch in key for ch in "\r\n\0"):
+            raise AuthError("credential provider returned an invalid credential")
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {key}",
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": self.USER_AGENT,
@@ -572,6 +651,12 @@ class SecretServerClient:
     # ------------------------------------------------------------------
     # Operation-only cryptographic backends
     # ------------------------------------------------------------------
+
+    def signing_key(self, key_id: str, backend: str = "pkcs11") -> "RemoteSigningKey":
+        """Bind a server-side key reference. This handle never contains private key bytes."""
+        if backend not in ("pkcs11", "ehsm") or not key_id:
+            raise ValueError("use a configured operation-only backend and key ID")
+        return RemoteSigningKey(self, backend, key_id)
 
     def list_crypto_backends(self) -> List[Dict[str, Any]]:
         """List configured backends and their non-secret capabilities."""
@@ -1244,3 +1329,22 @@ class CredentialResource:
 
     def delete(self, id: str) -> None:
         self._client._delete(f"/{_seg(self._resource)}/{_seg(id)}")
+
+
+class RemoteSigningKey:
+    """Operation handle, not local key material. Parent client owns authentication."""
+    __slots__ = ("_client", "_backend", "_key_id")
+
+    def __init__(self, client: SecretServerClient, backend: str, key_id: str):
+        self._client, self._backend, self._key_id = client, backend, key_id
+
+    def sign(self, message: bytes, purpose: str) -> Dict[str, Any]:
+        if not isinstance(message, bytes) or not 0 < len(message) <= 1024 * 1024:
+            raise ValueError("message must be bytes between 1 byte and 1 MiB")
+        return self._client.sign(self._backend, self._key_id, base64.b64encode(message).decode("ascii"), purpose)
+
+    def __repr__(self):
+        return "<RemoteSigningKey operation-only>"
+
+    def __reduce__(self):
+        raise TypeError("authenticated signing handles cannot be serialized")

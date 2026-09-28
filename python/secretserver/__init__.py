@@ -7,11 +7,13 @@ from .client import (
     NotFoundError,
     PermissionError,
     SecretServerClient,
+    RemoteSigningKey,
     SecretServerError,
 )
 
 __all__ = [
     "SecretServerClient",
+    "RemoteSigningKey",
     "SecretServerError",
     "AuthError",
     "ConflictError",

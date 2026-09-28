@@ -2,6 +2,16 @@
 
 package securemem
 
-import "golang.org/x/sys/unix"
+import (
+	"github.com/awnumar/memguard"
+	"golang.org/x/sys/unix"
+)
 
-func hardenMapping(data []byte) error { return unix.Madvise(data, unix.MADV_DONTDUMP) }
+// MemGuard's memcall treats MADV_DONTDUMP as best effort. Keep our stricter
+// contract: do not expose a plaintext view if dump exclusion cannot be applied.
+func harden(b *memguard.LockedBuffer) error {
+	if unix.Madvise(b.Inner(), unix.MADV_DONTDUMP) != nil {
+		return ErrUnavailable
+	}
+	return nil
+}

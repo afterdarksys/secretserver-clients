@@ -381,3 +381,10 @@ The desktop GUI Documents tab opens the web manager with a separate sign-in;
 self-hosted users enter their web console URL. Ansible, Terraform and MCP do not
 implicitly deliver or cache protected PDFs. View-only access withholds originals,
 but visible pixels can still be captured. See https://secretserver.io/docs/documents.
+
+## Runtime memory protection
+
+Python/Node support explicit credential cleanup, request-time credential providers,
+and operation-only remote signing handles. MCP uses guarded locked memory. The
+unpublished Rust foundation lives in `rust/secret-memory`. See
+[guarantees, usage and limits](docs/MEMORY_PROTECTION.md).

@@ -74,7 +74,6 @@ func (c *Client) Close() error {
 		return nil
 	}
 	err := c.token.Destroy()
-	c.token = nil
 	return err
 }
 

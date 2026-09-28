@@ -30,6 +30,8 @@ export class ConflictError extends SecretServerError {
 export interface ClientConfig {
   /** API key — also reads SS_API_KEY from process.env */
   apiKey?: string;
+  /** Obtain a short-lived credential per request; mutually exclusive with apiKey. */
+  credentialProvider?: () => string | Promise<string>;
   /**
    * Base URL — defaults to https://api.secretserver.io. Must be https; plain
    * http is accepted only for loopback hosts (localhost, 127.0.0.1, ::1).
@@ -564,14 +566,19 @@ async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
 const USER_AGENT = "secretserver-node/1.3.0";
 
 export class SecretServerClient {
-  private readonly apiKey: string;
+  #apiKey: Uint8Array;
+  #credentialProvider?: () => string | Promise<string>;
+  #destroyed = false;
   private readonly apiUrl: string;
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
   private readonly partialUpdates: boolean;
 
   constructor(config: ClientConfig = {}) {
-    this.apiKey = config.apiKey ?? process.env.SS_API_KEY ?? "";
+    if (config.credentialProvider !== undefined && (typeof config.credentialProvider !== "function" || config.apiKey !== undefined))
+      throw new SecretServerError("provide either apiKey or credentialProvider");
+    this.#credentialProvider = config.credentialProvider;
+    this.#apiKey = new TextEncoder().encode(config.credentialProvider ? "" : (config.apiKey ?? process.env.SS_API_KEY ?? ""));
     this.apiUrl = validateBaseUrl(config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL)
       .replace(/\/$/, "")
       .replace(/\/api\/v1$/, "");
@@ -580,7 +587,7 @@ export class SecretServerClient {
     this.partialUpdates = config.partialUpdates ?? process.env.SS_PARTIAL_UPDATES === "1";
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) throw new SecretServerError("timeoutMs must be positive");
 
-    if (!this.apiKey) {
+    if (!this.#credentialProvider && this.#apiKey.length === 0) {
       throw new AuthError("No API key provided. Set apiKey or SS_API_KEY env var.");
     }
   }
@@ -594,9 +601,20 @@ export class SecretServerClient {
     if (!this.partialUpdates && !isEntityTag(ifMatch)) throw new SecretServerError(PARTIAL_UPDATES_REQUIRED);
   }
 
-  private headers(extra?: Record<string, string>): Record<string, string> {
+  /** Wipe the owned credential copy. Caller strings, headers, and in-flight requests are outside this guarantee. */
+  destroy(): void { this.#destroyed = true; this.#apiKey.fill(0); this.#apiKey = new Uint8Array(0); this.#credentialProvider = undefined; }
+  toJSON(): never { throw new SecretServerError("authenticated clients cannot be serialized"); }
+  [Symbol.for("nodejs.util.inspect.custom")](): string { return "SecretServerClient { credentials: [redacted] }"; }
+
+  private async headers(extra?: Record<string, string>): Promise<Record<string, string>> {
+    if (this.#destroyed) throw new SecretServerError("client is destroyed");
+    let key: string;
+    try { key = this.#credentialProvider ? await this.#credentialProvider() : new TextDecoder().decode(this.#apiKey); }
+    catch { throw new AuthError("credential provider failed"); }
+    if (this.#destroyed) throw new SecretServerError("client is destroyed");
+    if (typeof key !== "string" || !key || /[\r\n\0]/.test(key)) throw new AuthError("invalid credential");
     return {
-      Authorization: `Bearer ${this.apiKey}`,
+      Authorization: `Bearer ${key}`,
       Accept: "application/json",
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
@@ -632,11 +650,13 @@ export class SecretServerClient {
   private async send(method: string, path: string, body?: unknown, headers?: Record<string, string>, pdf?: Uint8Array): Promise<Response> {
     const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
     const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
+    const authHeaders = await this.headers(headers);
+    if (this.#destroyed) throw new SecretServerError("client is destroyed");
     const res = await this.fetchFn(url, {
       method,
       redirect: "error",
       signal: AbortSignal.timeout(this.timeoutMs),
-      headers: this.headers(headers),
+      headers: authHeaders,
       body: pdf !== undefined ? new Blob([new Uint8Array(pdf)], { type: "application/pdf" }) : (body !== undefined ? JSON.stringify(body) : undefined),
     });
 
@@ -832,6 +852,11 @@ export class SecretServerClient {
   // -----------------------------------------------------------------------
   // Operation-only cryptographic backends
   // -----------------------------------------------------------------------
+
+  signingKey(keyId: string, backend = "pkcs11"): RemoteSigningKey {
+    if (!["pkcs11", "ehsm"].includes(backend) || !keyId) throw new SecretServerError("use an operation-only backend and key ID");
+    return new RemoteSigningKey(this, backend, keyId);
+  }
 
   async listCryptoBackends(): Promise<CryptoBackend[]> { return this.get("/crypto/backends"); }
 
@@ -1355,3 +1380,14 @@ export interface ProtectedDocument extends DocumentUpload { created_at: string; 
 export interface DocumentList { documents: ProtectedDocument[]; can_manage: boolean; limit: number; }
 export interface DocumentGrantRequest { user_id?: string; recipient_email?: string; expires_at: string; allow_download?: boolean; allow_print?: boolean; }
 export interface DocumentGrant extends DocumentGrantRequest { id: string; user_id: string; revoked_at: string | null; }
+
+/** A server-side signing reference. It never imports or exports private key bytes. */
+export class RemoteSigningKey {
+  #client: SecretServerClient;
+  #backend: string;
+  #keyId: string;
+  constructor(client: SecretServerClient, backend: string, keyId: string) { this.#client = client; this.#backend = backend; this.#keyId = keyId; }
+  sign(message: Uint8Array, purpose: string): Promise<SignResult> { return this.#client.sign(this.#backend, this.#keyId, message, purpose); }
+  toJSON(): never { throw new SecretServerError("authenticated signing handles cannot be serialized"); }
+  [Symbol.for("nodejs.util.inspect.custom")](): string { return "RemoteSigningKey { operation-only }"; }
+}
