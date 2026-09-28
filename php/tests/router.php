@@ -12,6 +12,14 @@ if (($_SERVER['HTTP_AUTHORIZATION'] ?? '') !== 'Bearer sk_test') {
     return;
 }
 
+if (str_starts_with($uri, '/api/v1/documents')) {
+    $route = parse_url($uri, PHP_URL_PATH);
+    if (str_contains($route, '/pages/') || str_ends_with($route, '/download')) { echo "\x00\xff\n\x80"; return; }
+    if ($method === 'DELETE') { http_response_code(204); return; }
+    header('Content-Type: application/json');
+    echo json_encode(['uri'=>$uri, 'method'=>$method, 'content_type'=>$_SERVER['CONTENT_TYPE'] ?? '', 'body'=>base64_encode(file_get_contents('php://input'))]);
+    return;
+}
 switch ($uri) {
     case '/api/v1/oversize':
         header('Content-Type: application/json');

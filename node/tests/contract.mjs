@@ -353,3 +353,28 @@ function stub(routes, config = {}) {
 }
 
 console.log('contract + security tests PASS');
+
+// Protected document uploads must remain binary, and preview/print are separate requests.
+const documentCalls = [];
+const docs = new SecretServerClient({apiKey: 'sk_test', fetchFn: async (url, init) => {
+  documentCalls.push({url, init});
+  return new Response(url.includes('/pages/') || url.endsWith('/download') ? new Uint8Array([0,255,10,128]) : '{}');
+}});
+const pdfBytes = new Uint8Array([37,80,68,70,45,0,255]);
+await docs.uploadDocument('a & b.pdf', pdfBytes);
+assert.equal(documentCalls[0].init.headers['Content-Type'], 'application/pdf');
+assert.deepEqual(new Uint8Array(await documentCalls[0].init.body.arrayBuffer()), pdfBytes);
+assert.ok(documentCalls[0].url.endsWith('/documents?name=a+%26+b.pdf'));
+assert.deepEqual(await docs.previewDocument('doc', 2, true), new Uint8Array([0,255,10,128]));
+assert.ok(documentCalls.at(-1).url.endsWith('/documents/doc/pages/2?purpose=print'));
+assert.deepEqual(await docs.downloadDocument('doc'), new Uint8Array([0,255,10,128]));
+await docs.grantDocument('doc', {recipient_email:'member@example.com',expires_at:'2030-01-01T00:00:00Z'});
+assert.deepEqual(JSON.parse(documentCalls.at(-1).init.body), {allow_download:false,allow_print:false,recipient_email:'member@example.com',expires_at:'2030-01-01T00:00:00Z'});
+await docs.listDocuments(); await docs.getDocument('doc'); await docs.listDocumentGrants('doc'); await docs.revokeDocumentGrant('doc','grant');
+assert.equal(documentCalls.at(-1).init.method, 'DELETE');
+const docCount = documentCalls.length;
+assert.throws(() => docs.previewDocument('doc', 0));
+assert.throws(() => docs.grantDocument('doc', {expires_at:'x'}));
+await assert.rejects(docs.uploadDocument('x', new Uint8Array(8*1024*1024+1)));
+assert.equal(documentCalls.length, docCount);
+console.log('Protected document SDK contracts passed');

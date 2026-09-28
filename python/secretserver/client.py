@@ -289,7 +289,7 @@ class SecretServerClient:
         return self._send(method, path, body)
 
     def _send(self, method: str, path: str, body: Optional[Any] = None, raw: bool = False,
-              if_match: Optional[str] = None, with_etag: bool = False) -> Any:
+              if_match: Optional[str] = None, with_etag: bool = False, pdf: Optional[bytes] = None) -> Any:
         method = method.upper()
         if not path.startswith("/"):
             path = "/" + path
@@ -298,8 +298,10 @@ class SecretServerClient:
         elif path.startswith("/api/v1/"):
             path = path[7:]
         url = f"{self.api_url}/api/v1{path}"
-        data = json.dumps(body).encode() if body is not None else None
+        data = pdf if pdf is not None else (json.dumps(body).encode() if body is not None else None)
         headers = self._headers()
+        if pdf is not None:
+            headers["Content-Type"] = "application/pdf"
         if raw:
             headers["Accept"] = "*/*"
         if if_match is not None:
@@ -335,6 +337,41 @@ class SecretServerClient:
             raise SecretServerError("Invalid server response") from None
         except OSError:
             raise SecretServerError("SecretServer connection failed") from None
+
+    def list_documents(self) -> Any:
+        return self._get("/documents")
+
+    def get_document(self, document_id: str) -> Any:
+        return self._get(f"/documents/{_seg(document_id)}")
+
+    def upload_document(self, name: str, pdf: bytes) -> Any:
+        """Upload raw PDF bytes (maximum 8 MiB); never reads a local file."""
+        if not isinstance(pdf, bytes) or not 0 < len(pdf) <= 8 * 1024 * 1024:
+            raise ValueError("PDF must be bytes, between 1 byte and 8 MiB")
+        return self._send("POST", "/documents?" + urlencode({"name": name}), pdf=pdf)
+
+    def download_document(self, document_id: str) -> bytes:
+        return self._send("GET", f"/documents/{_seg(document_id)}/download", raw=True)
+
+    def preview_document(self, document_id: str, page: int = 1, *, for_print: bool = False) -> bytes:
+        if type(page) is not int or not 1 <= page <= 50:
+            raise ValueError("Page must be an integer from 1 to 50")
+        return self._send("GET", f"/documents/{_seg(document_id)}/pages/{page}" + ("?purpose=print" if for_print else ""), raw=True)
+
+    def grant_document(self, document_id: str, expires_at: str, *, user_id: Optional[str] = None,
+                       recipient_email: Optional[str] = None, allow_download: bool = False,
+                       allow_print: bool = False) -> Any:
+        if bool(user_id) == bool(recipient_email):
+            raise ValueError("Specify exactly one user_id or recipient_email")
+        body = {"expires_at": expires_at, "allow_download": allow_download, "allow_print": allow_print}
+        body["user_id" if user_id else "recipient_email"] = user_id or recipient_email
+        return self._post(f"/documents/{_seg(document_id)}/grants", body)
+
+    def list_document_grants(self, document_id: str) -> Any:
+        return self._get(f"/documents/{_seg(document_id)}/grants")
+
+    def revoke_document_grant(self, document_id: str, grant_id: str) -> Any:
+        return self._delete(f"/documents/{_seg(document_id)}/grants/{_seg(grant_id)}")
 
     # Retained for compatibility with code which subclassed the client.
     def _request(self, method: str, path: str, body: Optional[Any] = None) -> Any:

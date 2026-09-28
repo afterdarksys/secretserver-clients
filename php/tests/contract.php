@@ -323,3 +323,18 @@ $enroll = $client->enrollCertificate('wildcard', 'example.test', ['www.example.t
 check(($enroll['body']['dns_names'][0] ?? null) === 'www.example.test' && !isset($enroll['body']['sans']), 'certificate enrollment matches backend contract');
 
 echo "PHP contract PASS ($passed checks)\n";
+
+$doc = $client->uploadDocument('a & b.pdf', "%PDF-\x00\xff");
+check($doc['uri'] === '/api/v1/documents?name=a%20%26%20b.pdf', 'document upload name encoding');
+check($doc['content_type'] === 'application/pdf' && base64_decode($doc['body']) === "%PDF-\x00\xff", 'raw PDF upload');
+check($client->previewDocument('doc', 2, true) === "\x00\xff\n\x80", 'binary page response');
+check($client->downloadDocument('doc') === "\x00\xff\n\x80", 'binary original response');
+$grant = $client->grantDocument('doc', ['recipient_email'=>'member@example.com', 'expires_at'=>'2030-01-01T00:00:00Z']);
+$body = json_decode(base64_decode($grant['body']), true);
+check($body['allow_download'] === false && $body['allow_print'] === false, 'grant defaults deny download and print');
+$client->listDocuments(); $client->getDocument('doc'); $client->listDocumentGrants('doc');
+$client->revokeDocumentGrant('doc', 'grant'); // A 204 must complete without JSON decoding errors.
+expectFailure(fn() => $client->previewDocument('doc', 0), 'invalid page');
+expectFailure(fn() => $client->grantDocument('doc', []), 'missing recipient');
+expectFailure(fn() => $client->uploadDocument('x', str_repeat('x', 8*1024*1024+1)), 'oversize PDF');
+echo "Protected document SDK contracts passed\n";

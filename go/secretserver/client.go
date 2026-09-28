@@ -62,6 +62,7 @@ type Client struct {
 	Mock         *MockService
 	Integrations *IntegrationsService
 	Crypto       *CryptoService
+	Documents    *DocumentsService
 	JKS          *JKSService
 }
 
@@ -161,6 +162,7 @@ func NewClient(cfg *Config) (*Client, error) {
 	c.Integrations = &IntegrationsService{client: c}
 	c.Crypto = &CryptoService{client: c}
 	c.JKS = &JKSService{client: c}
+	c.Documents = &DocumentsService{client: c}
 
 	return c, nil
 }

@@ -1235,6 +1235,28 @@ class SecretServerClient
      *
      * @throws SecretServerException
      */
+    public function listDocuments(): array { return $this->get('/documents'); }
+    public function getDocument(string $id): array { return $this->get('/documents/' . self::pathSegment($id)); }
+    public function uploadDocument(string $name, string $pdf): array
+    {
+        if (strlen($pdf) === 0 || strlen($pdf) > 8 * 1024 * 1024) throw new SecretServerException('PDF must contain between 1 byte and 8 MiB');
+        $etag = null;
+        return $this->decodeJson($this->send('POST', '/documents' . self::query(['name' => $name]), null, self::MAX_JSON_BYTES, 'application/json', [], $etag, $pdf), false);
+    }
+    public function downloadDocument(string $id): string { return $this->requestRaw('GET', '/documents/' . self::pathSegment($id) . '/download'); }
+    public function previewDocument(string $id, int $page = 1, bool $forPrint = false): string
+    {
+        if ($page < 1 || $page > 50) throw new SecretServerException('Page must be from 1 to 50');
+        return $this->requestRaw('GET', '/documents/' . self::pathSegment($id) . '/pages/' . $page . ($forPrint ? '?purpose=print' : ''));
+    }
+    public function grantDocument(string $id, array $grant): array
+    {
+        if (!empty($grant['user_id']) === !empty($grant['recipient_email'])) throw new SecretServerException('Specify exactly one user_id or recipient_email');
+        return $this->post('/documents/' . self::pathSegment($id) . '/grants', array_merge(['allow_download' => false, 'allow_print' => false], $grant));
+    }
+    public function listDocumentGrants(string $id): array { return $this->get('/documents/' . self::pathSegment($id) . '/grants'); }
+    public function revokeDocumentGrant(string $id, string $grantID): void { $this->delete('/documents/' . self::pathSegment($id) . '/grants/' . self::pathSegment($grantID)); }
+
     private function requestRaw(string $method, string $path): string
     {
         return $this->send($method, $path, null, self::MAX_RAW_BYTES, '*/*');
@@ -1244,7 +1266,7 @@ class SecretServerClient
      * @param array<string, mixed>|null $body
      * @throws SecretServerException
      */
-    private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept, array $extraHeaders = [], ?string &$etag = null): string
+    private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept, array $extraHeaders = [], ?string &$etag = null, ?string $pdf = null): string
     {
         $path = '/' . ltrim($path, '/');
         if ($path === '/api/v1') {
@@ -1258,7 +1280,7 @@ class SecretServerClient
         $headers = [
             'Authorization: Bearer ' . $this->apiKey,
             'Accept: ' . $accept,
-            'Content-Type: application/json',
+            'Content-Type: ' . ($pdf !== null ? 'application/pdf' : 'application/json'),
             'User-Agent: ' . self::USER_AGENT,
             ...$extraHeaders,
         ];
@@ -1299,7 +1321,9 @@ class SecretServerClient
             curl_setopt($ch, CURLOPT_CAINFO, $this->caFile);
         }
 
-        if ($body !== null) {
+        if ($pdf !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $pdf);
+        } elseif ($body !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, $body === [] ? '{}' : json_encode($body, JSON_THROW_ON_ERROR));
         }
 

@@ -76,6 +76,7 @@ func (a *App) BuildUI() fyne.CanvasObject {
 	a.Tabs = container.NewAppTabs(
 		container.NewTabItem("Secrets", a.secretsUI.Content),
 		container.NewTabItem("Variables", a.variablesPanel()),
+		container.NewTabItem("Documents", a.documentsPanel()),
 		container.NewTabItem("Extractor", a.extractorUI.Content),
 		container.NewTabItem("Settings", a.settingsUI.Content),
 	)

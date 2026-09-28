@@ -629,7 +629,7 @@ export class SecretServerClient {
     return readCapped(await this.send("GET", path), MAX_RAW_BYTES);
   }
 
-  private async send(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<Response> {
+  private async send(method: string, path: string, body?: unknown, headers?: Record<string, string>, pdf?: Uint8Array): Promise<Response> {
     const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
     const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
     const res = await this.fetchFn(url, {
@@ -637,7 +637,7 @@ export class SecretServerClient {
       redirect: "error",
       signal: AbortSignal.timeout(this.timeoutMs),
       headers: this.headers(headers),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: pdf !== undefined ? new Blob([new Uint8Array(pdf)], { type: "application/pdf" }) : (body !== undefined ? JSON.stringify(body) : undefined),
     });
 
     if (!res.ok) {
@@ -651,6 +651,27 @@ export class SecretServerClient {
     }
     return res;
   }
+
+  listDocuments(): Promise<DocumentList> { return this.get("/documents"); }
+  getDocument(id: string): Promise<ProtectedDocument> { return this.get(`/documents/${seg(id)}`); }
+  async uploadDocument(name: string, pdf: Uint8Array): Promise<DocumentUpload> {
+    if (!(pdf instanceof Uint8Array) || pdf.byteLength === 0 || pdf.byteLength > 8 * 1024 * 1024)
+      throw new SecretServerError("PDF must contain between 1 byte and 8 MiB");
+    const res = await this.send("POST", `/documents?${new URLSearchParams({name})}`, undefined, {"Content-Type": "application/pdf"}, pdf);
+    try { return JSON.parse(new TextDecoder().decode(await readCapped(res, MAX_JSON_BYTES))); }
+    catch (e) { if (e instanceof SecretServerError) throw e; throw new SecretServerError("Invalid document upload response"); }
+  }
+  downloadDocument(id: string): Promise<Uint8Array> { return this.download(`/documents/${seg(id)}/download`); }
+  previewDocument(id: string, page = 1, forPrint = false): Promise<Uint8Array> {
+    if (!Number.isInteger(page) || page < 1 || page > 50) throw new SecretServerError("Page must be an integer from 1 to 50");
+    return this.download(`/documents/${seg(id)}/pages/${page}${forPrint ? "?purpose=print" : ""}`);
+  }
+  grantDocument(id: string, grant: DocumentGrantRequest): Promise<{id: string}> {
+    if (!!grant.user_id === !!grant.recipient_email) throw new SecretServerError("Specify exactly one user_id or recipient_email");
+    return this.post(`/documents/${seg(id)}/grants`, {allow_download: false, allow_print: false, ...grant});
+  }
+  listDocumentGrants(id: string): Promise<{grants: DocumentGrant[]}> { return this.get(`/documents/${seg(id)}/grants`); }
+  revokeDocumentGrant(id: string, grantID: string): Promise<void> { return this.delete(`/documents/${seg(id)}/grants/${seg(grantID)}`); }
 
   private get = <T>(path: string) => this.request<T>("GET", path);
   private post = <T>(path: string, body?: unknown) => this.request<T>("POST", path, body);
@@ -1328,3 +1349,9 @@ function scalar(payload: {value?: string; data?: Record<string, unknown>}): stri
  }
  throw new SecretServerError("Secret response has no supported scalar field");
 }
+
+export interface DocumentUpload { id: string; name: string; pages: number; size_bytes: number; }
+export interface ProtectedDocument extends DocumentUpload { created_at: string; can_manage: boolean; can_download: boolean; can_print: boolean; }
+export interface DocumentList { documents: ProtectedDocument[]; can_manage: boolean; limit: number; }
+export interface DocumentGrantRequest { user_id?: string; recipient_email?: string; expires_at: string; allow_download?: boolean; allow_print?: boolean; }
+export interface DocumentGrant extends DocumentGrantRequest { id: string; user_id: string; revoked_at: string | null; }
