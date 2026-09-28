@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/afterdarksys/secretserver-go/secretserver"
+	"github.com/afterdarksys/secretserver-clients/go/secretserver"
 )
 
 func TestEditUpdateRequest(t *testing.T) {

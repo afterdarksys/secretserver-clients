@@ -8,7 +8,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
-	"github.com/afterdarksys/secretserver-go/secretserver"
+	"github.com/afterdarksys/secretserver-clients/go/secretserver"
 )
 
 // SettingsUI manages the configuration view

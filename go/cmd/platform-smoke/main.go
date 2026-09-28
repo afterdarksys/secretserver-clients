@@ -12,7 +12,7 @@ import (
 	"os"
 	"strings"
 
-	ss "github.com/afterdarksys/secretserver-go/secretserver"
+	ss "github.com/afterdarksys/secretserver-clients/go/secretserver"
 )
 
 // liveEnv returns SS_LIVE_URL, SS_LIVE_KEY and SS_LIVE_WRITE_KEY, exiting

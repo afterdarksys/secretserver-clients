@@ -60,7 +60,7 @@ TOTP and YubiKey OTP, JKS keystores, and operation-only HSM signing.
 | **Python** | `python/` | `pip install secretserver` | [PyPI](https://pypi.org/project/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/python) |
 | **Node.js / TypeScript** | `node/` | `npm install secretserver` | [npm](https://npmjs.com/package/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/node) |
 | **PHP** | `php/` | `composer require afterdark/secretserver` | [Packagist](https://packagist.org/packages/afterdark/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
-| **Go** | `go/` | `go get github.com/afterdarksys/secretserver-go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-go) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/go) |
+| **Go** | `go/` | `go get github.com/afterdarksys/secretserver-clients/go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-clients/go) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/go) |
 | **Ansible** | `ansible/` | Drop `secretserver.py` in your lookup_plugins/ | — | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/ansible) |
 | **MCP** | `mcp/` | `go build -o secretserver-mcp .` | stdio MCP server | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/mcp) |
 | **Agent Skills** | `skills/` | Copy the appropriate skill folder | Claude Code and Codex | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/skills) |
@@ -208,7 +208,7 @@ echo "Current code: {$code['code']}\n";  // 6-digit code
 ### Go
 
 ```go
-import ss "github.com/afterdarksys/secretserver-go/secretserver"
+import ss "github.com/afterdarksys/secretserver-clients/go/secretserver"
 
 client, err := ss.NewClient(&ss.Config{
     APIKey: os.Getenv("SS_API_KEY"),

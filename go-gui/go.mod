@@ -2,12 +2,12 @@ module github.com/afterdarksys/secretserver-gui
 
 go 1.25.7
 
-replace github.com/afterdarksys/secretserver-go => ../go
+replace github.com/afterdarksys/secretserver-clients/go => ../go
 
 require (
 	fyne.io/fyne/v2 v2.7.3
-	github.com/afterdarksys/secretserver-go v0.0.0-00010101000000-000000000000
-	github.com/afterdarktech/sekretsauce v0.0.0-00010101000000-000000000000
+	github.com/afterdarksys/secretserver-clients/go v0.0.0-00010101000000-000000000000
+	github.com/straticus1/SeKretSauce/sekretsauce-cli v0.0.0-20260928124030-b4d9d37a4384
 	github.com/zalando/go-keyring v0.2.8
 )
 
@@ -46,5 +46,3 @@ require (
 	golang.org/x/text v0.22.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/afterdarktech/sekretsauce => /Users/ryan/development/afterdark-secretsauce/sekretsauce-cli

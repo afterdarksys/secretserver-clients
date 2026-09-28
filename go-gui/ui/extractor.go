@@ -12,9 +12,9 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
-	"github.com/afterdarksys/secretserver-go/secretserver"
-	"github.com/afterdarktech/sekretsauce/pkg/keychain"
-	"github.com/afterdarktech/sekretsauce/pkg/secrets"
+	"github.com/afterdarksys/secretserver-clients/go/secretserver"
+	"github.com/straticus1/SeKretSauce/sekretsauce-cli/pkg/keychain"
+	"github.com/straticus1/SeKretSauce/sekretsauce-cli/pkg/secrets"
 )
 
 // ExtractorUI manages the local credentials extractor

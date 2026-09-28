@@ -3,7 +3,7 @@ package ui
 import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"github.com/afterdarksys/secretserver-go/secretserver"
+	"github.com/afterdarksys/secretserver-clients/go/secretserver"
 )
 
 // App holds the application state
