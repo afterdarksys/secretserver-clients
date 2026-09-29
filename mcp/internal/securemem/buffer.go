@@ -31,7 +31,7 @@ const MaxSecretSize = 1 << 20
 const (
 	headroomMinBytes   = 64 << 10
 	headroomMaxBytes   = 1 << 20
-	defaultBudgetBytes = 64 << 20
+	defaultBudgetBytes = 16 << 20
 )
 
 var pageSize = os.Getpagesize()

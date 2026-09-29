@@ -74,7 +74,7 @@ func TestBudgetFromLimit(t *testing.T) {
 	if got := budgetFromLimit(0, true); got != 0 {
 		t.Fatalf("zero limit: %d", got)
 	}
-	if got := budgetFromLimit(0, false); got != defaultBudgetBytes/page {
+	if got := budgetFromLimit(0, false); got != (16<<20)/page {
 		t.Fatalf("unlimited: %d", got)
 	}
 	if got := budgetFromLimit(256<<10, true); got != (256<<10-64<<10)/page {
