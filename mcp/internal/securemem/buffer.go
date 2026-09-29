@@ -6,14 +6,82 @@ package securemem
 import (
 	"errors"
 	"fmt"
-	"github.com/awnumar/memguard"
+	"os"
 	"sync"
+
+	"github.com/awnumar/memguard"
 )
 
 var ErrDestroyed = errors.New("secure memory buffer has been destroyed")
 var ErrUnavailable = errors.New("protected memory unavailable")
 
+// ErrExhausted means one allocation did not fit the locked-page budget. It
+// fails that request only; existing buffers and later allocations are fine.
+// errors.Is(ErrExhausted, ErrUnavailable) is true.
+var ErrExhausted = fmt.Errorf("%w: locked-memory budget exhausted", ErrUnavailable)
+
 const MaxSecretSize = 1 << 20
+
+// Locked-page budget. MemGuard panics on an mlock failure, and its panic path
+// purges every allocation in the process. The adapter therefore counts the
+// pages it locks and refuses an allocation before the kernel limit is hit.
+// The budget is RLIMIT_MEMLOCK minus headroom for other code in the process
+// that may lock memory (PKCS#11 modules, TLS libraries); with no finite limit
+// it is defaultBudgetBytes.
+const (
+	headroomMinBytes   = 64 << 10
+	headroomMaxBytes   = 1 << 20
+	defaultBudgetBytes = 64 << 20
+)
+
+var pageSize = os.Getpagesize()
+var budgetPages = -1 // computed on first allocation
+var lockedPages int
+var generation int // bumped by Purge; buffers from older generations hold no pages
+
+// onPoison runs if MemGuard fails anyway (a panic inside the dependency). All
+// buffers are gone at that point, so the process must restart.
+var onPoison = func() {
+	fmt.Fprintln(os.Stderr, "securemem: FATAL: protected memory failed (mlock/mprotect); MemGuard purged every buffer; exiting with status 70 for a supervised restart")
+	os.Exit(70)
+}
+
+func budgetFromLimit(limit uint64, finite bool) int {
+	if !finite {
+		return defaultBudgetBytes / pageSize
+	}
+	headroom := limit / 8
+	if headroom < headroomMinBytes {
+		headroom = headroomMinBytes
+	}
+	if headroom > headroomMaxBytes {
+		headroom = headroomMaxBytes
+	}
+	if limit <= headroom {
+		return 0
+	}
+	return int((limit - headroom) / uint64(pageSize))
+}
+
+func pagesFor(size int) int { return (size + pageSize - 1) / pageSize }
+
+// Healthy reports whether protected memory is usable. It is false only after
+// a dependency failure, which also terminates the process (status 70).
+func Healthy() bool {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	return !failed
+}
+
+// Usage returns locked pages in use and the budget, in pages.
+func Usage() (used, budget int) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	if budgetPages < 0 {
+		budgetPages = budgetFromLimit(memlockLimit())
+	}
+	return lockedPages, budgetPages
+}
 
 // All memory operations and borrowed views share one lock because MemGuard may
 // purge every allocation on failure. Never call MemGuard directly alongside
@@ -26,6 +94,8 @@ var failed bool
 type Buffer struct {
 	memory *memguard.LockedBuffer
 	size   int
+	pages  int
+	gen    int
 }
 
 func protected(fn func() error) (err error) {
@@ -35,6 +105,7 @@ func protected(fn func() error) (err error) {
 		if recover() != nil {
 			failed = true
 			err = ErrUnavailable
+			onPoison()
 		}
 	}()
 	return fn()
@@ -46,10 +117,17 @@ func allocate(size int, init func(*memguard.LockedBuffer)) (*Buffer, error) {
 	}
 	var b *Buffer
 	err := protected(func() error {
-		// A dependency panic can leave a partially allocated mapping. Poison the
-		// adapter until process restart so retries cannot accumulate leaked mappings.
+		// After a dependency panic the process is exiting (onPoison); refuse
+		// everything until then.
 		if failed {
 			return ErrUnavailable
+		}
+		if budgetPages < 0 {
+			budgetPages = budgetFromLimit(memlockLimit())
+		}
+		need := pagesFor(size)
+		if lockedPages+need > budgetPages {
+			return ErrExhausted
 		}
 		p := memguard.NewBuffer(size)
 		keep := false
@@ -68,7 +146,8 @@ func allocate(size int, init func(*memguard.LockedBuffer)) (*Buffer, error) {
 			init(p)
 		}
 		p.Freeze()
-		b = &Buffer{memory: p, size: size}
+		b = &Buffer{memory: p, size: size, pages: need, gen: generation}
+		lockedPages += need
 		keep = true
 		return nil
 	})
@@ -180,12 +259,23 @@ func (b *Buffer) Destroy() error {
 		if b.memory != nil {
 			b.memory.Destroy()
 			b.memory = nil
+			if b.gen == generation {
+				lockedPages -= b.pages
+			}
 		}
+		b.pages = 0
 		b.size = 0
 		return nil
 	})
 }
 
 // Purge invalidates all adapter buffers. Only executables should call this,
-// after draining work at shutdown. A failed session requires process restart.
-func Purge() error { return protected(func() error { memguard.Purge(); return nil }) }
+// after draining work at shutdown.
+func Purge() error {
+	return protected(func() error {
+		memguard.Purge()
+		lockedPages = 0
+		generation++
+		return nil
+	})
+}

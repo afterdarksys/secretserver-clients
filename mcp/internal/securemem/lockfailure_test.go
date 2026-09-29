@@ -39,42 +39,64 @@ func TestLockFailureIsClosed(t *testing.T) {
 	}
 }
 
-// One successful allocation followed by exhaustion exercises purge while other
-// live handles exist, and ensures repeated retries neither allocate nor hang.
-func TestPartialLockExhaustion(t *testing.T) {
-	if os.Getenv("SS_MEMORY_PARTIAL_CHILD") == "1" {
+// If MemGuard fails anyway (here: the adapter budget is forced far above the
+// kernel limit), every buffer is gone, so the process must exit with status 70
+// for a supervised restart instead of serving on a poisoned adapter.
+func TestDependencyFailureExitsForRestart(t *testing.T) {
+	if os.Getenv("SS_MEMORY_POISON_CHILD") == "1" {
 		page := uint64(os.Getpagesize())
 		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: page, Max: page}); err != nil {
 			t.Fatal(err)
 		}
-		first, err := Consume([]byte("first"))
-		if err != nil {
-			t.Fatal("first allocation", err)
-		}
-		defer first.Destroy()
-		for i := 0; i < 100; i++ {
-			src := []byte("second")
-			b, err := Consume(src)
-			if b != nil || !errors.Is(err, ErrUnavailable) {
-				t.Fatalf("exhaustion not closed: %v", err)
-			}
-			if !bytes.Equal(src, make([]byte, len(src))) {
-				t.Fatal("source not wiped")
-			}
-			if err := first.WithBytes(func([]byte) error { t.Fatal("stale view exposed"); return nil }); !errors.Is(err, ErrUnavailable) {
-				t.Fatal("stale handle", err)
+		budgetPages = 1 << 20
+		for i := 0; i < 8; i++ {
+			if _, err := Consume([]byte("x")); err != nil {
+				t.Fatalf("returned instead of exiting: %v", err)
 			}
 		}
-		if first.Len() != 0 {
-			t.Fatal("purged handle length")
-		}
-		return
+		t.Fatal("kernel limit never reached")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPartialLockExhaustion$", "-test.v")
-	cmd.Env = append(os.Environ(), "SS_MEMORY_PARTIAL_CHILD=1")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("partial exhaustion: %v\n%s", err, output)
+	out, err := runChild(t, "TestDependencyFailureExitsForRestart", "SS_MEMORY_POISON_CHILD")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 70 {
+		t.Fatalf("want exit status 70, got %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("exiting with status 70")) {
+		t.Fatalf("poison not logged:\n%s", out)
+	}
+}
+
+func TestBudgetFromLimit(t *testing.T) {
+	page := os.Getpagesize()
+	if got := budgetFromLimit(8<<20, true); got != (8<<20-1<<20)/page {
+		t.Fatalf("8 MiB limit: %d pages", got)
+	}
+	if got := budgetFromLimit(0, true); got != 0 {
+		t.Fatalf("zero limit: %d", got)
+	}
+	if got := budgetFromLimit(0, false); got != defaultBudgetBytes/page {
+		t.Fatalf("unlimited: %d", got)
+	}
+	if got := budgetFromLimit(256<<10, true); got != (256<<10-64<<10)/page {
+		t.Fatalf("256 KiB limit: %d", got)
+	}
+}
+
+func TestHealthyAndUsage(t *testing.T) {
+	if !Healthy() {
+		t.Fatal("adapter unhealthy at start")
+	}
+	before, budget := Usage()
+	b, err := Consume([]byte("usage"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used, _ := Usage(); used != before+1 {
+		t.Fatalf("used %d, want %d", used, before+1)
+	}
+	b.Destroy()
+	b.Destroy()
+	if used, _ := Usage(); used != before || budget <= 0 {
+		t.Fatalf("used %d after destroy (budget %d)", used, budget)
 	}
 }
