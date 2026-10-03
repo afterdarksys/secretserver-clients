@@ -1,4 +1,24 @@
 
+## Authentication
+
+Pass exactly one of `Config.APIKey` or `Config.TokenProvider`
+(`func(ctx context.Context) (string, error)`, called before every request).
+
+To reuse your `ss login` SSO session instead of an API key:
+
+```go
+creds := secretserver.CLICredentials() // runs `ss auth print-access-token --format json`
+cfg, err := creds.Config(ctx)          // APIURL = the URL `ss` is logged in to
+if err != nil { /* errors.Is(err, secretserver.ErrCLINotLoggedIn): run `ss login` */ }
+client, err := secretserver.NewClient(cfg)
+```
+
+Or set `Config{TokenProvider: creds.Token}` with your own `APIURL`. The CLI is
+taken from `SS_CLI_PATH`, else `ss` on `PATH` (override with
+`CLICredentialProvider.Path`), run without a shell, limited to 30 s
+(`Timeout`) and 64 KiB of output. Tokens are cached in memory until 60 s
+before they expire and never appear in errors.
+
 
 ## Protected PDF documents
 
