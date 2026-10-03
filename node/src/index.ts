@@ -30,7 +30,10 @@ export class ConflictError extends SecretServerError {
 export interface ClientConfig {
   /** API key — also reads SS_API_KEY from process.env */
   apiKey?: string;
-  /** Obtain a short-lived credential per request; mutually exclusive with apiKey. */
+  /**
+   * Obtain a short-lived credential per request; mutually exclusive with
+   * apiKey. Use cliCredentialProvider() to reuse the `ss login` session.
+   */
   credentialProvider?: () => string | Promise<string>;
   /**
    * Base URL — defaults to https://api.secretserver.io. Must be https; plain
@@ -471,6 +474,10 @@ function validateBaseUrl(raw: string): string {
  * Percent-encode one caller-supplied path segment. Empty and dot segments are
  * rejected because URL normalisation would collapse them into a different route.
  */
+function normalizeBaseUrl(raw: string): string {
+  return validateBaseUrl(raw).replace(/\/$/, "").replace(/\/api\/v1$/, "");
+}
+
 function seg(value: string | number): string {
   const s = String(value);
   if (s === "" || s === "." || s === "..") throw new SecretServerError("Invalid path segment");
@@ -563,13 +570,114 @@ async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
   if (bytes.byteLength > cap) throw tooLarge();
   return bytes;
 }
-const USER_AGENT = "secretserver-node/1.3.0";
+const USER_AGENT = "secretserver-node/1.4.0";
+
+// ---------------------------------------------------------------------------
+// CLI credential provider (`ss login`)
+//
+// Threats: lets a program reuse the developer's `ss login` session without
+// handling refresh tokens. The CLI is run from an argv array (execFile, no
+// shell) with a 30 s timeout and a 64 KiB output cap; any malformed answer
+// fails closed; the access token and the CLI's stdout never appear in errors.
+// Does NOT protect against a malicious `ss` binary on PATH or in SS_CLI_PATH,
+// or against other code running as the same OS user.
+// ---------------------------------------------------------------------------
+
+export interface CliCredentialProviderOptions {
+  /** The `ss` executable. Default: SS_CLI_PATH from process.env, else `ss` on PATH. */
+  cliPath?: string;
+  /** Limit for one CLI run in milliseconds. Default 30000. */
+  timeoutMs?: number;
+}
+
+/** A `credentialProvider` backed by `ss auth print-access-token`. */
+export interface CliCredentialProvider {
+  (): Promise<string>;
+  /** The API URL the CLI is logged in to (runs the CLI if nothing is cached). */
+  apiUrl(): Promise<string | undefined>;
+}
+
+interface CliToken { token: string; expiresAt: number; apiUrl?: string; }
+
+const CLI_MAX_OUTPUT = 64 * 1024;
+const CLI_REFRESH_SKEW_MS = 60_000;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i;
+const cliProviders = new WeakSet<object>();
+
+/**
+ * Credential provider that reuses the `ss login` SSO session: it runs
+ * `ss auth print-access-token --format json` and caches the token in memory
+ * until 60 s before it expires. Exit status 2 from the CLI becomes an
+ * AuthError telling the user to run `ss login`. When the client is given no
+ * apiUrl (and SS_API_URL is unset) it uses the URL the CLI is logged in to.
+ */
+export function cliCredentialProvider(opts: CliCredentialProviderOptions = {}): CliCredentialProvider {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new SecretServerError("timeoutMs must be positive");
+  let cached: CliToken | undefined;
+  let inflight: Promise<CliToken> | undefined;
+  const current = async (): Promise<CliToken> => {
+    if (cached && Date.now() < cached.expiresAt - CLI_REFRESH_SKEW_MS) return cached;
+    cached = undefined;
+    inflight ??= runCli(opts.cliPath || process.env.SS_CLI_PATH || "ss", timeoutMs).finally(() => { inflight = undefined; });
+    cached = await inflight;
+    return cached;
+  };
+  const provider = (async () => (await current()).token) as CliCredentialProvider;
+  provider.apiUrl = async () => (await current()).apiUrl;
+  cliProviders.add(provider);
+  return provider;
+}
+
+type CliExecError = Error & { code?: number | string; killed?: boolean };
+type ExecFile = (
+  file: string, args: string[], options: object,
+  callback: (err: CliExecError | null, stdout: string, stderr: string) => void,
+) => { stdin?: { end(): void } | null };
+// Loaded lazily (and through a variable, so bundlers for non-Node targets
+// leave it alone); only cliCredentialProvider needs it.
+const CHILD_PROCESS_MODULE = "node:child_process";
+
+async function runCli(path: string, timeoutMs: number): Promise<CliToken> {
+  const { execFile } = (await import(CHILD_PROCESS_MODULE)) as { execFile: ExecFile };
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const child = execFile(path, ["auth", "print-access-token", "--format", "json"], {
+      encoding: "utf8", shell: false, timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: CLI_MAX_OUTPUT, windowsHide: true,
+    }, (err, out, errOut) => {
+      if (!err) return resolve(out);
+      // Never attach err: it carries the CLI's stdout.
+      const e = err;
+      if (e.code === "ENOENT") return reject(new SecretServerError(`SecretServer CLI "${path}" not found: install \`ss\` or set SS_CLI_PATH`));
+      if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return reject(new SecretServerError(`\`ss auth print-access-token\` output exceeds ${CLI_MAX_OUTPUT} bytes`));
+      if (e.killed) return reject(new SecretServerError(`\`ss auth print-access-token\` timed out after ${timeoutMs} ms`));
+      if (e.code === 2) return reject(new AuthError("SecretServer CLI is not logged in: run `ss login`"));
+      if (typeof e.code === "number") return reject(new SecretServerError(`\`ss auth print-access-token\` failed (exit ${e.code})${stderrExcerpt(errOut)}`));
+      reject(new SecretServerError(`running SecretServer CLI "${path}" failed`));
+    });
+    child.stdin?.end();
+  });
+  let parsed: unknown;
+  try { parsed = JSON.parse(stdout); } catch { throw new SecretServerError("`ss auth print-access-token` returned invalid JSON"); }
+  const o = (parsed ?? {}) as Record<string, unknown>;
+  if (typeof o.access_token !== "string" || !/^[\x21-\x7e]+$/.test(o.access_token))
+    throw new SecretServerError("`ss auth print-access-token` returned no usable access_token");
+  const expiresAt = typeof o.expires_at === "string" && RFC3339.test(o.expires_at) ? Date.parse(o.expires_at) : NaN;
+  if (!Number.isFinite(expiresAt)) throw new SecretServerError("`ss auth print-access-token` returned an invalid expires_at");
+  return { token: o.access_token, expiresAt, apiUrl: typeof o.api_url === "string" && o.api_url ? o.api_url : undefined };
+}
+
+/** First stderr line, at most 200 printable characters. The CLI never writes tokens to stderr. */
+function stderrExcerpt(stderr: string): string {
+  const line = (stderr.trim().split("\n")[0] ?? "").replace(/[\x00-\x1f\x7f]/g, "").slice(0, 200);
+  return line ? `: ${line}` : "";
+}
 
 export class SecretServerClient {
   #apiKey: Uint8Array;
   #credentialProvider?: () => string | Promise<string>;
   #destroyed = false;
-  private readonly apiUrl: string;
+  private apiUrl: string;
+  #apiUrlFromCli?: () => Promise<string | undefined>;
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
   private readonly partialUpdates: boolean;
@@ -579,9 +687,9 @@ export class SecretServerClient {
       throw new SecretServerError("provide either apiKey or credentialProvider");
     this.#credentialProvider = config.credentialProvider;
     this.#apiKey = new TextEncoder().encode(config.credentialProvider ? "" : (config.apiKey ?? process.env.SS_API_KEY ?? ""));
-    this.apiUrl = validateBaseUrl(config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL)
-      .replace(/\/$/, "")
-      .replace(/\/api\/v1$/, "");
+    this.apiUrl = normalizeBaseUrl(config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL);
+    if (config.apiUrl === undefined && process.env.SS_API_URL === undefined && cliProviders.has(config.credentialProvider as object))
+      this.#apiUrlFromCli = (config.credentialProvider as CliCredentialProvider).apiUrl;
     this.fetchFn = config.fetchFn ?? fetch;
     this.timeoutMs = config.timeoutMs ?? 10000;
     this.partialUpdates = config.partialUpdates ?? process.env.SS_PARTIAL_UPDATES === "1";
@@ -610,7 +718,11 @@ export class SecretServerClient {
     if (this.#destroyed) throw new SecretServerError("client is destroyed");
     let key: string;
     try { key = this.#credentialProvider ? await this.#credentialProvider() : new TextDecoder().decode(this.#apiKey); }
-    catch { throw new AuthError("credential provider failed"); }
+    catch (e) {
+      // SDK errors (e.g. cliCredentialProvider's "run `ss login`") carry no secrets.
+      if (e instanceof SecretServerError) throw e;
+      throw new AuthError("credential provider failed");
+    }
     if (this.#destroyed) throw new SecretServerError("client is destroyed");
     if (typeof key !== "string" || !key || /[\r\n\0]/.test(key)) throw new AuthError("invalid credential");
     return {
@@ -648,6 +760,11 @@ export class SecretServerClient {
   }
 
   private async send(method: string, path: string, body?: unknown, headers?: Record<string, string>, pdf?: Uint8Array): Promise<Response> {
+    if (this.#apiUrlFromCli) {
+      const fromCli = await this.#apiUrlFromCli();
+      if (fromCli) this.apiUrl = normalizeBaseUrl(fromCli);
+      this.#apiUrlFromCli = undefined;
+    }
     const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
     const url = `${this.apiUrl}/api/v1${normalizedPath === "/" ? "" : normalizedPath}`;
     const authHeaders = await this.headers(headers);

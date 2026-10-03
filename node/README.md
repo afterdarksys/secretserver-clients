@@ -9,6 +9,24 @@ const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
 const value = await ss.secret("production/db-password");
 ```
 
+## Use your `ss login`
+
+Instead of an API key, reuse the SSO session of the `ss` CLI:
+
+```ts
+import { SecretServerClient, cliCredentialProvider, AuthError } from "secretserver";
+
+const ss = new SecretServerClient({ credentialProvider: cliCredentialProvider() });
+// AuthError "... run `ss login`" when the CLI has no valid session.
+```
+
+The provider runs `ss auth print-access-token --format json` (the binary from
+`SS_CLI_PATH`, else `ss` on `PATH`; options `cliPath`, `timeoutMs`) through
+`execFile` without a shell, with a 30 s timeout and a 64 KiB output cap. It
+caches the token in memory until 60 s before expiry. When neither `apiUrl` nor
+`SS_API_URL` is set, the client uses the API URL the CLI is logged in to.
+Tokens never appear in errors.
+
 ## Partial updates
 
 **Minimum server: secretserver.io 3075630 (partial, conditional updates).**
