@@ -68,6 +68,24 @@ TOTP and YubiKey OTP, JKS keystores, and operation-only HSM signing.
 
 **📥 [Download All Clients](https://github.com/afterdarksys/secretserver-clients/releases) | [Clone Repository](https://github.com/afterdarksys/secretserver-clients.git)**
 
+### Install from git (no registry account needed)
+
+The repository is public, so these need no GitHub or registry credentials.
+`<ref>` is the branch `feat/cli-sso-login` (or a commit hash) today, and the
+release tags after 1.4.0 ships: `v1.4.0` for Python/Node/PHP/Ansible,
+`go/v1.4.0` and `mcp/v1.4.0` for the Go modules. Verified from clean temp
+directories against `feat/cli-sso-login` @ 4a62eac.
+
+| Client | Command |
+|--------|---------|
+| Go | `go get github.com/afterdarksys/secretserver-clients/go@<ref>` — Go rejects branch names containing `/`, so use a commit hash (or the `go/v1.4.0` tag) |
+| Python | `pip install "git+https://github.com/afterdarksys/secretserver-clients.git@<ref>#subdirectory=python"` |
+| Node.js | npm cannot install a git subdirectory. Clone, build, pack, install the tarball: `git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git && (cd secretserver-clients/node && npm ci && npm run build && npm pack)` then `npm install ./secretserver-clients/node/secretserver-1.4.0.tgz` |
+| PHP | A Composer `vcs` repository does not work (no `composer.json` at the repo root). Clone, then use a `path` repository: `composer config repositories.secretserver path ./secretserver-clients/php && composer require afterdark/secretserver:@dev` |
+| Ansible | Not a Galaxy collection. Clone and copy `ansible/secretserver.py` into your `lookup_plugins/` (or point `ANSIBLE_LOOKUP_PLUGINS` at `secretserver-clients/ansible`); `use_cli_login` also needs the Python package above |
+| MCP bridge | `go install …/mcp@<ref>` does not work (its `go.mod` has a `replace` for `../go`). Clone and build: `cd secretserver-clients/mcp && go build -o secretserver-mcp .` |
+| Desktop GUI | Same `replace` limitation. Clone and build (cgo/Fyne toolchain required): `cd secretserver-clients/go-gui && go build -o secretserver-gui .` |
+
 ### MCP and agent skills
 
 The standalone MCP bridge provides operation-only access to non-exportable smart-card and HSM signing keys. It reads a short-lived `keys:sign` identity from an owner-only file and never returns private key material.

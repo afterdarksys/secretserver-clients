@@ -74,3 +74,12 @@ to another origin), requires TLS 1.2 or newer, bounds responses to 4 MiB, and
 validates signing inputs (key id and purpose 1-256 characters, message at most
 1 MiB decoded) before any request is sent. A reverse-proxy path prefix in
 `SECRETSERVER_URL` is preserved.
+
+## Install from git
+
+No registry account needed; see the top-level README for `<ref>` values.
+
+```bash
+git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git
+cd secretserver-clients/mcp && go build -o secretserver-mcp .   # go install @ref fails: go.mod has a replace directive
+```

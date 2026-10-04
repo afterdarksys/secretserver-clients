@@ -90,3 +90,13 @@ The desktop GUI Documents tab opens the web manager with a separate sign-in;
 self-hosted users enter their web console URL. Ansible, Terraform and MCP do not
 implicitly deliver or cache protected PDFs. View-only access withholds originals,
 but visible pixels can still be captured. See https://secretserver.io/docs/documents.
+
+## Install from git
+
+No registry account needed; see the top-level README for `<ref>` values.
+
+```bash
+git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git
+composer config repositories.secretserver path ./secretserver-clients/php   # a vcs repository does not work for a subdirectory
+composer require afterdark/secretserver:@dev
+```
