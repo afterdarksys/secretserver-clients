@@ -19,3 +19,4 @@ for _ in $(seq 1 50); do
 done
 
 TEST_SERVER_URL="http://127.0.0.1:$PORT" "$PHP" "$DIR/tests/contract.php"
+TEST_SERVER_URL="http://127.0.0.1:$PORT" "$PHP" "$DIR/tests/cli_credentials.php"

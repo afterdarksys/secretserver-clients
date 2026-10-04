@@ -6,6 +6,28 @@ composer require afterdark/secretserver
 
 Requires PHP 8.0+ with the curl and json extensions.
 
+## Use your `ss login`
+
+Instead of an API key, pass a credential provider. `CliCredentialProvider`
+reuses the SSO session of the `ss` CLI:
+
+```php
+use SecretServer\CliCredentialProvider;
+use SecretServer\SecretServerClient;
+
+$ss = new SecretServerClient(credentialProvider: new CliCredentialProvider());
+```
+
+It runs `ss auth print-access-token --format json` (first constructor argument,
+else `SS_CLI_PATH`, else `ss` on `PATH`) through `proc_open` with an argv array
+(no shell), a 30 s timeout (second argument) and a 64 KiB output cap, and caches
+the token in memory until 60 s before it expires. If the CLI is not logged in it
+throws `AuthException` asking you to run `ss login`. Without `$apiUrl` or
+`SS_API_URL` the client uses the API URL the CLI is logged in to (the CLI runs
+once when the client is created). Any callable returning a token works as
+`$credentialProvider` (mutually exclusive with `$apiKey`); tokens never appear
+in exceptions.
+
 ## Partial updates
 
 **Minimum server: secretserver.io 3075630 (partial, conditional updates).**

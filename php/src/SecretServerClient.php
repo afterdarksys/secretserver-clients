@@ -22,7 +22,7 @@ namespace SecretServer;
 class SecretServerClient
 {
     private const DEFAULT_URL = 'https://api.secretserver.io';
-    private const USER_AGENT  = 'secretserver-php/1.3.0';
+    private const USER_AGENT  = 'secretserver-php/1.4.0';
 
     /** Maximum body size for JSON responses. */
     private const MAX_JSON_BYTES = 4 * 1024 * 1024;
@@ -48,6 +48,7 @@ class SecretServerClient
     private bool    $allowHttp;
     private ?string $caFile;
     private bool    $partialUpdates;
+    private ?\Closure $credentialProvider;
 
     /**
      * Threats: rejects plaintext transport to non-loopback hosts, credentials
@@ -66,6 +67,11 @@ class SecretServerClient
      *                               updateJKSKeystore, updateYubikey) without an ETag.
      *                               Only safe against secretserver.io 3075630 or newer;
      *                               also enabled by SS_PARTIAL_UPDATES=1.
+     * @param callable|null $credentialProvider Returns the bearer token; called before
+     *                               every request. Mutually exclusive with $apiKey. Use
+     *                               CliCredentialProvider to reuse the `ss login` session;
+     *                               with it, a missing $apiUrl/SS_API_URL defaults to the
+     *                               URL the CLI is logged in to (the CLI runs immediately).
      * @throws AuthException|SecretServerException
      */
     public function __construct(
@@ -74,9 +80,17 @@ class SecretServerClient
         int     $timeout  = 10,
         bool    $verifySsl = true,
         ?string $caFile   = null,
-        bool    $partialUpdates = false
+        bool    $partialUpdates = false,
+        ?callable $credentialProvider = null
     ) {
-        $this->apiKey    = $apiKey ?? (string) getenv('SS_API_KEY');
+        if ($credentialProvider !== null && $apiKey !== null) {
+            throw new SecretServerException('Provide either $apiKey or $credentialProvider');
+        }
+        $this->credentialProvider = $credentialProvider === null ? null : \Closure::fromCallable($credentialProvider);
+        $this->apiKey    = $credentialProvider !== null ? '' : ($apiKey ?? (string) getenv('SS_API_KEY'));
+        if ($apiUrl === null && !getenv('SS_API_URL') && $credentialProvider instanceof CliCredentialProvider) {
+            $apiUrl = $credentialProvider->apiUrl();
+        }
         $this->apiUrl    = rtrim($apiUrl ?? (string)(getenv('SS_API_URL') ?: self::DEFAULT_URL), '/');
         if (str_ends_with($this->apiUrl, '/api/v1')) {
             $this->apiUrl = substr($this->apiUrl, 0, -7);
@@ -84,7 +98,7 @@ class SecretServerClient
         $this->timeout   = $timeout;
         $this->partialUpdates = $partialUpdates || getenv('SS_PARTIAL_UPDATES') === '1';
 
-        if ($this->apiKey === '') {
+        if ($this->apiKey === '' && $this->credentialProvider === null) {
             throw new AuthException('No API key provided. Pass $apiKey or set SS_API_KEY env var.');
         }
         if (!$verifySsl) {
@@ -1268,6 +1282,20 @@ class SecretServerClient
      */
     private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept, array $extraHeaders = [], ?string &$etag = null, ?string $pdf = null): string
     {
+        $bearer = $this->apiKey;
+        if ($this->credentialProvider !== null) {
+            try {
+                $bearer = ($this->credentialProvider)();
+            } catch (SecretServerException $e) {
+                // SDK errors (e.g. "run `ss login`") carry no secrets.
+                throw $e;
+            } catch (\Throwable) {
+                throw new AuthException('credential provider failed');
+            }
+            if (!is_string($bearer) || preg_match('/^[\x21-\x7e]+$/', $bearer) !== 1) {
+                throw new AuthException('credential provider returned an invalid credential');
+            }
+        }
         $path = '/' . ltrim($path, '/');
         if ($path === '/api/v1') {
             $path = '';
@@ -1278,7 +1306,7 @@ class SecretServerClient
         $ch  = curl_init($url);
 
         $headers = [
-            'Authorization: Bearer ' . $this->apiKey,
+            'Authorization: Bearer ' . $bearer,
             'Accept: ' . $accept,
             'Content-Type: ' . ($pdf !== null ? 'application/pdf' : 'application/json'),
             'User-Agent: ' . self::USER_AGENT,
