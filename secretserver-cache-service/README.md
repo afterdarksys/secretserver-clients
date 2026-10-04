@@ -33,3 +33,12 @@ The service is an **offline lease cache**, not a general-purpose cache:
 6. Client cache mode may be `off`, `prefer`, or `required`; it cannot modify server policy.
 7. Standard assurance leases become unusable after an offline daemon restart. Offline-across-reboot requires a supported TPM-backed anti-rollback mechanism.
 8. Local administrators/root remain outside the standard threat boundary; hardware-backed mode reduces but cannot eliminate a hostile administrator's ability to patch clients or inspect consumers.
+
+## Credentials for a future implementation
+
+The daemon talks to SecretServer only to enroll, fetch signed policies, and receive leases. When it is built, it should obtain that credential the same way the other clients in this repo do, and never store a long-lived token of its own:
+
+- **Interactive enrollment on a developer machine:** use the CLI credential provider (`ss auth print-access-token --format json`, exit 2 = "run `ss login`"), e.g. `secretserver.CLICredentials()` in the Go client. Keep the access token in memory only, refresh it from the CLI, and refuse to send it to an API URL other than the one `ss login` recorded. See `docs/CLI_SSO_LOGIN.md` §2–3 in the server repo.
+- **Unattended/server devices:** a scoped API key loaded from an owner-only file or the OS keychain (never an argument or environment variable value, per property 5), limited to the enrollment/lease permissions.
+
+Either credential only authorizes enrollment and lease delivery; it must not let the daemon widen a policy, and it is not used to decrypt cache entries (that is the device-wrapped per-lease key).
