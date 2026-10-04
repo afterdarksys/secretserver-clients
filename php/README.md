@@ -1,7 +1,7 @@
 # SecretServer.io PHP client
 
 ```bash
-composer require afterdark/secretserver
+composer require afterdarksys/secretserver
 ```
 
 Requires PHP 8.0+ with the curl and json extensions.
@@ -98,5 +98,5 @@ No registry account needed; see the top-level README for `<ref>` values.
 ```bash
 git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git
 composer config repositories.secretserver path ./secretserver-clients/php   # a vcs repository does not work for a subdirectory
-composer require afterdark/secretserver:@dev
+composer require afterdarksys/secretserver:@dev
 ```

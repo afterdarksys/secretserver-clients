@@ -6,7 +6,7 @@
  *
  * @example
  * ```ts
- * import { SecretServerClient } from "secretserver";
+ * import { SecretServerClient } from "@afterdarksys/secretserver";
  *
  * const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
  * const value = await ss.secret("production/db-password");

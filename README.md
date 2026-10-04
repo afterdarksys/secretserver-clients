@@ -57,9 +57,9 @@ TOTP and YubiKey OTP, JKS keystores, and operation-only HSM signing.
 
 | Language | Directory | Install | Package | GitHub |
 |----------|-----------|---------|---------|--------|
-| **Python** | `python/` | `pip install secretserver` | [PyPI](https://pypi.org/project/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/python) |
-| **Node.js / TypeScript** | `node/` | `npm install secretserver` | [npm](https://npmjs.com/package/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/node) |
-| **PHP** | `php/` | `composer require afterdark/secretserver` | [Packagist](https://packagist.org/packages/afterdark/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
+| **Python** | `python/` | `pip install afterdarksys-secretserver` | [PyPI](https://pypi.org/project/afterdarksys-secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/python) |
+| **Node.js / TypeScript** | `node/` | `npm install @afterdarksys/secretserver` | [npm](https://npmjs.com/package/@afterdarksys/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/node) |
+| **PHP** | `php/` | `composer require afterdarksys/secretserver` | [Packagist](https://packagist.org/packages/afterdarksys/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
 | **Go** | `go/` | `go get github.com/afterdarksys/secretserver-clients/go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-clients/go) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/go) |
 | **Ansible** | `ansible/` | Drop `secretserver.py` in your lookup_plugins/ | — | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/ansible) |
 | **MCP** | `mcp/` | `go build -o secretserver-mcp .` | stdio MCP server | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/mcp) |
@@ -80,8 +80,8 @@ directories against `feat/cli-sso-login` @ 4a62eac.
 |--------|---------|
 | Go | `go get github.com/afterdarksys/secretserver-clients/go@<ref>` — Go rejects branch names containing `/`, so use a commit hash (or the `go/v1.4.0` tag) |
 | Python | `pip install "git+https://github.com/afterdarksys/secretserver-clients.git@<ref>#subdirectory=python"` |
-| Node.js | npm cannot install a git subdirectory. Clone, build, pack, install the tarball: `git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git && (cd secretserver-clients/node && npm ci && npm run build && npm pack)` then `npm install ./secretserver-clients/node/secretserver-1.4.0.tgz` |
-| PHP | A Composer `vcs` repository does not work (no `composer.json` at the repo root). Clone, then use a `path` repository: `composer config repositories.secretserver path ./secretserver-clients/php && composer require afterdark/secretserver:@dev` |
+| Node.js | npm cannot install a git subdirectory. Clone, build, pack, install the tarball: `git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git && (cd secretserver-clients/node && npm ci && npm run build && npm pack)` then `npm install ./secretserver-clients/node/afterdarksys-secretserver-1.4.0.tgz` |
+| PHP | A Composer `vcs` repository does not work (no `composer.json` at the repo root). Clone, then use a `path` repository: `composer config repositories.secretserver path ./secretserver-clients/php && composer require afterdarksys/secretserver:@dev` |
 | Ansible | Not a Galaxy collection. Clone and copy `ansible/secretserver.py` into your `lookup_plugins/` (or point `ANSIBLE_LOOKUP_PLUGINS` at `secretserver-clients/ansible`); `use_cli_login` also needs the Python package above |
 | MCP bridge | `go install …/mcp@<ref>` does not work (its `go.mod` has a `replace` for `../go`). Clone and build: `cd secretserver-clients/mcp && go build -o secretserver-mcp .` |
 | Desktop GUI | Same `replace` limitation. Clone and build (cgo/Fyne toolchain required): `cd secretserver-clients/go-gui && go build -o secretserver-gui .` |
@@ -146,7 +146,7 @@ print(f"Current code: {code['code']}")  # 6-digit code
 ### Node.js / TypeScript
 
 ```typescript
-import { SecretServerClient } from "secretserver";
+import { SecretServerClient } from "@afterdarksys/secretserver";
 
 const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
 

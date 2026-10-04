@@ -12,7 +12,7 @@ if [[ "${1:-}" == "--dev" ]]; then
   echo "==> Installing deps and linking for dev..."
   npm install
   npm link
-  echo "==> Done. Use 'npm link secretserver' in your project."
+  echo "==> Done. Use 'npm link @afterdarksys/secretserver' in your project."
 else
   echo "==> Building dist..."
   npm install

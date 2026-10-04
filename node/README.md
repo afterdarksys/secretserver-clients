@@ -1,9 +1,9 @@
-# secretserver (Node.js / TypeScript)
+# @afterdarksys/secretserver (Node.js / TypeScript)
 
 Zero-dependency client for SecretServer.io. Node.js 18+ (native fetch).
 
 ```ts
-import { SecretServerClient } from "secretserver";
+import { SecretServerClient } from "@afterdarksys/secretserver";
 
 const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
 const value = await ss.secret("production/db-password");
@@ -14,7 +14,7 @@ const value = await ss.secret("production/db-password");
 Instead of an API key, reuse the SSO session of the `ss` CLI:
 
 ```ts
-import { SecretServerClient, cliCredentialProvider, AuthError } from "secretserver";
+import { SecretServerClient, cliCredentialProvider, AuthError } from "@afterdarksys/secretserver";
 
 const ss = new SecretServerClient({ credentialProvider: cliCredentialProvider() });
 // AuthError "... run `ss login`" when the CLI has no valid session.
@@ -84,5 +84,5 @@ No registry account needed; see the top-level README for `<ref>` values.
 ```bash
 git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git
 (cd secretserver-clients/node && npm ci && npm run build && npm pack)
-npm install ./secretserver-clients/node/secretserver-1.4.0.tgz   # npm cannot install a git subdirectory directly
+npm install ./secretserver-clients/node/afterdarksys-secretserver-1.4.0.tgz   # npm cannot install a git subdirectory directly
 ```

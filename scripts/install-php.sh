@@ -16,7 +16,7 @@ cd "$PHP_DIR"
 composer install --no-dev --optimize-autoloader
 
 echo "==> Done. Add to your project:"
-echo "    composer require afterdark/secretserver"
+echo "    composer require afterdarksys/secretserver"
 echo "    # or from local path:"
 echo "    composer config repositories.secretserver path $PHP_DIR"
-echo "    composer require afterdark/secretserver:@dev"
+echo "    composer require afterdarksys/secretserver:@dev"

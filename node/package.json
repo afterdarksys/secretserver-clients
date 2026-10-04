@@ -1,5 +1,5 @@
 {
-  "name": "secretserver",
+  "name": "@afterdarksys/secretserver",
   "version": "1.4.0",
   "description": "SecretServer.io Node.js / TypeScript client library",
   "type": "module",
