@@ -82,6 +82,9 @@ func TestCLICredentialsSuccessAndCache(t *testing.T) {
 	if n := runs(t, count); n != 1 {
 		t.Fatalf("APIURL re-ran the CLI: %d runs", n)
 	}
+	if tenant, err := p.TenantID(context.Background()); err != nil || tenant != "t-1" {
+		t.Fatalf("TenantID() = %q, %v", tenant, err)
+	}
 }
 
 func TestCLICredentialsRefreshesNearExpiry(t *testing.T) {

@@ -48,6 +48,7 @@ type CLICredentialProvider struct {
 	token     string
 	expiresAt time.Time
 	apiURL    string
+	tenantID  string
 }
 
 // CLICredentials returns a provider backed by the `ss` CLI's SSO login. Use
@@ -70,7 +71,7 @@ func (p *CLICredentialProvider) Token(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	p.token, p.expiresAt, p.apiURL = out.AccessToken, out.expiresAt, out.APIURL
+	p.token, p.expiresAt, p.apiURL, p.tenantID = out.AccessToken, out.expiresAt, out.APIURL, out.TenantID
 	return out.AccessToken, nil
 }
 
@@ -83,6 +84,17 @@ func (p *CLICredentialProvider) APIURL(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.apiURL, nil
+}
+
+// TenantID returns the tenant recorded by `ss login` ("" if the CLI did not
+// report one), running the CLI first if there is no cached token.
+func (p *CLICredentialProvider) TenantID(ctx context.Context) (string, error) {
+	if _, err := p.Token(ctx); err != nil {
+		return "", err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tenantID, nil
 }
 
 type cliToken struct {
