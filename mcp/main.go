@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	secretserver "github.com/afterdarksys/secretserver-clients/go/secretserver"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -153,7 +154,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure SecretServer MCP bridge: %v", err)
 	}
-	client, err := NewClient(os.Getenv("SECRETSERVER_URL"), os.Getenv("SECRETSERVER_TOKEN_FILE"))
+	client, err := newClientFromEnv(context.Background(), os.Getenv, secretserver.CLICredentials())
 	if err != nil {
 		log.Fatalf("initialize SecretServer MCP bridge: %v", err)
 	}
