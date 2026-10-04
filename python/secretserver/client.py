@@ -118,6 +118,30 @@ def _validate_base_url(api_url: str) -> str:
     raise ValueError("api_url must use https (plain http is allowed only for localhost)")
 
 
+def _normalize_api_origin(raw: str) -> str:
+    """Loose equality for the CLI-login/explicit-api_url mismatch check only:
+    lowercases scheme and host, strips the scheme's default port (80 for
+    http, 443 for https) and a trailing slash. Not a general URL comparison.
+    """
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.hostname:
+        return raw.lower().rstrip("/")
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is not None and ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    return f"{scheme}://{netloc}{parts.path.rstrip('/')}"
+
+
+def _same_api_origin(a: str, b: str) -> bool:
+    return _normalize_api_origin(a) == _normalize_api_origin(b)
+
+
 def _seg(value: Any) -> str:
     """Percent-encode one caller-supplied path segment."""
     text = str(value)
@@ -275,9 +299,16 @@ class SecretServerClient:
         self._closed = False
         self._credential_provider = credential_provider
         self._credential = _Credential("" if credential_provider is not None else (api_key or os.environ.get("SS_API_KEY", "")))
-        if api_url is None and "SS_API_URL" not in os.environ and isinstance(credential_provider, CliCredentialProvider):
-            # Use the API the `ss` CLI is logged in to; runs the CLI now.
-            api_url = credential_provider.api_url()
+        self._pending_cli_url_check: Optional["CliCredentialProvider"] = None
+        if isinstance(credential_provider, CliCredentialProvider):
+            if api_url is None and "SS_API_URL" not in os.environ:
+                # Use the API the `ss` CLI is logged in to; runs the CLI now.
+                api_url = credential_provider.api_url()
+            else:
+                # An explicit api_url is checked against the CLI's session on
+                # the first request (see _headers()), so the token is never
+                # sent to a host the session was not issued for.
+                self._pending_cli_url_check = credential_provider
         self.api_url = _validate_base_url(api_url or os.environ.get("SS_API_URL", self.DEFAULT_URL))
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -341,6 +372,14 @@ class SecretServerClient:
                 raise SecretServerError("client is closed")
             provider = self._credential_provider
             key = self.api_key if provider is None else None
+            pending = self._pending_cli_url_check
+            self._pending_cli_url_check = None
+        if pending is not None:
+            cli_api_url = pending.api_url()
+            if cli_api_url and not _same_api_origin(self.api_url, cli_api_url):
+                raise SecretServerError(
+                    f"API URL {self.api_url} does not match the `ss login` session for {cli_api_url}"
+                )
         try:
             if provider is not None:
                 key = provider()

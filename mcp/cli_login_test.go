@@ -80,7 +80,9 @@ func TestCLILoginClientUsesSSOTokenAndURL(t *testing.T) {
 }
 
 func TestCLILoginExplicitURLWinsAndRefreshes(t *testing.T) {
-	creds, runs := fakeSS(t, cliTokenJSON(30*time.Second, "https://cli.example.test"))
+	// Explicit URL matches (modulo case) the CLI's session, so it is used
+	// as given rather than the CLI's own casing, and still refreshes.
+	creds, runs := fakeSS(t, cliTokenJSON(30*time.Second, "https://Pinned.example.test"))
 	client, err := newClientFromEnv(context.Background(), envMap(map[string]string{
 		"SECRETSERVER_USE_CLI_LOGIN": "1", "SECRETSERVER_URL": "https://pinned.example.test",
 	}), creds)
@@ -100,6 +102,22 @@ func TestCLILoginExplicitURLWinsAndRefreshes(t *testing.T) {
 	// Startup check + one request; the token expires within 60 s so each use refreshes.
 	if runs() != 2 {
 		t.Fatalf("CLI ran %d times, want 2", runs())
+	}
+}
+
+func TestCLILoginRefusesMismatchedURL(t *testing.T) {
+	creds, runs := fakeSS(t, cliTokenJSON(time.Hour, "https://cli.example.test"))
+	_, err := newClientFromEnv(context.Background(), envMap(map[string]string{
+		"SECRETSERVER_USE_CLI_LOGIN": "1", "SECRETSERVER_URL": "https://pinned.example.test",
+	}), creds)
+	if err == nil || !strings.Contains(err.Error(), "https://pinned.example.test") || !strings.Contains(err.Error(), "https://cli.example.test") {
+		t.Fatalf("err = %v, want a mismatch error naming both URLs", err)
+	}
+	if strings.Contains(err.Error(), cliTestToken) {
+		t.Fatalf("error leaks the access token: %v", err)
+	}
+	if runs() != 1 {
+		t.Fatalf("CLI ran %d times, want 1", runs())
 	}
 }
 

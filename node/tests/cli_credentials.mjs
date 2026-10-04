@@ -100,14 +100,30 @@ assert.throws(() => cliCredentialProvider({ timeoutMs: 0 }), /timeoutMs/);
   assert.deepEqual(seen, [["https://cli.example.test/api/v1/secrets", `Bearer ${TOKEN}`], ["https://cli.example.test/api/v1/secrets", `Bearer ${TOKEN}`]]);
   assert.equal(ss.runs(), 1);
 
+  // Explicit apiUrl matching the CLI session (modulo case/port/slash) is
+  // used as given, not replaced with the CLI's own casing.
   const explicit = [];
   const pinned = new SecretServerClient({
     apiUrl: "https://pinned.example.test",
-    credentialProvider: cliCredentialProvider({ cliPath: fakeSS(tokenJSON(3600_000, "https://cli.example.test")).path }),
+    credentialProvider: cliCredentialProvider({ cliPath: fakeSS(tokenJSON(3600_000, "https://Pinned.example.test:443/")).path }),
     fetchFn: async (url) => { explicit.push(url); return new Response("{}"); },
   });
   await pinned.request("GET", "/health");
-  assert.deepEqual(explicit, ["https://pinned.example.test/api/v1/health"], "caller's apiUrl wins");
+  assert.deepEqual(explicit, ["https://pinned.example.test/api/v1/health"], "caller's apiUrl wins when it matches the ss login session");
+
+  // An explicit apiUrl that disagrees with the CLI's own session is refused:
+  // the token must never be sent to a host the session was not issued for.
+  const mismatchSeen = [];
+  const mismatched = new SecretServerClient({
+    apiUrl: "https://pinned.example.test",
+    credentialProvider: cliCredentialProvider({ cliPath: fakeSS(tokenJSON(3600_000, "https://cli.example.test")).path }),
+    fetchFn: async (url) => { mismatchSeen.push(url); return new Response("{}"); },
+  });
+  await assert.rejects(
+    mismatched.request("GET", "/health"),
+    (e) => e instanceof SecretServerError && e.message.includes("https://pinned.example.test") && e.message.includes("https://cli.example.test") && noToken(e),
+  );
+  assert.deepEqual(mismatchSeen, [], "request must not be sent on a mismatched API URL");
 
   const loggedOut = new SecretServerClient({
     credentialProvider: cliCredentialProvider({ cliPath: fakeSS("exit 2").path }),

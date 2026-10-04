@@ -266,10 +266,23 @@ class CliLoginTests(unittest.TestCase):
 
     def test_explicit_api_url_wins(self):
         from test_cli_credentials import token_json
+        # The CLI's own session reports an origin equal to the explicit
+        # api_url modulo case and a trailing slash: not a mismatch, and the
+        # explicit spelling (not the CLI's) is used for the request.
         body = json.dumps({"data": {"value": "v"}}).encode()
         with patch(OPEN, return_value=Raw(body)) as opener:
-            self.run_cli_lookup(token_json(3600, "https://cli.example.test"), api_url="https://pinned.example.test")
+            self.run_cli_lookup(token_json(3600, "https://Pinned.example.test/"), api_url="https://pinned.example.test")
         self.assertEqual(opener.call_args.args[0].full_url, "https://pinned.example.test/api/v1/s/prod/db")
+
+    def test_refuses_mismatched_api_url(self):
+        from test_cli_credentials import token_json
+        with patch(OPEN) as opener:
+            with self.assertRaises(AnsibleError) as ctx:
+                self.run_cli_lookup(token_json(3600, "https://cli.example.test"), api_url="https://pinned.example.test")
+        opener.assert_not_called()
+        message = str(ctx.exception)
+        self.assertIn("https://pinned.example.test", message)
+        self.assertIn("https://cli.example.test", message)
 
     def test_not_logged_in_fails_closed(self):
         with patch(OPEN) as opener:

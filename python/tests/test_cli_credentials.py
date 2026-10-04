@@ -110,6 +110,9 @@ class CliCredentialProviderTests(unittest.TestCase):
 
     def test_client_uses_cli_token_and_api_url(self):
         path, runs = fake_ss(self, token_json(3600, "https://cli.example.test/api/v1"))
+        # pinned's own CLI session reports an origin equal to its explicit
+        # api_url modulo case and a trailing slash: not a mismatch.
+        pinned_path, pinned_runs = fake_ss(self, token_json(3600, "https://Pinned.example.test/"))
         seen = []
 
         def response(req, **kwargs):
@@ -118,14 +121,29 @@ class CliCredentialProviderTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SS_API_URL", None)
             c = SecretServerClient(credential_provider=cli_credential_provider(cli_path=path))
-            pinned = SecretServerClient(credential_provider=cli_credential_provider(cli_path=path),
+            pinned = SecretServerClient(credential_provider=cli_credential_provider(cli_path=pinned_path),
                                         api_url="https://pinned.example.test")
+        self.assertEqual(pinned_runs(), 0, "mismatch check is deferred to first request")
         with patch(OPEN, side_effect=response):
             c.request("GET", "/health"); c.request("GET", "/health")
             pinned.request("GET", "/health")
         self.assertEqual(seen, [("https://cli.example.test/api/v1/health", f"Bearer {TOKEN}")] * 2
                          + [("https://pinned.example.test/api/v1/health", f"Bearer {TOKEN}")])
-        self.assertEqual(runs(), 2)  # one per provider; requests reuse the cache
+        self.assertEqual(runs(), 1)  # eager at construction (no explicit api_url); cached across requests
+        self.assertEqual(pinned_runs(), 1)  # checked and cached together on first use
+
+    def test_client_refuses_mismatched_api_url(self):
+        path, runs = fake_ss(self, token_json(3600, "https://cli.example.test"))
+        c = SecretServerClient(credential_provider=cli_credential_provider(cli_path=path), api_url="https://pinned.example.test")
+        self.assertEqual(runs(), 0, "mismatch check is deferred to first request")
+        with patch(OPEN) as transport:
+            with self.assertRaises(SecretServerError) as ctx:
+                c.request("GET", "/health")
+            transport.assert_not_called()
+        message = str(ctx.exception)
+        self.assertIn("https://pinned.example.test", message)
+        self.assertIn("https://cli.example.test", message)
+        self.assertNotIn(TOKEN, message)
 
     def test_client_surfaces_login_error_without_request(self):
         path, _ = fake_ss(self, "exit 2")

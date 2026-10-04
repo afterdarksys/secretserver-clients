@@ -49,6 +49,14 @@ class SecretServerClient
     private ?string $caFile;
     private bool    $partialUpdates;
     private ?\Closure $credentialProvider;
+    /**
+     * Set when the caller gave both an explicit apiUrl and a
+     * CliCredentialProvider: checked (and cleared) on the first request so a
+     * session logged in to a different origin is never used to send the
+     * token there.
+     */
+    private ?CliCredentialProvider $pendingCliUrlCheck = null;
+    private string $pendingCliUrlExplicit = '';
 
     /**
      * Threats: rejects plaintext transport to non-loopback hosts, credentials
@@ -88,8 +96,16 @@ class SecretServerClient
         }
         $this->credentialProvider = $credentialProvider === null ? null : \Closure::fromCallable($credentialProvider);
         $this->apiKey    = $credentialProvider !== null ? '' : ($apiKey ?? (string) getenv('SS_API_KEY'));
-        if ($apiUrl === null && !getenv('SS_API_URL') && $credentialProvider instanceof CliCredentialProvider) {
-            $apiUrl = $credentialProvider->apiUrl();
+        $explicitApiUrl = $apiUrl ?? ((string) getenv('SS_API_URL') ?: null);
+        if ($credentialProvider instanceof CliCredentialProvider) {
+            if ($explicitApiUrl === null) {
+                $apiUrl = $credentialProvider->apiUrl();
+            } else {
+                // Deferred to the first request (see send()) so a provider
+                // that is not yet logged in still fails lazily, as before.
+                $this->pendingCliUrlCheck = $credentialProvider;
+                $this->pendingCliUrlExplicit = $explicitApiUrl;
+            }
         }
         $this->apiUrl    = rtrim($apiUrl ?? (string)(getenv('SS_API_URL') ?: self::DEFAULT_URL), '/');
         if (str_ends_with($this->apiUrl, '/api/v1')) {
@@ -175,6 +191,32 @@ class SecretServerClient
             throw new SecretServerException('Unsupported secret type');
         }
         return $type;
+    }
+
+    /**
+     * Loose equality for the CLI-login/explicit-apiUrl mismatch check only:
+     * lowercases scheme and host, strips the scheme's default port (80 for
+     * http, 443 for https) and a trailing slash. Not a general URL comparison.
+     */
+    private static function sameApiOrigin(string $a, string $b): bool
+    {
+        return self::normalizeApiOrigin($a) === self::normalizeApiOrigin($b);
+    }
+
+    private static function normalizeApiOrigin(string $raw): string
+    {
+        $parts = parse_url($raw);
+        if ($parts === false || !isset($parts['host'])) {
+            return strtolower(rtrim($raw, '/'));
+        }
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        $host   = strtolower((string) $parts['host']);
+        $port   = $parts['port'] ?? null;
+        if ($port !== null && (($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80))) {
+            $port = null;
+        }
+        $path = rtrim((string) ($parts['path'] ?? ''), '/');
+        return $scheme . '://' . $host . ($port !== null ? ':' . $port : '') . $path;
     }
 
     /** @param array<string, mixed> $params */
@@ -1282,6 +1324,19 @@ class SecretServerClient
      */
     private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept, array $extraHeaders = [], ?string &$etag = null, ?string $pdf = null): string
     {
+        if ($this->pendingCliUrlCheck !== null) {
+            $cliProvider = $this->pendingCliUrlCheck;
+            $explicitApiUrl = $this->pendingCliUrlExplicit;
+            $this->pendingCliUrlCheck = null;
+            $cliApiUrl = $cliProvider->apiUrl();
+            if ($cliApiUrl !== null && !self::sameApiOrigin($explicitApiUrl, $cliApiUrl)) {
+                throw new SecretServerException(sprintf(
+                    'API URL %s does not match the `ss login` session for %s',
+                    $explicitApiUrl,
+                    $cliApiUrl
+                ));
+            }
+        }
         $bearer = $this->apiKey;
         if ($this->credentialProvider !== null) {
             try {

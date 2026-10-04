@@ -140,6 +140,10 @@ class LookupModule(LookupBase):
             if api_key:
                 raise AnsibleError("api_key and use_cli_login are mutually exclusive (check SS_API_KEY)")
             api_key, cli_api_url = cli_login_token()
+            if api_url and cli_api_url and not same_api_origin(api_url, cli_api_url):
+                raise AnsibleError(
+                    "SecretServer api_url {} does not match the `ss login` session for {}".format(api_url, cli_api_url)
+                )
             api_url = api_url or cli_api_url
         api_url = validate_api_url(api_url or DEFAULT_API_URL)
         self._ssl_context = make_ssl_context(self.get_option("ca_path"))
@@ -291,6 +295,30 @@ def cli_login_token():
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def normalize_api_origin(raw):
+    """Loose equality for the CLI-login/explicit-api_url mismatch check only:
+    lowercases scheme and host, strips the scheme's default port (80 for
+    http, 443 for https) and a trailing slash. Not a general URL comparison.
+    """
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.hostname:
+        return raw.lower().rstrip("/")
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is not None and ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+        port = None
+    netloc = host if port is None else "{}:{}".format(host, port)
+    return "{}://{}{}".format(scheme, netloc, parts.path.rstrip("/"))
+
+
+def same_api_origin(a, b):
+    return normalize_api_origin(a) == normalize_api_origin(b)
 
 
 def validate_api_url(api_url):

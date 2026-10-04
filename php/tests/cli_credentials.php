@@ -155,6 +155,30 @@ $client = new SecretServerClient(apiUrl: $baseURL, credentialProvider: new CliCr
 $e = expectFailure(fn () => $client->listDocuments(), 'logged-out client fails');
 check($e instanceof AuthException && str_contains($e->getMessage(), 'ss login'), 'client surfaces run ss login');
 
+// An explicit apiUrl that disagrees with the CLI's own session is refused on
+// first use: the token must never be sent to a host the session was not
+// issued for.
+[$path, $runs] = fakeSS(tokenJSON(3600, 'https://cli.example.test'));
+$client = new SecretServerClient(apiUrl: 'https://pinned.example.test', credentialProvider: new CliCredentialProvider($path));
+check($runs() === 0, 'mismatch check is deferred to first request');
+$e = expectFailure(fn () => $client->listDocuments(), 'mismatched api URL refused');
+check(
+    !($e instanceof AuthException)
+    && str_contains($e->getMessage(), 'https://pinned.example.test')
+    && str_contains($e->getMessage(), 'https://cli.example.test')
+    && noToken($e),
+    'mismatch error names both URLs and omits the token'
+);
+
+// An explicit apiUrl equal to the CLI's session modulo case and a trailing
+// slash is not a mismatch.
+$baseUrlParts = parse_url($baseURL);
+$equivalentCliUrl = strtoupper((string) $baseUrlParts['scheme']) . '://' . strtoupper((string) $baseUrlParts['host'])
+    . (isset($baseUrlParts['port']) ? ':' . $baseUrlParts['port'] : '') . '/';
+[$path, $runs] = fakeSS(tokenJSON(3600, $equivalentCliUrl, 'sk_test'));
+$client = new SecretServerClient(apiUrl: $baseURL, credentialProvider: new CliCredentialProvider($path));
+check(($client->listDocuments()['uri'] ?? null) === '/api/v1/documents', 'equivalent (case/slash) api URL from the CLI is accepted');
+
 $e = expectFailure(fn () => new SecretServerClient('sk_test', $baseURL, credentialProvider: fn () => 'x'), 'apiKey + provider refused');
 $client = new SecretServerClient(apiUrl: $baseURL, credentialProvider: fn () => throw new RuntimeException(TOKEN));
 $e = expectFailure(fn () => $client->listDocuments(), 'foreign provider exception');

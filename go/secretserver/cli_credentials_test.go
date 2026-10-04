@@ -188,6 +188,38 @@ func TestClientUsesTokenProviderPerRequest(t *testing.T) {
 	}
 }
 
+func TestNewCLIClientRefusesMismatchedAPIURL(t *testing.T) {
+	path, count := fakeSS(t, tokenJSON(cliTestToken, time.Now().Add(time.Hour), "https://cli.example.com"))
+	t.Setenv("SS_CLI_PATH", path)
+	_, err := NewCLIClient(context.Background(), &Config{APIURL: "https://other.example.com"})
+	if err == nil {
+		t.Fatal("expected a mismatch error")
+	}
+	if !strings.Contains(err.Error(), "https://other.example.com") || !strings.Contains(err.Error(), "https://cli.example.com") {
+		t.Fatalf("error = %v, want it to name both URLs", err)
+	}
+	if strings.Contains(err.Error(), cliTestToken) {
+		t.Fatalf("error leaks the access token: %v", err)
+	}
+	if runs(t, count) != 1 {
+		t.Fatalf("CLI ran %d times, want 1", runs(t, count))
+	}
+}
+
+func TestNewCLIClientAllowsEquivalentAPIURL(t *testing.T) {
+	// Same origin as "https://CLI.example.com" modulo case, the default
+	// port, and a trailing slash: must not be treated as a mismatch.
+	path, _ := fakeSS(t, tokenJSON(cliTestToken, time.Now().Add(time.Hour), "https://CLI.example.com:443/"))
+	t.Setenv("SS_CLI_PATH", path)
+	c, err := NewCLIClient(context.Background(), &Config{APIURL: "https://cli.example.com"})
+	if err != nil {
+		t.Fatalf("equivalent API URL was refused: %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected a client")
+	}
+}
+
 func TestClientTokenProviderFailsClosed(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))

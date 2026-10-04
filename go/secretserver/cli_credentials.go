@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -211,7 +212,9 @@ func (b *cappedBuffer) Bytes() []byte { return b.buf.Bytes() }
 
 // NewCLIClient returns a client authenticated by the `ss login` session.
 // cfg may be nil; it must not set APIKey or TokenProvider. When cfg.APIURL
-// is empty the API URL recorded by the CLI is used.
+// is empty the API URL recorded by the CLI is used. When cfg.APIURL is set
+// and the CLI reports a different origin, NewCLIClient refuses rather than
+// send the `ss login` token to a host the session was not issued for.
 func NewCLIClient(ctx context.Context, cfg *Config) (*Client, error) {
 	var c Config
 	if cfg != nil {
@@ -221,13 +224,45 @@ func NewCLIClient(ctx context.Context, cfg *Config) (*Client, error) {
 		return nil, errors.New("NewCLIClient: APIKey and TokenProvider must be empty")
 	}
 	p := CLICredentials()
+	cliAPIURL, err := p.APIURL(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if c.APIURL == "" {
-		u, err := p.APIURL(ctx)
-		if err != nil {
-			return nil, err
-		}
-		c.APIURL = u
+		c.APIURL = cliAPIURL
+	} else if cliAPIURL != "" && !sameAPIOrigin(c.APIURL, cliAPIURL) {
+		return nil, fmt.Errorf("API URL %s does not match the `ss login` session for %s", c.APIURL, cliAPIURL)
 	}
 	c.TokenProvider = p.Token
 	return NewClient(&c)
+}
+
+// NormalizeAPIURL lowercases the scheme and host, strips the scheme's
+// default port (80 for http, 443 for https) and any trailing slash. It is
+// not a general URL normalizer: it exists so callers (and other clients in
+// this repo) can compare an explicitly configured API URL against the one
+// an `ss login` session reports without false mismatches from case, a
+// redundant default port, or a trailing slash. An unparsable URL is
+// returned lowercased and otherwise unchanged.
+func NormalizeAPIURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return strings.ToLower(strings.TrimSuffix(raw, "/"))
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host + strings.TrimSuffix(u.Path, "/")
+}
+
+// sameAPIOrigin reports whether a and b address the same API origin after
+// NormalizeAPIURL.
+func sameAPIOrigin(a, b string) bool {
+	return NormalizeAPIURL(a) == NormalizeAPIURL(b)
 }

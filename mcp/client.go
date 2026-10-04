@@ -64,17 +64,20 @@ func NewClient(rawURL, tokenFile string) (*Client, error) {
 
 // NewCLIClient authenticates with the `ss` CLI's SSO session through
 // creds, which refreshes the short-lived access token as needed. An empty
-// rawURL means the API URL the CLI is logged in to. Unlike the token-file
-// mode, the access token is held in ordinary process memory.
+// rawURL means the API URL the CLI is logged in to. When rawURL is set and
+// differs from the API URL the CLI reports, NewCLIClient refuses rather
+// than send the `ss login` token to a host the session was not issued for.
+// Unlike the token-file mode, the access token is held in ordinary process
+// memory.
 func NewCLIClient(ctx context.Context, rawURL string, creds *secretserver.CLICredentialProvider) (*Client, error) {
-	if rawURL == "" {
-		apiURL, err := creds.APIURL(ctx)
-		if err != nil {
-			return nil, err
-		}
-		rawURL = apiURL
-	} else if _, err := creds.Token(ctx); err != nil {
+	cliAPIURL, err := creds.APIURL(ctx)
+	if err != nil {
 		return nil, err
+	}
+	if rawURL == "" {
+		rawURL = cliAPIURL
+	} else if cliAPIURL != "" && secretserver.NormalizeAPIURL(rawURL) != secretserver.NormalizeAPIURL(cliAPIURL) {
+		return nil, fmt.Errorf("API URL %s does not match the `ss login` session for %s", rawURL, cliAPIURL)
 	}
 	baseURL, err := validateBaseURL(rawURL)
 	if err != nil {

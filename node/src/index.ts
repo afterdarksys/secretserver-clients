@@ -478,6 +478,23 @@ function normalizeBaseUrl(raw: string): string {
   return validateBaseUrl(raw).replace(/\/$/, "").replace(/\/api\/v1$/, "");
 }
 
+/**
+ * Loose equality for the CLI-login/explicit-apiUrl mismatch check only:
+ * lowercases scheme and host, strips the scheme's default port (80 for
+ * http, 443 for https) and a trailing slash. Not a general URL normalizer.
+ */
+function sameApiOrigin(a: string, b: string): boolean {
+  const norm = (raw: string): string => {
+    let u: URL;
+    try { u = new URL(raw); } catch { return raw.toLowerCase().replace(/\/$/, ""); }
+    const scheme = u.protocol.toLowerCase();
+    const isDefaultPort = (scheme === "https:" && (u.port === "" || u.port === "443")) || (scheme === "http:" && (u.port === "" || u.port === "80"));
+    const port = isDefaultPort ? "" : (u.port ? `:${u.port}` : "");
+    return `${scheme}//${u.hostname.toLowerCase()}${port}${u.pathname.replace(/\/$/, "")}`;
+  };
+  return norm(a) === norm(b);
+}
+
 function seg(value: string | number): string {
   const s = String(value);
   if (s === "" || s === "." || s === "..") throw new SecretServerError("Invalid path segment");
@@ -678,6 +695,7 @@ export class SecretServerClient {
   #destroyed = false;
   private apiUrl: string;
   #apiUrlFromCli?: () => Promise<string | undefined>;
+  #explicitApiUrl?: string;
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
   private readonly partialUpdates: boolean;
@@ -688,7 +706,9 @@ export class SecretServerClient {
     this.#credentialProvider = config.credentialProvider;
     this.#apiKey = new TextEncoder().encode(config.credentialProvider ? "" : (config.apiKey ?? process.env.SS_API_KEY ?? ""));
     this.apiUrl = normalizeBaseUrl(config.apiUrl ?? process.env.SS_API_URL ?? DEFAULT_URL);
-    if (config.apiUrl === undefined && process.env.SS_API_URL === undefined && cliProviders.has(config.credentialProvider as object))
+    const apiUrlWasExplicit = config.apiUrl !== undefined || process.env.SS_API_URL !== undefined;
+    if (apiUrlWasExplicit) this.#explicitApiUrl = this.apiUrl;
+    if (cliProviders.has(config.credentialProvider as object))
       this.#apiUrlFromCli = (config.credentialProvider as CliCredentialProvider).apiUrl;
     this.fetchFn = config.fetchFn ?? fetch;
     this.timeoutMs = config.timeoutMs ?? 10000;
@@ -762,7 +782,15 @@ export class SecretServerClient {
   private async send(method: string, path: string, body?: unknown, headers?: Record<string, string>, pdf?: Uint8Array): Promise<Response> {
     if (this.#apiUrlFromCli) {
       const fromCli = await this.#apiUrlFromCli();
-      if (fromCli) this.apiUrl = normalizeBaseUrl(fromCli);
+      if (fromCli) {
+        const normalized = normalizeBaseUrl(fromCli);
+        if (this.#explicitApiUrl !== undefined) {
+          if (!sameApiOrigin(this.#explicitApiUrl, normalized))
+            throw new SecretServerError(`API URL ${this.#explicitApiUrl} does not match the \`ss login\` session for ${normalized}`);
+        } else {
+          this.apiUrl = normalized;
+        }
+      }
       this.#apiUrlFromCli = undefined;
     }
     const normalizedPath = `/${path}`.replace(/^\/+(?:api\/v1\/?)?/, "/");
