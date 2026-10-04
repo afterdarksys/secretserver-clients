@@ -68,11 +68,11 @@ func NewClient(rawURL, tokenFile string) (*Client, error) {
 // mode, the access token is held in ordinary process memory.
 func NewCLIClient(ctx context.Context, rawURL string, creds *secretserver.CLICredentialProvider) (*Client, error) {
 	if rawURL == "" {
-		cfg, err := creds.Config(ctx)
+		apiURL, err := creds.APIURL(ctx)
 		if err != nil {
 			return nil, err
 		}
-		rawURL = cfg.APIURL
+		rawURL = apiURL
 	} else if _, err := creds.Token(ctx); err != nil {
 		return nil, err
 	}

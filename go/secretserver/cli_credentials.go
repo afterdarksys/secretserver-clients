@@ -41,9 +41,8 @@ var ErrCLINotLoggedIn = errors.New("SecretServer CLI is not logged in: run `ss l
 type CLICredentialProvider struct {
 	// Path is the CLI executable. Empty means $SS_CLI_PATH, or `ss` on PATH.
 	Path string
-	// Timeout bounds one CLI run. Zero means 30 seconds.
-	Timeout time.Duration
 
+	timeout   time.Duration
 	mu        sync.Mutex
 	token     string
 	expiresAt time.Time
@@ -51,11 +50,8 @@ type CLICredentialProvider struct {
 }
 
 // CLICredentials returns a provider backed by the `ss` CLI's SSO login. Use
-// its Token method as Config.TokenProvider, or Config to also take the API URL
-// the CLI is logged in to:
-//
-//	cfg, err := secretserver.CLICredentials().Config(ctx)
-//	client, err := secretserver.NewClient(cfg)
+// its Token method as Config.TokenProvider, or NewCLIClient to build a
+// client directly from the CLI's session.
 func CLICredentials() *CLICredentialProvider {
 	return &CLICredentialProvider{}
 }
@@ -77,16 +73,15 @@ func (p *CLICredentialProvider) Token(ctx context.Context) (string, error) {
 	return out.AccessToken, nil
 }
 
-// Config returns a client Config using this provider, with APIURL set to the
-// URL the CLI is logged in to (the default API URL if the CLI reports none).
-func (p *CLICredentialProvider) Config(ctx context.Context) (*Config, error) {
+// APIURL returns the API URL recorded by `ss login`, running the CLI first
+// if there is no cached token.
+func (p *CLICredentialProvider) APIURL(ctx context.Context) (string, error) {
 	if _, err := p.Token(ctx); err != nil {
-		return nil, err
+		return "", err
 	}
 	p.mu.Lock()
-	apiURL := p.apiURL
-	p.mu.Unlock()
-	return &Config{APIURL: apiURL, TokenProvider: p.Token}, nil
+	defer p.mu.Unlock()
+	return p.apiURL, nil
 }
 
 type cliToken struct {
@@ -105,7 +100,7 @@ func (p *CLICredentialProvider) run(ctx context.Context) (*cliToken, error) {
 	if path == "" {
 		path = "ss"
 	}
-	timeout := p.Timeout
+	timeout := p.timeout
 	if timeout <= 0 {
 		timeout = defaultCLITimeout
 	}
@@ -213,3 +208,26 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 }
 
 func (b *cappedBuffer) Bytes() []byte { return b.buf.Bytes() }
+
+// NewCLIClient returns a client authenticated by the `ss login` session.
+// cfg may be nil; it must not set APIKey or TokenProvider. When cfg.APIURL
+// is empty the API URL recorded by the CLI is used.
+func NewCLIClient(ctx context.Context, cfg *Config) (*Client, error) {
+	var c Config
+	if cfg != nil {
+		c = *cfg
+	}
+	if c.APIKey != "" || c.TokenProvider != nil {
+		return nil, errors.New("NewCLIClient: APIKey and TokenProvider must be empty")
+	}
+	p := CLICredentials()
+	if c.APIURL == "" {
+		u, err := p.APIURL(ctx)
+		if err != nil {
+			return nil, err
+		}
+		c.APIURL = u
+	}
+	c.TokenProvider = p.Token
+	return NewClient(&c)
+}

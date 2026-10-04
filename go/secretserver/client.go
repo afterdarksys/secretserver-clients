@@ -47,7 +47,7 @@ type Client struct {
 	partialUpdates bool
 	// tokenProvider is Config.TokenProvider; when set it supplies the bearer
 	// token for every request instead of apiKey.
-	tokenProvider func(ctx context.Context) (string, error)
+	tokenProvider TokenProvider
 
 	// Service clients
 	Secrets      *SecretsService
@@ -68,6 +68,10 @@ type Client struct {
 	Documents    *DocumentsService
 	JKS          *JKSService
 }
+
+// TokenProvider returns the bearer credential for a request. It is called
+// before every request, so it should cache (see CLICredentials).
+type TokenProvider func(ctx context.Context) (string, error)
 
 // Config holds client configuration.
 //
@@ -96,7 +100,7 @@ type Client struct {
 type Config struct {
 	APIURL         string
 	APIKey         string
-	TokenProvider  func(ctx context.Context) (string, error)
+	TokenProvider  TokenProvider
 	HTTPClient     *http.Client
 	UserAgent      string
 	PartialUpdates bool

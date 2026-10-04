@@ -75,12 +75,12 @@ func TestCLICredentialsSuccessAndCache(t *testing.T) {
 	if n := runs(t, count); n != 1 {
 		t.Fatalf("CLI ran %d times, want 1 (cached)", n)
 	}
-	cfg, err := p.Config(context.Background())
-	if err != nil || cfg.APIURL != "https://api.example.com" || cfg.TokenProvider == nil || cfg.APIKey != "" {
-		t.Fatalf("Config() = %#v, %v", cfg, err)
+	apiURL, err := p.APIURL(context.Background())
+	if err != nil || apiURL != "https://api.example.com" {
+		t.Fatalf("APIURL() = %q, %v", apiURL, err)
 	}
 	if n := runs(t, count); n != 1 {
-		t.Fatalf("Config re-ran the CLI: %d runs", n)
+		t.Fatalf("APIURL re-ran the CLI: %d runs", n)
 	}
 }
 
@@ -141,7 +141,9 @@ func TestCLICredentialsFailuresNeverLeakToken(t *testing.T) {
 func TestCLICredentialsTimeout(t *testing.T) {
 	path, _ := fakeSS(t, `exec sleep 10`)
 	start := time.Now()
-	_, err := (&CLICredentialProvider{Path: path, Timeout: 200 * time.Millisecond}).Token(context.Background())
+	p := &CLICredentialProvider{Path: path}
+	p.timeout = 200 * time.Millisecond
+	_, err := p.Token(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("Token() error = %v, want timeout", err)
 	}
@@ -165,11 +167,8 @@ func TestClientUsesTokenProviderPerRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 	path, count := fakeSS(t, tokenJSON(cliTestToken, time.Now().Add(time.Hour), srv.URL))
-	cfg, err := (&CLICredentialProvider{Path: path}).Config(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := NewClient(cfg)
+	t.Setenv("SS_CLI_PATH", path)
+	c, err := NewCLIClient(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,6 +182,9 @@ func TestClientUsesTokenProviderPerRequest(t *testing.T) {
 	}
 	if runs(t, count) != 1 {
 		t.Fatal("token was not cached across requests")
+	}
+	if _, err := NewCLIClient(context.Background(), &Config{APIKey: "sk_x"}); err == nil {
+		t.Fatal("NewCLIClient accepted an API key")
 	}
 }
 

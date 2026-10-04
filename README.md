@@ -276,7 +276,7 @@ borrow that session. No API key is stored anywhere:
 
 | Client | How |
 |--------|-----|
-| Go | `cfg, err := secretserver.CLICredentials().Config(ctx); client, err := secretserver.NewClient(cfg)` (or `Config{TokenProvider: secretserver.CLICredentials().Token}`) |
+| Go | `client, err := secretserver.NewCLIClient(ctx, nil)` (or `Config{TokenProvider: secretserver.CLICredentials().Token}`) |
 | Python | `SecretServerClient(credential_provider=cli_credential_provider())` |
 | Node.js | `new SecretServerClient({ credentialProvider: cliCredentialProvider() })` |
 | PHP | `new SecretServerClient(credentialProvider: new CliCredentialProvider())` |
