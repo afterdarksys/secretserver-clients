@@ -2,6 +2,7 @@
 
 from .client import (
     AuthError,
+    CliCredentialProvider,
     ConflictError,
     ETagDict,
     NotFoundError,
@@ -9,6 +10,7 @@ from .client import (
     SecretServerClient,
     RemoteSigningKey,
     SecretServerError,
+    cli_credential_provider,
 )
 
 __all__ = [
@@ -16,10 +18,12 @@ __all__ = [
     "RemoteSigningKey",
     "SecretServerError",
     "AuthError",
+    "CliCredentialProvider",
+    "cli_credential_provider",
     "ConflictError",
     "ETagDict",
     "NotFoundError",
     "PermissionError",
 ]
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
