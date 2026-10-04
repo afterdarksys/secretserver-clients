@@ -269,14 +269,48 @@ The Go SDK does not read `SS_PARTIAL_UPDATES`; set `Config.PartialUpdates`.
 
 ## Authentication
 
-All libraries support two auth methods:
+### Use your `ss login` (interactive use)
+
+Log in once with the `ss` CLI (`ss login`, browser SSO) and let the library
+borrow that session. No API key is stored anywhere:
+
+| Client | How |
+|--------|-----|
+| Go | `cfg, err := secretserver.CLICredentials().Config(ctx); client, err := secretserver.NewClient(cfg)` (or `Config{TokenProvider: secretserver.CLICredentials().Token}`) |
+| Python | `SecretServerClient(credential_provider=cli_credential_provider())` |
+| Node.js | `new SecretServerClient({ credentialProvider: cliCredentialProvider() })` |
+| PHP | `new SecretServerClient(credentialProvider: new CliCredentialProvider())` |
+| Ansible lookup | `lookup('secretserver', 'prod/db', use_cli_login=true)` (needs the Python package on the controller) |
+| MCP bridge | `SECRETSERVER_USE_CLI_LOGIN=1` instead of `SECRETSERVER_TOKEN_FILE` |
+
+Every provider runs `ss auth print-access-token --format json` (binary from
+`SS_CLI_PATH`, else `ss` on `PATH`) without a shell, with a 30 s timeout and a
+64 KiB output cap, caches the short-lived token in memory until 60 s before it
+expires, and raises the library's auth error with "run `ss login`" when the CLI
+has no session. When you do not set an API URL, the URL the CLI is logged in to
+is used. Tokens never appear in errors. The Rust crate (`rust/secret-memory`)
+has no HTTP client and the offline cache service is a design only, so neither
+has a CLI provider.
+
+### API keys (automation, CI, servers)
 
 | Method | How |
 |--------|-----|
 | Environment variable | `export SS_API_KEY=sk_...` |
 | Constructor argument | `SecretServerClient(api_key="sk_...")` |
 
-API keys are created in the SecretServer dashboard under **Settings → API Keys**.
+The web console has no API-key page. Create keys with the REST API from an
+admin session, e.g. using your `ss login` token:
+
+```bash
+curl -sS https://api.secretserver.io/api/v1/api-keys \
+  -H "Authorization: Bearer $(ss auth print-access-token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ci-deploy","permissions":["secrets:read"]}'
+```
+
+Grant only the scopes the workload needs (see below) and store the key in your
+platform's secret store.
 
 ---
 

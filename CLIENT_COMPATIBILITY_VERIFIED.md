@@ -64,6 +64,21 @@ PYTHONPATH=python python3 -m pytest python/tests ansible/tests
 
 The harness needs `initdb`, `pg_ctl`, `vault`, `go`, `node`, `php`, `python3` and `ansible-playbook`. PostgreSQL and Vault listen on loopback. The API binary binds its port on all interfaces, because the server offers no way to set the bind address. Every run uses fresh CSPRNG credentials and deletes all state on exit.
 
+## CLI SSO login providers (1.4.0)
+
+Python, Node and PHP 1.4.0, the Go SDK, the Ansible lookup and the MCP bridge can
+authenticate with the `ss login` session through `ss auth print-access-token
+--format json` (Go `Config.TokenProvider` + `CLICredentials()`, Python
+`cli_credential_provider()`, Node `cliCredentialProvider()`, PHP
+`$credentialProvider` + `CliCredentialProvider`, Ansible `use_cli_login`, MCP
+`SECRETSERVER_USE_CLI_LOGIN=1`). Verified offline only, against fake `ss`
+executables: argv (no shell), token caching and refresh within 60 s of expiry,
+exit 2 mapped to the auth error with "run `ss login`", exit 1, malformed JSON,
+invalid `expires_at`, header-injection tokens, >64 KiB stdout, timeout, missing
+binary, `SS_CLI_PATH`, API URL defaulting, and that the token never appears in
+errors. Not yet live-verified: it needs a server and `ss` CLI with the CLI SSO
+endpoints (`secretserver.io` `docs/CLI_SSO_LOGIN.md`).
+
 ## Contract corrections in this pass
 
 **Secrets**
