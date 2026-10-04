@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="secretserver",
-    version="1.3.0",
+    name="afterdarksys-secretserver",
+    version="1.4.0",
     description="SecretServer.io Python client library",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",

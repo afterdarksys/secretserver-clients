@@ -10,6 +10,8 @@ import re
 import urllib.request
 import urllib.error
 import ssl
+import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlsplit
@@ -114,6 +116,30 @@ def _validate_base_url(api_url: str) -> str:
     if scheme == "https" or (scheme == "http" and host in _LOOPBACK_HOSTS):
         return url
     raise ValueError("api_url must use https (plain http is allowed only for localhost)")
+
+
+def _normalize_api_origin(raw: str) -> str:
+    """Loose equality for the CLI-login/explicit-api_url mismatch check only:
+    lowercases scheme and host, strips the scheme's default port (80 for
+    http, 443 for https) and a trailing slash. Not a general URL comparison.
+    """
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.hostname:
+        return raw.lower().rstrip("/")
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is not None and ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    return f"{scheme}://{netloc}{parts.path.rstrip('/')}"
+
+
+def _same_api_origin(a: str, b: str) -> bool:
+    return _normalize_api_origin(a) == _normalize_api_origin(b)
 
 
 def _seg(value: Any) -> str:
@@ -253,7 +279,7 @@ class SecretServerClient:
     """
 
     DEFAULT_URL = "https://api.secretserver.io"
-    USER_AGENT = "secretserver-python/1.3.0"
+    USER_AGENT = "secretserver-python/1.4.0"
 
     def __init__(
         self,
@@ -273,6 +299,16 @@ class SecretServerClient:
         self._closed = False
         self._credential_provider = credential_provider
         self._credential = _Credential("" if credential_provider is not None else (api_key or os.environ.get("SS_API_KEY", "")))
+        self._pending_cli_url_check: Optional["CliCredentialProvider"] = None
+        if isinstance(credential_provider, CliCredentialProvider):
+            if api_url is None and "SS_API_URL" not in os.environ:
+                # Use the API the `ss` CLI is logged in to; runs the CLI now.
+                api_url = credential_provider.api_url()
+            else:
+                # An explicit api_url is checked against the CLI's session on
+                # the first request (see _headers()), so the token is never
+                # sent to a host the session was not issued for.
+                self._pending_cli_url_check = credential_provider
         self.api_url = _validate_base_url(api_url or os.environ.get("SS_API_URL", self.DEFAULT_URL))
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -336,9 +372,20 @@ class SecretServerClient:
                 raise SecretServerError("client is closed")
             provider = self._credential_provider
             key = self.api_key if provider is None else None
+            pending = self._pending_cli_url_check
+            self._pending_cli_url_check = None
+        if pending is not None:
+            cli_api_url = pending.api_url()
+            if cli_api_url and not _same_api_origin(self.api_url, cli_api_url):
+                raise SecretServerError(
+                    f"API URL {self.api_url} does not match the `ss login` session for {cli_api_url}"
+                )
         try:
             if provider is not None:
                 key = provider()
+        except SecretServerError:
+            # SDK errors (e.g. "run `ss login`") carry no secrets.
+            raise
         except Exception:
             raise AuthError("credential provider failed") from None
         if self._closed:
@@ -1348,3 +1395,153 @@ class RemoteSigningKey:
 
     def __reduce__(self):
         raise TypeError("authenticated signing handles cannot be serialized")
+
+
+# ---------------------------------------------------------------------------
+# CLI credential provider (`ss login`)
+#
+# Threats: lets a program reuse the developer's `ss login` session without
+# handling refresh tokens. The CLI runs from an argv list (shell=False) with a
+# 30 s timeout and a 64 KiB stdout cap; any malformed answer fails closed; the
+# access token and the CLI's stdout never appear in exceptions. Does NOT
+# protect against a malicious `ss` binary on PATH or in SS_CLI_PATH, or
+# against other code running as the same OS user.
+# ---------------------------------------------------------------------------
+
+_CLI_MAX_OUTPUT = 64 * 1024
+_CLI_MAX_STDERR = 4 * 1024
+_CLI_REFRESH_SKEW = 60.0
+_CLI_TOKEN = re.compile(r"[\x21-\x7e]+")
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+
+
+class CliCredentialProvider:
+    """``credential_provider`` backed by ``ss auth print-access-token``.
+
+    Runs ``ss auth print-access-token --format json`` (``cli_path``, else env
+    SS_CLI_PATH, else ``ss`` on PATH) and caches the access token in memory
+    until 60 s before it expires. Exit status 2 from the CLI raises AuthError
+    telling the user to run ``ss login``; every other failure raises
+    SecretServerError. Thread-safe.
+    """
+
+    def __init__(self, cli_path: Optional[str] = None, timeout: float = 30.0):
+        if not timeout or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._cli_path = cli_path
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._token: Optional[str] = None
+        self._expires_at = 0.0
+        self._api_url: Optional[str] = None
+
+    def __call__(self) -> str:
+        return self._current()[0]
+
+    def api_url(self) -> Optional[str]:
+        """The API URL the CLI is logged in to (runs the CLI if nothing is cached)."""
+        return self._current()[1]
+
+    def _current(self):
+        with self._lock:
+            if self._token is not None and time.time() < self._expires_at - _CLI_REFRESH_SKEW:
+                return self._token, self._api_url
+            self._token = None
+            token, expires_at, api_url = _run_cli(self._cli_path or os.environ.get("SS_CLI_PATH") or "ss", self._timeout)
+            self._token, self._expires_at, self._api_url = token, expires_at, api_url
+            return token, api_url
+
+    def __repr__(self):
+        return "<CliCredentialProvider credentials=redacted>"
+
+    def __reduce__(self):
+        raise TypeError("credential providers cannot be serialized")
+
+
+def cli_credential_provider(cli_path: Optional[str] = None, timeout: float = 30.0) -> CliCredentialProvider:
+    """Return a credential provider that reuses the ``ss login`` SSO session.
+
+    ``SecretServerClient(credential_provider=cli_credential_provider())`` uses
+    the API URL the CLI is logged in to when neither ``api_url`` nor
+    SS_API_URL is set.
+    """
+    return CliCredentialProvider(cli_path=cli_path, timeout=timeout)
+
+
+def _run_cli(path: str, timeout: float):
+    argv = [path, "auth", "print-access-token", "--format", "json"]
+    try:
+        proc = subprocess.Popen(argv, shell=False, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise SecretServerError(f"SecretServer CLI {path!r} not found: install `ss` or set SS_CLI_PATH") from None
+    except OSError:
+        raise SecretServerError(f"SecretServer CLI {path!r} could not be run") from None
+
+    captured = {"stdout": bytearray(), "stderr": bytearray(), "overflow": False}
+
+    def drain(name: str, stream, cap: int):
+        buf = captured[name]
+        while True:
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                return
+            if len(buf) + len(chunk) > cap:
+                buf.extend(chunk[:cap - len(buf)])
+                if name == "stdout":
+                    captured["overflow"] = True
+                    proc.kill()
+                    return
+            else:
+                buf.extend(chunk)
+
+    readers = [threading.Thread(target=drain, args=("stdout", proc.stdout, _CLI_MAX_OUTPUT), daemon=True),
+               threading.Thread(target=drain, args=("stderr", proc.stderr, _CLI_MAX_STDERR), daemon=True)]
+    for t in readers:
+        t.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    for t in readers:
+        t.join(2.0)
+    proc.stdout.close()
+    proc.stderr.close()
+
+    if captured["overflow"]:
+        raise SecretServerError(f"`ss auth print-access-token` output exceeds {_CLI_MAX_OUTPUT} bytes")
+    if timed_out:
+        raise SecretServerError(f"`ss auth print-access-token` timed out after {timeout} s")
+    if proc.returncode == 2:
+        raise AuthError("SecretServer CLI is not logged in: run `ss login`")
+    if proc.returncode != 0:
+        raise SecretServerError(f"`ss auth print-access-token` failed (exit {proc.returncode})"
+                                + _stderr_excerpt(bytes(captured["stderr"])))
+    try:
+        out = json.loads(bytes(captured["stdout"]).decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise SecretServerError("`ss auth print-access-token` returned invalid JSON") from None
+    if not isinstance(out, dict):
+        raise SecretServerError("`ss auth print-access-token` returned invalid JSON")
+    token = out.get("access_token")
+    if not isinstance(token, str) or not _CLI_TOKEN.fullmatch(token):
+        raise SecretServerError("`ss auth print-access-token` returned no usable access_token")
+    expires = out.get("expires_at")
+    try:
+        if not isinstance(expires, str) or not _RFC3339.fullmatch(expires):
+            raise ValueError
+        expires_at = datetime.fromisoformat(re.sub(r"[Zz]$", "+00:00", re.sub(r"\.\d+", "", expires))).timestamp()
+    except ValueError:
+        raise SecretServerError("`ss auth print-access-token` returned an invalid expires_at") from None
+    api_url = out.get("api_url")
+    return token, expires_at, (api_url if isinstance(api_url, str) and api_url else None)
+
+
+def _stderr_excerpt(stderr: bytes) -> str:
+    """First stderr line, at most 200 printable characters. The CLI never writes tokens to stderr."""
+    lines = stderr.decode("utf-8", "replace").strip().splitlines()
+    line = re.sub(r"[\x00-\x1f\x7f]", "", lines[0] if lines else "")[:200]
+    return f": {line}" if line else ""

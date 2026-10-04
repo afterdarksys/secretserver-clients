@@ -5,7 +5,7 @@ This standalone stdio MCP server exposes operation-only SecretServer tools:
 - `list_key_metadata` lists non-exportable PKCS#11 or eHSM signing keys.
 - `sign_with_key` signs a bounded base64 message inside the configured device and returns a signature plus audit correlation ID.
 
-By default, the two signing tools do not expose private keys, PINs, passwords, provider credentials, or decrypted plaintext. The API identity is read from an owner-only file into locked memory. The bridge refuses non-loopback plaintext HTTP.
+By default, the two signing tools do not expose private keys, PINs, passwords, provider credentials, or decrypted plaintext. The API identity is read from an owner-only file into locked memory (or, opt-in, taken from your `ss login` session). The bridge refuses non-loopback plaintext HTTP.
 
 ## Build
 
@@ -30,6 +30,28 @@ claude mcp add --transport stdio --scope user secretserver \
 
 Do not place the API key itself in MCP configuration or environment variables.
 
+### Use your `ss login` instead of a token file
+
+For interactive use on a developer machine, set `SECRETSERVER_USE_CLI_LOGIN=1`
+(and no `SECRETSERVER_TOKEN_FILE`; setting both is refused). The bridge then
+runs `ss auth print-access-token --format json` (the binary from `SS_CLI_PATH`,
+else `ss` on `PATH`; argv only, 30 s timeout, 64 KiB output cap) at startup and
+whenever the short-lived access token is within 60 s of expiry, so it follows
+the CLI's refreshes. `SECRETSERVER_URL` is optional in this mode and defaults to
+the API URL the CLI is logged in to. The bridge exits at startup with "run
+`ss login`" if the CLI has no session.
+
+```bash
+claude mcp add --transport stdio --scope user secretserver \
+  --env SECRETSERVER_USE_CLI_LOGIN=1 \
+  -- /absolute/path/to/secretserver-mcp
+```
+
+Trade-off: the identity is your full user session rather than a key scoped to
+`keys:sign`, and the access token is cached in ordinary process memory, not the
+locked memory used for the token file. Prefer a scoped token file for unattended
+or shared agents.
+
 ## Optional variable resolution
 
 Set `SECRETSERVER_ENABLE_SECRET_RESOLUTION=1` together with
@@ -52,3 +74,12 @@ to another origin), requires TLS 1.2 or newer, bounds responses to 4 MiB, and
 validates signing inputs (key id and purpose 1-256 characters, message at most
 1 MiB decoded) before any request is sent. A reverse-proxy path prefix in
 `SECRETSERVER_URL` is preserved.
+
+## Install from git
+
+No registry account needed; see the top-level README for `<ref>` values.
+
+```bash
+git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git
+cd secretserver-clients/mcp && go build -o secretserver-mcp .   # go install @ref fails: go.mod has a replace directive
+```

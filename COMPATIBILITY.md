@@ -10,6 +10,7 @@ Live validation covers Go, Python, TypeScript and PHP creating, reading by name 
 - HTTP error messages omit server response bodies. Use typed status codes to distinguish denial/not-found. Mutations are not automatically retried; read current state after timeouts or audit failure before retrying.
 - Default Go requests and Python/TypeScript requests refuse redirects. Caller-supplied Go HTTP clients are responsible for their own timeout/redirect policy. PHP uses cURL without follow-redirects.
 - Go supports context cancellation. TypeScript has a configurable `timeoutMs`; Python/PHP accept timeout seconds. Transport and operating-system behavior still require deployment validation.
+- Interactive use can borrow the `ss login` session instead of an API key (`ss auth print-access-token --format json`; see the README "Authentication" section). This needs a server and CLI with the CLI SSO login endpoints.
 - API-key/JWT revocation and workload-binding disablement take effect on the next authenticated request. Offline cache design is not an implemented availability guarantee.
 - New database credential and workload endpoints can be called through each client's generic REST interface; see the server operations contract for deployment bindings and scopes.
 

@@ -28,7 +28,8 @@ DOCUMENTATION = r"""
         description: >
           SecretServer API base URL. Must use https; plain http is accepted only
           for localhost, 127.0.0.1 or ::1. URLs containing credentials are rejected.
-        default: https://api.secretserver.io
+          Defaults to https://api.secretserver.io, or with O(use_cli_login) to
+          the URL the C(ss) CLI is logged in to.
         env:
           - name: SS_API_URL
         ini:
@@ -36,14 +37,26 @@ DOCUMENTATION = r"""
             key: api_url
         type: str
       api_key:
-        description: SecretServer API key.
-        required: true
+        description: >
+          SecretServer API key. Required unless O(use_cli_login) is set;
+          mutually exclusive with it.
         env:
           - name: SS_API_KEY
         ini:
           - section: secretserver
             key: api_key
         type: str
+      use_cli_login:
+        description: >
+          Authenticate with the controller user's C(ss login) SSO session instead
+          of an API key. Runs C(ss auth print-access-token --format json) (the
+          binary from E(SS_CLI_PATH), else C(ss) on PATH) once per lookup, without
+          a shell, with a 30 s timeout. Requires the C(secretserver) Python
+          package 1.4.0 or newer on the controller. If the CLI is not logged in
+          the lookup fails and asks you to run C(ss login).
+        type: bool
+        default: false
+        version_added: "1.4.0"
       ca_path:
         description: >
           PEM CA bundle used to verify the server certificate, for deployments
@@ -70,7 +83,7 @@ DOCUMENTATION = r"""
         type: int
     notes:
       - Use no_log=true on every task consuming secrets. Lookup results are not automatically redacted.
-      - Store the api_key in Ansible Vault, not in plaintext.
+      - Store the api_key in Ansible Vault, not in plaintext, or use O(use_cli_login).
     seealso:
       - name: SecretServer API documentation
         link: https://secretserver.io/docs/api
@@ -82,6 +95,11 @@ EXAMPLES = r"""
 - name: Read a secret without logging its value
   ansible.builtin.set_fact:
     database_password: "{{ lookup('afterdark.secretserver.secretserver', 'prod/database-password', api_key=vault_ss_key) }}"
+  no_log: true
+
+- name: Read a secret with your `ss login` session (no API key)
+  ansible.builtin.set_fact:
+    database_password: "{{ lookup('afterdark.secretserver.secretserver', 'prod/database-password', use_cli_login=true) }}"
   no_log: true
 """
 
@@ -104,6 +122,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_API_URL = "https://api.secretserver.io"
 LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 display = Display()
@@ -115,9 +134,19 @@ class LookupModule(LookupBase):
     def run(self, terms, variables=None, **kwargs):
         self.set_options(var_options=variables, direct=kwargs)
 
-        api_url = validate_api_url(self.get_option("api_url") or "")
-        self._ssl_context = make_ssl_context(self.get_option("ca_path"))
         api_key = self.get_option("api_key")
+        api_url = self.get_option("api_url")
+        if self.get_option("use_cli_login"):
+            if api_key:
+                raise AnsibleError("api_key and use_cli_login are mutually exclusive (check SS_API_KEY)")
+            api_key, cli_api_url = cli_login_token()
+            if api_url and cli_api_url and not same_api_origin(api_url, cli_api_url):
+                raise AnsibleError(
+                    "SecretServer api_url {} does not match the `ss login` session for {}".format(api_url, cli_api_url)
+                )
+            api_url = api_url or cli_api_url
+        api_url = validate_api_url(api_url or DEFAULT_API_URL)
+        self._ssl_context = make_ssl_context(self.get_option("ca_path"))
         timeout = int(self.get_option("timeout"))
         version_override = self.get_option("version")
         if timeout <= 0:
@@ -128,7 +157,8 @@ class LookupModule(LookupBase):
         if not api_key:
             raise AnsibleError(
                 "SecretServer API key is required. "
-                "Set SS_API_KEY env var or secretserver.api_key in ansible.cfg."
+                "Set SS_API_KEY env var or secretserver.api_key in ansible.cfg, "
+                "or use_cli_login=true to use your `ss login` session."
             )
 
         results = []
@@ -243,9 +273,52 @@ class LookupModule(LookupBase):
         return value
 
 
+def cli_login_token():
+    """Return (access token, API URL or None) from the `ss` CLI's SSO session.
+
+    Uses the secretserver package's CLI provider (argv only, 30 s timeout,
+    64 KiB cap). Its errors never contain the token.
+    """
+    try:
+        from secretserver import SecretServerError, cli_credential_provider
+    except ImportError:
+        raise AnsibleError(
+            "use_cli_login requires the secretserver Python package (1.4.0 or newer) on the controller"
+        ) from None
+    provider = cli_credential_provider()
+    try:
+        return provider(), provider.api_url()
+    except SecretServerError as exc:
+        raise AnsibleError("SecretServer CLI login failed: {}".format(exc)) from None
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def normalize_api_origin(raw):
+    """Loose equality for the CLI-login/explicit-api_url mismatch check only:
+    lowercases scheme and host, strips the scheme's default port (80 for
+    http, 443 for https) and a trailing slash. Not a general URL comparison.
+    """
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.hostname:
+        return raw.lower().rstrip("/")
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is not None and ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+        port = None
+    netloc = host if port is None else "{}:{}".format(host, port)
+    return "{}://{}{}".format(scheme, netloc, parts.path.rstrip("/"))
+
+
+def same_api_origin(a, b):
+    return normalize_api_origin(a) == normalize_api_origin(b)
 
 
 def validate_api_url(api_url):

@@ -22,7 +22,7 @@ namespace SecretServer;
 class SecretServerClient
 {
     private const DEFAULT_URL = 'https://api.secretserver.io';
-    private const USER_AGENT  = 'secretserver-php/1.3.0';
+    private const USER_AGENT  = 'secretserver-php/1.4.0';
 
     /** Maximum body size for JSON responses. */
     private const MAX_JSON_BYTES = 4 * 1024 * 1024;
@@ -48,6 +48,15 @@ class SecretServerClient
     private bool    $allowHttp;
     private ?string $caFile;
     private bool    $partialUpdates;
+    private ?\Closure $credentialProvider;
+    /**
+     * Set when the caller gave both an explicit apiUrl and a
+     * CliCredentialProvider: checked (and cleared) on the first request so a
+     * session logged in to a different origin is never used to send the
+     * token there.
+     */
+    private ?CliCredentialProvider $pendingCliUrlCheck = null;
+    private string $pendingCliUrlExplicit = '';
 
     /**
      * Threats: rejects plaintext transport to non-loopback hosts, credentials
@@ -66,6 +75,11 @@ class SecretServerClient
      *                               updateJKSKeystore, updateYubikey) without an ETag.
      *                               Only safe against secretserver.io 3075630 or newer;
      *                               also enabled by SS_PARTIAL_UPDATES=1.
+     * @param callable|null $credentialProvider Returns the bearer token; called before
+     *                               every request. Mutually exclusive with $apiKey. Use
+     *                               CliCredentialProvider to reuse the `ss login` session;
+     *                               with it, a missing $apiUrl/SS_API_URL defaults to the
+     *                               URL the CLI is logged in to (the CLI runs immediately).
      * @throws AuthException|SecretServerException
      */
     public function __construct(
@@ -74,9 +88,25 @@ class SecretServerClient
         int     $timeout  = 10,
         bool    $verifySsl = true,
         ?string $caFile   = null,
-        bool    $partialUpdates = false
+        bool    $partialUpdates = false,
+        ?callable $credentialProvider = null
     ) {
-        $this->apiKey    = $apiKey ?? (string) getenv('SS_API_KEY');
+        if ($credentialProvider !== null && $apiKey !== null) {
+            throw new SecretServerException('Provide either $apiKey or $credentialProvider');
+        }
+        $this->credentialProvider = $credentialProvider === null ? null : \Closure::fromCallable($credentialProvider);
+        $this->apiKey    = $credentialProvider !== null ? '' : ($apiKey ?? (string) getenv('SS_API_KEY'));
+        $explicitApiUrl = $apiUrl ?? ((string) getenv('SS_API_URL') ?: null);
+        if ($credentialProvider instanceof CliCredentialProvider) {
+            if ($explicitApiUrl === null) {
+                $apiUrl = $credentialProvider->apiUrl();
+            } else {
+                // Deferred to the first request (see send()) so a provider
+                // that is not yet logged in still fails lazily, as before.
+                $this->pendingCliUrlCheck = $credentialProvider;
+                $this->pendingCliUrlExplicit = $explicitApiUrl;
+            }
+        }
         $this->apiUrl    = rtrim($apiUrl ?? (string)(getenv('SS_API_URL') ?: self::DEFAULT_URL), '/');
         if (str_ends_with($this->apiUrl, '/api/v1')) {
             $this->apiUrl = substr($this->apiUrl, 0, -7);
@@ -84,7 +114,7 @@ class SecretServerClient
         $this->timeout   = $timeout;
         $this->partialUpdates = $partialUpdates || getenv('SS_PARTIAL_UPDATES') === '1';
 
-        if ($this->apiKey === '') {
+        if ($this->apiKey === '' && $this->credentialProvider === null) {
             throw new AuthException('No API key provided. Pass $apiKey or set SS_API_KEY env var.');
         }
         if (!$verifySsl) {
@@ -161,6 +191,32 @@ class SecretServerClient
             throw new SecretServerException('Unsupported secret type');
         }
         return $type;
+    }
+
+    /**
+     * Loose equality for the CLI-login/explicit-apiUrl mismatch check only:
+     * lowercases scheme and host, strips the scheme's default port (80 for
+     * http, 443 for https) and a trailing slash. Not a general URL comparison.
+     */
+    private static function sameApiOrigin(string $a, string $b): bool
+    {
+        return self::normalizeApiOrigin($a) === self::normalizeApiOrigin($b);
+    }
+
+    private static function normalizeApiOrigin(string $raw): string
+    {
+        $parts = parse_url($raw);
+        if ($parts === false || !isset($parts['host'])) {
+            return strtolower(rtrim($raw, '/'));
+        }
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        $host   = strtolower((string) $parts['host']);
+        $port   = $parts['port'] ?? null;
+        if ($port !== null && (($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80))) {
+            $port = null;
+        }
+        $path = rtrim((string) ($parts['path'] ?? ''), '/');
+        return $scheme . '://' . $host . ($port !== null ? ':' . $port : '') . $path;
     }
 
     /** @param array<string, mixed> $params */
@@ -1268,6 +1324,33 @@ class SecretServerClient
      */
     private function send(string $method, string $path, ?array $body, int $maxBytes, string $accept, array $extraHeaders = [], ?string &$etag = null, ?string $pdf = null): string
     {
+        if ($this->pendingCliUrlCheck !== null) {
+            $cliProvider = $this->pendingCliUrlCheck;
+            $explicitApiUrl = $this->pendingCliUrlExplicit;
+            $this->pendingCliUrlCheck = null;
+            $cliApiUrl = $cliProvider->apiUrl();
+            if ($cliApiUrl !== null && !self::sameApiOrigin($explicitApiUrl, $cliApiUrl)) {
+                throw new SecretServerException(sprintf(
+                    'API URL %s does not match the `ss login` session for %s',
+                    $explicitApiUrl,
+                    $cliApiUrl
+                ));
+            }
+        }
+        $bearer = $this->apiKey;
+        if ($this->credentialProvider !== null) {
+            try {
+                $bearer = ($this->credentialProvider)();
+            } catch (SecretServerException $e) {
+                // SDK errors (e.g. "run `ss login`") carry no secrets.
+                throw $e;
+            } catch (\Throwable) {
+                throw new AuthException('credential provider failed');
+            }
+            if (!is_string($bearer) || preg_match('/^[\x21-\x7e]+$/', $bearer) !== 1) {
+                throw new AuthException('credential provider returned an invalid credential');
+            }
+        }
         $path = '/' . ltrim($path, '/');
         if ($path === '/api/v1') {
             $path = '';
@@ -1278,7 +1361,7 @@ class SecretServerClient
         $ch  = curl_init($url);
 
         $headers = [
-            'Authorization: Bearer ' . $this->apiKey,
+            'Authorization: Bearer ' . $bearer,
             'Accept: ' . $accept,
             'Content-Type: ' . ($pdf !== null ? 'application/pdf' : 'application/json'),
             'User-Agent: ' . self::USER_AGENT,

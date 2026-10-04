@@ -1,13 +1,31 @@
-# secretserver (Node.js / TypeScript)
+# @afterdarksys/secretserver (Node.js / TypeScript)
 
 Zero-dependency client for SecretServer.io. Node.js 18+ (native fetch).
 
 ```ts
-import { SecretServerClient } from "secretserver";
+import { SecretServerClient } from "@afterdarksys/secretserver";
 
 const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
 const value = await ss.secret("production/db-password");
 ```
+
+## Use your `ss login`
+
+Instead of an API key, reuse the SSO session of the `ss` CLI:
+
+```ts
+import { SecretServerClient, cliCredentialProvider, AuthError } from "@afterdarksys/secretserver";
+
+const ss = new SecretServerClient({ credentialProvider: cliCredentialProvider() });
+// AuthError "... run `ss login`" when the CLI has no valid session.
+```
+
+The provider runs `ss auth print-access-token --format json` (the binary from
+`SS_CLI_PATH`, else `ss` on `PATH`; options `cliPath`, `timeoutMs`) through
+`execFile` without a shell, with a 30 s timeout and a 64 KiB output cap. It
+caches the token in memory until 60 s before expiry. When neither `apiUrl` nor
+`SS_API_URL` is set, the client uses the API URL the CLI is logged in to.
+Tokens never appear in errors.
 
 ## Partial updates
 
@@ -58,3 +76,13 @@ The desktop GUI Documents tab opens the web manager with a separate sign-in;
 self-hosted users enter their web console URL. Ansible, Terraform and MCP do not
 implicitly deliver or cache protected PDFs. View-only access withholds originals,
 but visible pixels can still be captured. See https://secretserver.io/docs/documents.
+
+## Install from git
+
+No registry account needed; see the top-level README for `<ref>` values.
+
+```bash
+git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git
+(cd secretserver-clients/node && npm ci && npm run build && npm pack)
+npm install ./secretserver-clients/node/afterdarksys-secretserver-1.4.0.tgz   # npm cannot install a git subdirectory directly
+```

@@ -57,9 +57,9 @@ TOTP and YubiKey OTP, JKS keystores, and operation-only HSM signing.
 
 | Language | Directory | Install | Package | GitHub |
 |----------|-----------|---------|---------|--------|
-| **Python** | `python/` | `pip install secretserver` | [PyPI](https://pypi.org/project/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/python) |
-| **Node.js / TypeScript** | `node/` | `npm install secretserver` | [npm](https://npmjs.com/package/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/node) |
-| **PHP** | `php/` | `composer require afterdark/secretserver` | [Packagist](https://packagist.org/packages/afterdark/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
+| **Python** | `python/` | `pip install afterdarksys-secretserver` | [PyPI](https://pypi.org/project/afterdarksys-secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/python) |
+| **Node.js / TypeScript** | `node/` | `npm install @afterdarksys/secretserver` | [npm](https://npmjs.com/package/@afterdarksys/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/node) |
+| **PHP** | `php/` | `composer require afterdarksys/secretserver` | [Packagist](https://packagist.org/packages/afterdarksys/secretserver) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/php) |
 | **Go** | `go/` | `go get github.com/afterdarksys/secretserver-clients/go` | [pkg.go.dev](https://pkg.go.dev/github.com/afterdarksys/secretserver-clients/go) | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/go) |
 | **Ansible** | `ansible/` | Drop `secretserver.py` in your lookup_plugins/ | — | [Download](https://github.com/afterdarksys/secretserver-clients/tree/main/ansible) |
 | **MCP** | `mcp/` | `go build -o secretserver-mcp .` | stdio MCP server | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/mcp) |
@@ -67,6 +67,24 @@ TOTP and YubiKey OTP, JKS keystores, and operation-only HSM signing.
 | **Offline Cache Service** | `secretserver-cache-service/` | Architecture/design package | Device-bound encrypted lease cache | [Source](https://github.com/afterdarksys/secretserver-clients/tree/main/secretserver-cache-service) |
 
 **📥 [Download All Clients](https://github.com/afterdarksys/secretserver-clients/releases) | [Clone Repository](https://github.com/afterdarksys/secretserver-clients.git)**
+
+### Install from git (no registry account needed)
+
+The repository is public, so these need no GitHub or registry credentials.
+`<ref>` is the branch `feat/cli-sso-login` (or a commit hash) today, and the
+release tags after 1.4.0 ships: `v1.4.0` for Python/Node/PHP/Ansible,
+`go/v1.4.0` and `mcp/v1.4.0` for the Go modules. Verified from clean temp
+directories against `feat/cli-sso-login` @ 4a62eac.
+
+| Client | Command |
+|--------|---------|
+| Go | `go get github.com/afterdarksys/secretserver-clients/go@<ref>` — Go rejects branch names containing `/`, so use a commit hash (or the `go/v1.4.0` tag) |
+| Python | `pip install "git+https://github.com/afterdarksys/secretserver-clients.git@<ref>#subdirectory=python"` |
+| Node.js | npm cannot install a git subdirectory. Clone, build, pack, install the tarball: `git clone -b <ref> https://github.com/afterdarksys/secretserver-clients.git && (cd secretserver-clients/node && npm ci && npm run build && npm pack)` then `npm install ./secretserver-clients/node/afterdarksys-secretserver-1.4.0.tgz` |
+| PHP | A Composer `vcs` repository does not work (no `composer.json` at the repo root). Clone, then use a `path` repository: `composer config repositories.secretserver path ./secretserver-clients/php && composer require afterdarksys/secretserver:@dev` |
+| Ansible | Not a Galaxy collection. Clone and copy `ansible/secretserver.py` into your `lookup_plugins/` (or point `ANSIBLE_LOOKUP_PLUGINS` at `secretserver-clients/ansible`); `use_cli_login` also needs the Python package above |
+| MCP bridge | `go install …/mcp@<ref>` does not work (its `go.mod` has a `replace` for `../go`). Clone and build: `cd secretserver-clients/mcp && go build -o secretserver-mcp .` |
+| Desktop GUI | Same `replace` limitation. Clone and build (cgo/Fyne toolchain required): `cd secretserver-clients/go-gui && go build -o secretserver-gui .` |
 
 ### MCP and agent skills
 
@@ -128,7 +146,7 @@ print(f"Current code: {code['code']}")  # 6-digit code
 ### Node.js / TypeScript
 
 ```typescript
-import { SecretServerClient } from "secretserver";
+import { SecretServerClient } from "@afterdarksys/secretserver";
 
 const ss = new SecretServerClient({ apiKey: process.env.SS_API_KEY });
 
@@ -269,14 +287,48 @@ The Go SDK does not read `SS_PARTIAL_UPDATES`; set `Config.PartialUpdates`.
 
 ## Authentication
 
-All libraries support two auth methods:
+### Use your `ss login` (interactive use)
+
+Log in once with the `ss` CLI (`ss login`, browser SSO) and let the library
+borrow that session. No API key is stored anywhere:
+
+| Client | How |
+|--------|-----|
+| Go | `client, err := secretserver.NewCLIClient(ctx, nil)` (or `Config{TokenProvider: secretserver.CLICredentials().Token}`) |
+| Python | `SecretServerClient(credential_provider=cli_credential_provider())` |
+| Node.js | `new SecretServerClient({ credentialProvider: cliCredentialProvider() })` |
+| PHP | `new SecretServerClient(credentialProvider: new CliCredentialProvider())` |
+| Ansible lookup | `lookup('secretserver', 'prod/db', use_cli_login=true)` (needs the Python package on the controller) |
+| MCP bridge | `SECRETSERVER_USE_CLI_LOGIN=1` instead of `SECRETSERVER_TOKEN_FILE` |
+
+Every provider runs `ss auth print-access-token --format json` (binary from
+`SS_CLI_PATH`, else `ss` on `PATH`) without a shell, with a 30 s timeout and a
+64 KiB output cap, caches the short-lived token in memory until 60 s before it
+expires, and raises the library's auth error with "run `ss login`" when the CLI
+has no session. When you do not set an API URL, the URL the CLI is logged in to
+is used. Tokens never appear in errors. The Rust crate (`rust/secret-memory`)
+has no HTTP client and the offline cache service is a design only, so neither
+has a CLI provider.
+
+### API keys (automation, CI, servers)
 
 | Method | How |
 |--------|-----|
 | Environment variable | `export SS_API_KEY=sk_...` |
 | Constructor argument | `SecretServerClient(api_key="sk_...")` |
 
-API keys are created in the SecretServer dashboard under **Settings → API Keys**.
+The web console has no API-key page. Create keys with the REST API from an
+admin session, e.g. using your `ss login` token:
+
+```bash
+curl -sS https://api.secretserver.io/api/v1/api-keys \
+  -H "Authorization: Bearer $(ss auth print-access-token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ci-deploy","permissions":["secrets:read"]}'
+```
+
+Grant only the scopes the workload needs (see below) and store the key in your
+platform's secret store.
 
 ---
 

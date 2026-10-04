@@ -45,6 +45,9 @@ type Client struct {
 	userAgent  string
 	// partialUpdates is Config.PartialUpdates.
 	partialUpdates bool
+	// tokenProvider is Config.TokenProvider; when set it supplies the bearer
+	// token for every request instead of apiKey.
+	tokenProvider TokenProvider
 
 	// Service clients
 	Secrets      *SecretsService
@@ -66,6 +69,10 @@ type Client struct {
 	JKS          *JKSService
 }
 
+// TokenProvider returns the bearer credential for a request. It is called
+// before every request, so it should cache (see CLICredentials).
+type TokenProvider func(ctx context.Context) (string, error)
+
 // Config holds client configuration.
 //
 // APIURL must use https; plain http is accepted only for loopback hosts
@@ -86,9 +93,14 @@ type Client struct {
 // conditional updates); older servers treat these PUTs as a full replace and
 // blank omitted fields. Set it only when the server is known to be 3075630 or
 // newer. Without it, each update must carry an ETag from Get as IfMatch.
+//
+// Exactly one of APIKey and TokenProvider must be set. TokenProvider is
+// called before every request and returns the bearer token to send; it must
+// cache tokens itself. CLICredentials returns one backed by `ss login`.
 type Config struct {
 	APIURL         string
 	APIKey         string
+	TokenProvider  TokenProvider
 	HTTPClient     *http.Client
 	UserAgent      string
 	PartialUpdates bool
@@ -102,8 +114,11 @@ func NewClient(cfg *Config) (*Client, error) {
 	if cfg.APIURL == "" {
 		cfg.APIURL = defaultBaseURL
 	}
-	if cfg.APIKey == "" {
-		return nil, fmt.Errorf("API key is required")
+	if cfg.APIKey == "" && cfg.TokenProvider == nil {
+		return nil, fmt.Errorf("API key or TokenProvider is required")
+	}
+	if cfg.APIKey != "" && cfg.TokenProvider != nil {
+		return nil, fmt.Errorf("APIKey and TokenProvider are mutually exclusive")
 	}
 
 	baseURL, err := ValidateAPIURL(cfg.APIURL)
@@ -140,6 +155,7 @@ func NewClient(cfg *Config) (*Client, error) {
 	c := &Client{
 		baseURL:        baseURL,
 		apiKey:         cfg.APIKey,
+		tokenProvider:  cfg.TokenProvider,
 		httpClient:     httpClient,
 		userAgent:      cfg.UserAgent,
 		partialUpdates: cfg.PartialUpdates,
@@ -270,6 +286,16 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	}
 	u.RawQuery = ref.RawQuery
 
+	token := c.apiKey
+	if c.tokenProvider != nil {
+		if token, err = c.tokenProvider(ctx); err != nil {
+			return nil, err
+		}
+		if !validBearerToken(token) {
+			return nil, fmt.Errorf("TokenProvider returned an empty or malformed token")
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
@@ -278,7 +304,7 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	// Set headers
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)

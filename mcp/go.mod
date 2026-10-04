@@ -3,6 +3,7 @@ module github.com/afterdarksys/secretserver-clients/mcp
 go 1.25.0
 
 require (
+	github.com/afterdarksys/secretserver-clients/go v0.0.0-00010101000000-000000000000
 	github.com/awnumar/memguard v0.23.0
 	github.com/modelcontextprotocol/go-sdk v1.6.0
 	golang.org/x/sys v0.46.0
@@ -17,3 +18,5 @@ require (
 	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 )
+
+replace github.com/afterdarksys/secretserver-clients/go => ../go

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	secretserver "github.com/afterdarksys/secretserver-clients/go/secretserver"
 	"github.com/afterdarksys/secretserver-clients/mcp/internal/securemem"
 )
 
@@ -24,10 +25,14 @@ const (
 	maxShortField       = 256
 )
 
+// Client holds exactly one credential source: token (an API key read from
+// SECRETSERVER_TOKEN_FILE into locked memory) or cliToken (short-lived access
+// tokens from the `ss login` session, SECRETSERVER_USE_CLI_LOGIN=1).
 type Client struct {
-	baseURL *url.URL
-	token   *securemem.Buffer
-	http    *http.Client
+	baseURL  *url.URL
+	token    *securemem.Buffer
+	cliToken func(context.Context) (string, error)
+	http     *http.Client
 }
 
 type SigningKey struct {
@@ -57,6 +62,47 @@ func NewClient(rawURL, tokenFile string) (*Client, error) {
 	return &Client{baseURL: baseURL, token: token, http: newHTTPClient()}, nil
 }
 
+// NewCLIClient authenticates with the `ss` CLI's SSO session through
+// creds, which refreshes the short-lived access token as needed. An empty
+// rawURL means the API URL the CLI is logged in to. When rawURL is set and
+// differs from the API URL the CLI reports, NewCLIClient refuses rather
+// than send the `ss login` token to a host the session was not issued for.
+// Unlike the token-file mode, the access token is held in ordinary process
+// memory.
+func NewCLIClient(ctx context.Context, rawURL string, creds *secretserver.CLICredentialProvider) (*Client, error) {
+	cliAPIURL, err := creds.APIURL(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rawURL == "" {
+		rawURL = cliAPIURL
+	} else if cliAPIURL != "" && secretserver.NormalizeAPIURL(rawURL) != secretserver.NormalizeAPIURL(cliAPIURL) {
+		return nil, fmt.Errorf("API URL %s does not match the `ss login` session for %s", rawURL, cliAPIURL)
+	}
+	baseURL, err := validateBaseURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{baseURL: baseURL, cliToken: creds.Token, http: newHTTPClient()}, nil
+}
+
+// newClientFromEnv builds the client from SECRETSERVER_URL plus exactly one of
+// SECRETSERVER_TOKEN_FILE or SECRETSERVER_USE_CLI_LOGIN=1.
+func newClientFromEnv(ctx context.Context, getenv func(string) string, creds *secretserver.CLICredentialProvider) (*Client, error) {
+	rawURL, tokenFile := getenv("SECRETSERVER_URL"), getenv("SECRETSERVER_TOKEN_FILE")
+	switch getenv("SECRETSERVER_USE_CLI_LOGIN") {
+	case "", "0":
+		return NewClient(rawURL, tokenFile)
+	case "1":
+		if tokenFile != "" {
+			return nil, fmt.Errorf("SECRETSERVER_TOKEN_FILE and SECRETSERVER_USE_CLI_LOGIN=1 are mutually exclusive")
+		}
+		return NewCLIClient(ctx, rawURL, creds)
+	default:
+		return nil, fmt.Errorf("SECRETSERVER_USE_CLI_LOGIN must be 0 or 1")
+	}
+}
+
 // newHTTPClient never follows redirects, so the bearer token cannot be replayed
 // to another scheme or host, and it refuses TLS below 1.2.
 func newHTTPClient() *http.Client {
@@ -70,7 +116,11 @@ func newHTTPClient() *http.Client {
 }
 
 func (c *Client) Close() error {
-	if c == nil || c.token == nil {
+	if c == nil {
+		return nil
+	}
+	c.cliToken = nil
+	if c.token == nil {
 		return nil
 	}
 	err := c.token.Destroy()
@@ -131,14 +181,22 @@ func (c *Client) call(ctx context.Context, method, path string, body, output any
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.token == nil {
+	switch {
+	case c.cliToken != nil:
+		token, err := c.cliToken(ctx)
+		if err != nil {
+			return fmt.Errorf("SecretServer CLI login: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	case c.token != nil:
+		if err := c.token.WithBytes(func(token []byte) error {
+			req.Header.Set("Authorization", "Bearer "+string(token))
+			return nil
+		}); err != nil {
+			return fmt.Errorf("access API token: %w", err)
+		}
+	default:
 		return fmt.Errorf("client is closed")
-	}
-	if err := c.token.WithBytes(func(token []byte) error {
-		req.Header.Set("Authorization", "Bearer "+string(token))
-		return nil
-	}); err != nil {
-		return fmt.Errorf("access API token: %w", err)
 	}
 	resp, err := c.http.Do(req)
 	req.Header.Del("Authorization")

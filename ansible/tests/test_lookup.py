@@ -242,5 +242,71 @@ class RedirectTests(unittest.TestCase):
             server.server_close()
 
 
+class CliLoginTests(unittest.TestCase):
+    """use_cli_login against fake `ss` executables (uses the secretserver package)."""
+
+    def run_cli_lookup(self, body, **options):
+        from test_cli_credentials import fake_ss
+        path, runs = fake_ss(self, body)
+        env = {k: v for k, v in os.environ.items() if k not in ("SS_API_KEY", "SS_API_URL")}
+        env["SS_CLI_PATH"] = path
+        with patch.dict(os.environ, env, clear=True):
+            return lookup_loader.get("secretserver").run(["prod/db"], variables={}, use_cli_login=True, **options), runs
+
+    def test_uses_cli_token_and_api_url(self):
+        from test_cli_credentials import TOKEN, token_json
+        body = json.dumps({"data": {"value": "v"}}).encode()
+        with patch(OPEN, return_value=Raw(body)) as opener:
+            result, runs = self.run_cli_lookup(token_json(3600, "https://cli.example.test"))
+        self.assertEqual(result, ["v"])
+        req = opener.call_args.args[0]
+        self.assertEqual(req.full_url, "https://cli.example.test/api/v1/s/prod/db")
+        self.assertEqual(req.get_header("Authorization"), "Bearer " + TOKEN)
+        self.assertEqual(runs(), 1)
+
+    def test_explicit_api_url_wins(self):
+        from test_cli_credentials import token_json
+        # The CLI's own session reports an origin equal to the explicit
+        # api_url modulo case and a trailing slash: not a mismatch, and the
+        # explicit spelling (not the CLI's) is used for the request.
+        body = json.dumps({"data": {"value": "v"}}).encode()
+        with patch(OPEN, return_value=Raw(body)) as opener:
+            self.run_cli_lookup(token_json(3600, "https://Pinned.example.test/"), api_url="https://pinned.example.test")
+        self.assertEqual(opener.call_args.args[0].full_url, "https://pinned.example.test/api/v1/s/prod/db")
+
+    def test_refuses_mismatched_api_url(self):
+        from test_cli_credentials import token_json
+        with patch(OPEN) as opener:
+            with self.assertRaises(AnsibleError) as ctx:
+                self.run_cli_lookup(token_json(3600, "https://cli.example.test"), api_url="https://pinned.example.test")
+        opener.assert_not_called()
+        message = str(ctx.exception)
+        self.assertIn("https://pinned.example.test", message)
+        self.assertIn("https://cli.example.test", message)
+
+    def test_not_logged_in_fails_closed(self):
+        with patch(OPEN) as opener:
+            with self.assertRaises(AnsibleError) as ctx:
+                self.run_cli_lookup("exit 2")
+        opener.assert_not_called()
+        self.assertIn("ss login", str(ctx.exception))
+
+    def test_cli_failure_never_leaks_token(self):
+        from test_cli_credentials import TOKEN
+        with patch(OPEN) as opener:
+            with self.assertRaises(AnsibleError) as ctx:
+                self.run_cli_lookup("printf '{\"access_token\":\"%s\",' '" + TOKEN + "'")
+        opener.assert_not_called()
+        self.assertNotIn(TOKEN, str(ctx.exception))
+
+    def test_api_key_and_cli_login_are_exclusive(self):
+        with patch(OPEN) as opener:
+            with self.assertRaises(AnsibleError) as ctx:
+                self.run_cli_lookup("exit 0", api_key=KEY)
+        opener.assert_not_called()
+        self.assertIn("mutually exclusive", str(ctx.exception))
+        self.assertNotIn(KEY, str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

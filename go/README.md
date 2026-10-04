@@ -1,4 +1,24 @@
 
+## Authentication
+
+Pass exactly one of `Config.APIKey` or `Config.TokenProvider`
+(`func(ctx context.Context) (string, error)`, called before every request).
+
+To reuse your `ss login` SSO session instead of an API key:
+
+```go
+client, err := secretserver.NewCLIClient(ctx, nil) // runs `ss auth print-access-token --format json`
+if err != nil { /* errors.Is(err, secretserver.ErrCLINotLoggedIn): run `ss login` */ }
+```
+
+`NewCLIClient`'s `*Config` may set `APIURL` to pin a different host; it must
+not set `APIKey` or `TokenProvider`. Or set `Config{TokenProvider:
+secretserver.CLICredentials().Token}` with your own `APIURL`. The CLI is
+taken from `SS_CLI_PATH`, else `ss` on `PATH` (override with
+`CLICredentialProvider.Path`), run without a shell, limited to 30 s and 64 KiB
+of output. Tokens are cached in memory until 60 s before they expire and
+never appear in errors.
+
 
 ## Protected PDF documents
 
@@ -22,3 +42,11 @@ The desktop GUI Documents tab opens the web manager with a separate sign-in;
 self-hosted users enter their web console URL. Ansible, Terraform and MCP do not
 implicitly deliver or cache protected PDFs. View-only access withholds originals,
 but visible pixels can still be captured. See https://secretserver.io/docs/documents.
+
+## Install from git
+
+No registry account needed; see the top-level README for `<ref>` values.
+
+```bash
+go get github.com/afterdarksys/secretserver-clients/go@<ref>   # commit hash or go/vX.Y.Z tag; branch names with "/" are rejected
+```

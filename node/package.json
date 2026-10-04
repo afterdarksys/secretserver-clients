@@ -1,6 +1,6 @@
 {
-  "name": "secretserver",
-  "version": "1.3.0",
+  "name": "@afterdarksys/secretserver",
+  "version": "1.4.0",
   "description": "SecretServer.io Node.js / TypeScript client library",
   "type": "module",
   "main": "dist/index.js",
@@ -15,7 +15,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node tests/contract.mjs",
+    "test": "npm run build && node tests/contract.mjs && node tests/cli_credentials.mjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

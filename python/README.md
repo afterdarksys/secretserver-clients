@@ -11,6 +11,24 @@ value = client.secret("example")
 client.delete_secret("example")
 ```
 
+## Use your `ss login`
+
+Instead of an API key, reuse the SSO session of the `ss` CLI:
+
+```python
+from secretserver import SecretServerClient, cli_credential_provider
+
+client = SecretServerClient(credential_provider=cli_credential_provider())
+```
+
+The provider runs `ss auth print-access-token --format json` (`cli_path=`, else
+`SS_CLI_PATH`, else `ss` on `PATH`) with `shell=False`, a 30 s timeout
+(`timeout=`) and a 64 KiB output cap, and caches the token in memory until 60 s
+before it expires. If the CLI is not logged in it raises `AuthError` asking you
+to run `ss login`. Without `api_url=` or `SS_API_URL` the client uses the API URL
+the CLI is logged in to (the CLI runs once when the client is created). Tokens
+never appear in exceptions.
+
 Use protected configuration for credentials; avoid logging returned values. Path reads use `container/name`, and history uses `container/name/2`. Generic request helpers support newer REST endpoints. Requests have a configurable timeout and do not automatically retry mutations. HTTP failures expose a status code without echoing response bodies.
 
 **Minimum server: secretserver.io 3075630 (partial, conditional updates).** Older servers treat `PUT` on secrets, JKS keystores and YubiKeys as a full replace and ignore `If-Match`, so a partial body silently blanks every omitted field. The three update methods therefore refuse to send (raising `SecretServerError` before any request) unless you opt in, or the call passes an ETag the server returned:
@@ -72,3 +90,11 @@ The desktop GUI Documents tab opens the web manager with a separate sign-in;
 self-hosted users enter their web console URL. Ansible, Terraform and MCP do not
 implicitly deliver or cache protected PDFs. View-only access withholds originals,
 but visible pixels can still be captured. See https://secretserver.io/docs/documents.
+
+## Install from git
+
+No registry account needed; see the top-level README for `<ref>` values.
+
+```bash
+pip install "git+https://github.com/afterdarksys/secretserver-clients.git@<ref>#subdirectory=python"
+```

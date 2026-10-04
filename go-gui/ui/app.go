@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"context"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"github.com/afterdarksys/secretserver-clients/go/secretserver"
@@ -14,6 +16,8 @@ type App struct {
 	Tabs       *container.AppTabs
 	// clientErr explains why Client is nil (keychain or URL problem).
 	clientErr error
+	// account describes the active credential (never a token).
+	account string
 
 	// UI Components
 	settingsUI  *SettingsUI
@@ -37,31 +41,11 @@ func NewApp(fyneApp fyne.App, window fyne.Window) *App {
 	return app
 }
 
-// initClient builds the client from the stored URL and the keychain API key.
-// On failure Client is nil and clientErr says why; plaintext is never used.
+// initClient builds the client from the stored credential choice: the
+// keychain API key or the `ss login` session. On failure Client is nil and
+// clientErr says why; plaintext is never used.
 func (a *App) initClient() {
-	a.Client, a.clientErr = nil, nil
-	prefs := a.FyneApp.Preferences()
-	apiURL := prefs.StringWithFallback(prefAPIURL, defaultAPIURL)
-	apiKey, err := loadAPIKey(prefs, apiURL)
-	if err != nil {
-		a.clientErr = err
-		return
-	}
-	if apiKey == "" {
-		return
-	}
-
-	client, err := secretserver.NewClient(&secretserver.Config{
-		APIURL:    apiURL,
-		APIKey:    apiKey,
-		UserAgent: "SecretServer-GUI/1.0",
-	})
-	if err != nil {
-		a.clientErr = err
-		return
-	}
-	a.Client = client
+	a.Client, a.account, a.clientErr = buildClient(context.Background(), a.FyneApp.Preferences())
 }
 
 // ReloadClient is called when settings change
